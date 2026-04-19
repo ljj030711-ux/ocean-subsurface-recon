@@ -1,210 +1,142 @@
-# Eddy Inversion - 涡旋反演项目
+# Eddy Inversion
 
-## 项目简介
+海洋反演项目：由海表场（SLA/SSS）重建水下多深度盐度/温盐结构，统一支持变分、统计与深度学习方法。
 
-这是一个**研究级的深度学习项目**，用于涡旋结构的水下温度反演。该项目采用标准的工程化架构，可直接支撑硕士论文的方法章节。
+## 建模范式
 
-## 项目特点
+- `2dto2d`：每个深度训练一个独立模型（当前：`eddy_unet`）。
+- `2dto3d`：单模型一次输出所有深度（当前：`2dvar`、`modas`、`ocean_transformer`）。
 
-✅ **完整的工程闭环**
-- 数据读取 → 特征构造 → 模型 → 训练 → 测试
-- 真实输出结果文件，支持后续分析
+输出目录统一为：
 
-✅ **清晰的代码结构**
-- 按功能模块划分（数据、模型、工具、训练）
-- 易于维护、升级和扩展
+- `outputs/{paradigm}/{method}/...`
+- `checkpoints/{paradigm}/{method}/...`
 
-✅ **标准化的数据格式**
-- 统一 `.npy` 格式
-- `[T, H, W]` 形状规范
+## 模型思路
 
-✅ **物理约束集成**
-- EKE (涡动动能) 计算
-- SSH 梯度特征
-- 光滑性正则化
+### 1) eddy_unet（2dto2d）
+
+- 思路：每层深度训练一个 2D->2D UNet，26 层对应 26 个 checkpoint。
+- 训练：按深度列表循环，目标为单层 `(B,1,H,W)`。
+- 推理：逐深度加载模型并拼装为 `(1,26,H,W)`，再统一评估与绘图。
+- 评估口径：`test.py` 中会将标准化输出反标准化回物理量后再评估，`MAE/RMSE` 单位为 `psu`，`MSE` 为 `psu^2`。
+
+### 2) 2dvar（2dto3d）
+
+- 思路：变分反演，构造背景项与观测项代价函数，L-BFGS-B 迭代求解。
+- 输出：`(1,D,H,W)`，默认 D=26（由 `--c-depth` 控制）。
+
+### 3) modas（2dto3d）
+
+- 思路：逐像素逐深度线性统计回归，在训练时段拟合系数，目标日预测整层场。
+- 输出：`(1,D,H,W)`，D 由真值数据深度维决定（当前 26）。
+
+### 4) ocean_transformer（2dto3d）
+
+- 思路：CNN 提取海表空间特征 + 空间 Transformer + 深度 Transformer。
+- 输出：`(B,D,H,W,2)`，最后一维是 `(temperature, salinity)`。
+- 损失：`PhysicsLoss = MSE + 静力学平衡约束 + 层结稳定约束`。
+
+## 项目整体架构
+
+```mermaid
+flowchart LR
+  raw[raw_npy_data] --> ds[dataset_io_and_dataset]
+  ds --> train[train.py]
+  ds --> test[test.py]
+  train --> ckpt[checkpoints_by_paradigm]
+  ckpt --> test
+  test --> eval[metrics_and_summary]
+  eval --> map2d[plot_level_map]
+  eval --> profile3d[plot_3d_metric_profile]
+```
+
+
 
 ## 目录结构
 
-```
+```text
 eddy_inversion/
-├── data/
-│   ├── raw/                  # 原始真实数据
-│   └── demo/                 # 示例数据
-│       ├── sst.npy          # 海表温度 [T, H, W]
-│       ├── sss.npy          # 海表盐度 [T, H, W]
-│       ├── ssh.npy          # 海面高度 [T, H, W]
-│       └── subsurface.npy   # 水下目标（100m温度） [T, H, W]
-│
-├── datasets/
-│   └── eddy_dataset.py       # PyTorch 数据集类
-│
-├── models/
-│   └── eddy_cnn.py           # MVP 模型 (CNN)
-│
-├── utils/
-│   ├── physics.py            # 物理量计算 (EKE, ∇SSH)
-│   └── metrics.py            # 评估指标
-│
-├── train.py                  # 训练脚本
-├── test.py                   # 推理 & 结果输出
-├── config.py                 # 超参数配置
-├── requirements.txt
-└── README.md
+├── config.py                     # 统一配置：范式、超参数、路径、常量
+├── train.py                      # 训练入口（2dto2d/2dto3d）
+├── test.py                       # 推理评估入口（2dto2d/2dto3d）
+├── models/                       # 各模型/算法实现
+├── datasets/                     # Dataset + 数据读入/前处理工具
+│   ├── io_2dto2d.py
+│   ├── io_2dto3d.py
+│   ├── non_dl_preprocess.py
+│   ├── date_utils.py
+│   ├── eddy_dataset.py
+│   └── twodto3d_dataset.py
+├── utils/                        # physics / loss / metrics / viz
+├── outputs/
+│   ├── 2dto2d/
+│   └── 2dto3d/
+└── checkpoints/
+    ├── 2dto2d/
+    └── 2dto3d/
 ```
 
 ## 快速开始
 
-### 1. 环境安装
+### 安装
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 训练模型
+### 训练
 
 ```bash
-python train.py
+# 2dto2d: eddy_unet（26层循环训练）
+python train.py --method eddy_unet --data-dir ./data/raw
+
+# 2dto3d: ocean_transformer
+python train.py --method ocean_transformer --data-dir ./data/raw
 ```
 
-输出：
-- `model.pth` - 训练好的模型权重
-
-### 3. 测试与输出结果
+### 推理评估
 
 ```bash
-python test.py
+# 2dto2d: eddy_unet（逐层加载checkpoint并拼装）
+python test.py --method eddy_unet --select-day 2023-06-15 --target-level 10 \
+  --data-dir ./data/raw --checkpoint-dir ./checkpoints/2dto2d/eddy_unet
+
+# 2dto3d: 2dvar
+python test.py --method 2dvar --select-day 2023-06-15 --target-level 10 \
+  --sla-sss-path ./data/raw/sla_sss_2019-01-01_2023-12-31_10_18_110_118.npy
+
+# 2dto3d: modas
+python test.py --method modas --select-day 2023-06-15 --target-level 10 \
+  --sla-sss-path ./data/raw/sla_sss_2019-01-01_2023-12-31_10_18_110_118.npy \
+  --sws-true-path ./data/raw/sws_2019-01-01_2023-12-31_10_18_110_118_0-300.npy
 ```
 
-输出：
-- `prediction.npy` - 反演结果 `[T, 1, H, W]`
+## 统一可视化产物
 
-## 数据格式规范
+每个方法都保留两类输出：
 
-所有输入数据统一为 `.npy` 格式，形状规范：
+1. 指定层 2D 图：`plot_level_map`
+2. 3D 误差剖面图：`plot_3d_metric_profile`
 
-| 变量 | 形状 | 说明 |
-|------|------|------|
-| sst | `[T, H, W]` | 海表温度 |
-| sss | `[T, H, W]` | 海表盐度 |
-| ssh | `[T, H, W]` | 海面高度 |
-| target | `[T, H, W]` | 目标变量（如100m水温） |
+统一输出文件（位于 `outputs/{paradigm}/{method}/`）：
 
-其中：
-- `T` - 时间步数
-- `H` - 空间高度（纬度）
-- `W` - 空间宽度（经度）
+- `pred_{method}_{date}.npy`
+- `grid_metrics_{method}_{date}.npz`
+- `map_*_lvl{level}_{method}_{date}.png`
+- `profile_{metric}_{method}_{date}.png`
+- `summary_{method}_{date}.json`
 
-## 核心模块说明
+`summary` 中包含：
 
-### 物理工具 (`utils/physics.py`)
+- `metric_space`：指标计算口径（`physical` 或 `raw`）
+- `metric_units`：`mse/rmse/mae/r2` 对应单位说明
 
-- **EKE 计算** - 涡动动能，反映涡旋强度
-- **SSH梯度** - 地转流速度
+## 配置索引（config.py）
 
-### 数据集 (`datasets/eddy_dataset.py`)
-
-- 自动加载所有输入变量
-- 返回包含 sst, sss, ssh, target 的字典
-- 支持动态特征工程
-
-### 模型 (`models/eddy_cnn.py`)
-
-- **输入**：5通道 `[sst, sss, ssh, eke, grad_ssh]`
-- **输出**：1通道反演结果
-- **架构**：4层 CNN (可升级到 UNet/SegFormer)
-
-### 训练 (`train.py`)
-
-- MSE 损失 + 光滑性正则化
-- 自动保存最佳模型
-- 实时损失监控
-
-### 测试 (`test.py`)
-
-- 加载训练好的模型
-- 对所有样本进行推理
-- 输出 `.npy` 结果文件
-
-## 升级路线
-
-### 第一阶段：替换骨干网络
-```python
-EddyAwareCNN → UNet / SegFormer
-```
-
-### 第二阶段：多深度反演
-```python
-target: [T, H, W] → [T, D, H, W]
-```
-
-### 第三阶段：物理约束增强
-- 涡旋极性 mask
-- 等密度面 loss
-- 位势涡度 (PV) 约束
-
-## 配置参数说明
-
-编辑 `config.py` 调整：
-
-```python
-BATCH_SIZE = 4        # 批处理大小
-EPOCHS = 20           # 训练轮数
-LR = 1e-3             # 学习率
-LAMBDA_SMOOTH = 0.1   # 光滑正则化系数
-DEVICE = "cpu"        # 计算设备
-```
-
-## 数据准备
-
-如需使用自己的数据，将其放入 `data/raw/`，需满足格式：
-
-```python
-sst.npy    # 形状 [T, H, W]
-sss.npy    # 形状 [T, H, W]
-ssh.npy    # 形状 [T, H, W]
-target.npy # 形状 [T, H, W]
-```
-
-然后修改 `config.py` 中的 `DATA_DIR`。
-
-## 输出解释
-
-训练完成后：
-
-```
-model.pth        # PyTorch 模型文件
-prediction.npy   # 推理结果，形状 [T, 1, H, W]
-```
-
-可使用 matplotlib 或 paraview 可视化：
-
-```python
-import numpy as np
-import matplotlib.pyplot as plt
-
-pred = np.load("prediction.npy")
-plt.imshow(pred[0, 0])  # 第一个时间步的结果
-plt.colorbar()
-plt.show()
-```
-
-## 论文相关
-
-该项目架构符合硕士论文方法章节的标准，包含：
-
-- ✅ 数据处理与特征工程
-- ✅ 物理约束设计
-- ✅ 深度学习模型
-- ✅ 训练与验证流程
-- ✅ 结果评估指标
-
-后续研究可基于本框架进行方法创新，而无需重构整个项目。
-
-## 许可证
-
-MIT License
-
-## 联系方式
-
-如有问题，欢迎讨论与反馈。
+- 范式与方法：`PARADIGM_2DTO2D_METHODS`、`PARADIGM_2DTO3D_METHODS`
+- 深度列表：`DEPTH_LEVELS_26M`
+- eddy_unet 训练：`EDDY_UNET_*`
+- ocean_transformer 训练：`TWODTO3D_*`
+- 推理可视化：`INFER_*`
 

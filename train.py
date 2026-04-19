@@ -1,392 +1,469 @@
-"""
-训练脚本
-用于模型的训练和优化
-"""
+"""统一训练入口（2dto2d / 2dto3d）。"""
 
+import argparse
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
+
+import matplotlib
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-import numpy as np
+from torch.utils.data import DataLoader, Subset
 
-from config import *
-from datasets.eddy_dataset import DailySequenceEddyDataset, EddyDataset
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from config import (
+    CHECKPOINTS_ROOT,
+    DATA_DIR,
+    DATA_START_DATE,
+    DEPTH_LEVELS_26M,
+    DX,
+    DY,
+    EDDY_UNET_BATCH_SIZE,
+    EDDY_UNET_CKPT_NAME_TEMPLATE,
+    EDDY_UNET_EPOCHS,
+    EDDY_UNET_HISTORY_NAME_TEMPLATE,
+    EDDY_UNET_IN_CHANNELS_NO_PHYS,
+    EDDY_UNET_IN_CHANNELS_PHYS,
+    EDDY_UNET_LAMBDA_SMOOTH,
+    EDDY_UNET_LOSS_CURVE_TEMPLATE,
+    EDDY_UNET_LR,
+    EDDY_UNET_PATIENCE,
+    EDDY_UNET_USE_PHYSICS_FEATURES,
+    EDDY_UNET_WEIGHT_DECAY,
+    TWODTO3D_BATCH_SIZE,
+    TWODTO3D_D_MODEL,
+    TWODTO3D_DEPTH_LAYERS,
+    TWODTO3D_DEPTH_LEVELS,
+    TWODTO3D_DIM_FF,
+    TWODTO3D_EPOCHS,
+    TWODTO3D_IN_CHANNELS,
+    TWODTO3D_LAMBDA_HYDRO,
+    TWODTO3D_LAMBDA_STRAT,
+    TWODTO3D_LR,
+    TWODTO3D_NHEAD,
+    TWODTO3D_NUM_DEPTHS,
+    TWODTO3D_OUT_VARS,
+    TWODTO3D_PATIENCE,
+    TWODTO3D_SPATIAL_LAYERS,
+    TWODTO3D_WEIGHT_DECAY,
+    OUTPUTS_ROOT,
+    PARADIGM_2DTO2D,
+    PARADIGM_2DTO2D_METHODS,
+    PARADIGM_2DTO3D,
+    PARADIGM_2DTO3D_METHODS,
+    SEED,
+    get_checkpoint_dir,
+    get_output_dir,
+)
+from datasets.eddy_dataset import EddyDataset
+from datasets.dataset_2dto3d import DummyTwoDto3DDataset
 from models.eddy_cnn import EddyAwareCNN, EddyResNet, EddyUNet
+from models.ocean_transformer import OceanTransformer
 from utils.physics import compute_eke, compute_grad_ssh
-from utils.metrics import evaluate_prediction
+from utils.physics_loss import PhysicsLoss
+
+TRAINABLE_METHODS = {"eddy_unet", "eddy_resnet", "eddy_cnn", "ocean_transformer"}
+
+
+def build_model(method, **kwargs):
+    """根据 method 构建模型。"""
+    name = method.strip().lower()
+    out_ch = kwargs.get("out_channels", 1)
+    if name in {"eddy_unet", "unet"}:
+        return EddyUNet(in_channels=kwargs.get("in_channels", EDDY_UNET_IN_CHANNELS_NO_PHYS), out_channels=out_ch)
+    if name in {"eddy_resnet", "resnet"}:
+        return EddyResNet(in_channels=kwargs.get("in_channels", EDDY_UNET_IN_CHANNELS_NO_PHYS), out_channels=out_ch)
+    if name in {"eddy_cnn", "cnn", "eddyawarecnn"}:
+        return EddyAwareCNN(in_channels=kwargs.get("in_channels", EDDY_UNET_IN_CHANNELS_NO_PHYS), out_channels=out_ch)
+    if name == "ocean_transformer":
+        return OceanTransformer(
+            in_channels=kwargs.get("in_channels", TWODTO3D_IN_CHANNELS),
+            d_model=kwargs.get("d_model", TWODTO3D_D_MODEL),
+            nhead=kwargs.get("nhead", TWODTO3D_NHEAD),
+            spatial_layers=kwargs.get("spatial_layers", TWODTO3D_SPATIAL_LAYERS),
+            depth_layers=kwargs.get("depth_layers", TWODTO3D_DEPTH_LAYERS),
+            dim_ff=kwargs.get("dim_ff", TWODTO3D_DIM_FF),
+            num_depths=kwargs.get("num_depths", TWODTO3D_NUM_DEPTHS),
+            out_vars=kwargs.get("out_vars", TWODTO3D_OUT_VARS),
+        )
+    raise ValueError(f"未识别的方法: {method}")
+
+
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def get_year_split_indices(total_len, start_date_str="2019-01-01"):
+    start = datetime.strptime(start_date_str, "%Y-%m-%d")
+    train_days = (datetime(2021, 12, 31) - start).days + 1
+    val_days = (datetime(2022, 12, 31) - datetime(2021, 12, 31)).days
+    train_idx = list(range(min(train_days, total_len)))
+    val_start = train_days
+    val_idx = list(range(val_start, min(val_start + val_days, total_len)))
+    test_start = val_start + val_days
+    test_idx = list(range(test_start, total_len))
+    return train_idx, val_idx, test_idx
+
+
+def save_loss_curve(train_losses, val_losses, output_path):
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+    ax.plot(train_losses, label="Train Loss")
+    ax.plot(val_losses, label="Val Loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training & Validation Loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"损失曲线已保存至：{output_path}")
 
 
 def smooth_loss(x):
-    """
-    计算光滑性正则化损失
-    约束相邻像素的梯度平滑
-    
-    Args:
-        x: 预测张量 [B, C, H, W]
-    
-    Returns:
-        loss: 光滑损失
-    """
     loss_x = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
     loss_y = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean()
     return loss_x + loss_y
 
 
-def build_input_features(sss, ssh, use_physics_features):
-    """
-    构造模型输入特征
-
-    False: [sss, ssh] (2通道)
-    True : [sss, ssh, eke, grad] (4通道)
-    """
-    if use_physics_features:
+def build_2dto2d_features(sss, ssh, use_physics):
+    if use_physics:
         eke = compute_eke(ssh, DX, DY)
         grad = compute_grad_ssh(ssh)
         return torch.cat([sss, ssh, eke, grad], dim=1)
     return torch.cat([sss, ssh], dim=1)
 
 
-def build_model(model_name, in_channels):
-    """
-    根据配置创建模型
-    """
-    name = model_name.strip().lower()
-    if name in {"eddyawarecnn", "eddycnn", "cnn"}:
-        return EddyAwareCNN(in_channels=in_channels, out_channels=1)
-    if name in {"eddyunet", "unet"}:
-        return EddyUNet(in_channels=in_channels, out_channels=1)
-    if name in {"eddyresnet", "resnet"}:
-        return EddyResNet(in_channels=in_channels, out_channels=1)
-    raise ValueError(f"未识别的模型名称: {model_name}")
+def select_target_depth(target, depth_idx=None):
+    if depth_idx is None:
+        return target
+    if target.ndim != 4:
+        raise ValueError(f"target 需为 (B,C,H,W)，实际：{tuple(target.shape)}")
+    return target[:, depth_idx : depth_idx + 1]
 
 
-def train_epoch(model, loader, optimizer, device, lambda_smooth=0.1, use_physics_features=True):
-    """
-    训练一个 epoch
-    
-    Args:
-        model: 神经网络模型
-        loader: 数据加载器
-        optimizer: 优化器
-        device: 计算设备
-        lambda_smooth: 光滑性正则化系数
-    
-    Returns:
-        float: 该 epoch 的平均损失
-    """
+def train_2dto2d_epoch(model, loader, optimizer, device, lambda_smooth, use_physics, depth_idx=None):
     model.train()
-    total_loss = 0.0
-    batch_count = 0
-    
+    total, count = 0.0, 0
     for batch in loader:
         sss = batch["sss"].to(device)
         ssh = batch["ssh"].to(device)
-        target = batch["target"].to(device)
-        
-        # 拼接输入特征（2通道或4通道）
-        x = build_input_features(sss, ssh, use_physics_features)
-        
-        # 前向传播
+        target = select_target_depth(batch["target"].to(device), depth_idx=depth_idx)
+        x = build_2dto2d_features(sss, ssh, use_physics)
         pred = model(x)
-        
-        # 计算损失
-        mse_loss = F.mse_loss(pred, target)
-        smooth_reg = smooth_loss(pred)
-        total_train_loss = mse_loss + lambda_smooth * smooth_reg
-        
-        # 反向传播和优化
+        loss = F.mse_loss(pred, target) + lambda_smooth * smooth_loss(pred)
         optimizer.zero_grad()
-        total_train_loss.backward()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        
-        total_loss += total_train_loss.item()
-        batch_count += 1
-    
-    return total_loss / batch_count
+        total += loss.item()
+        count += 1
+    return total / max(count, 1)
 
 
-def validate(model, loader, device, use_physics_features=True):
-    """
-    验证模型
-    
-    Args:
-        model: 神经网络模型
-        loader: 数据加载器
-        device: 计算设备
-    
-    Returns:
-        float: 验证集平均损失
-    """
+def validate_2dto2d(model, loader, device, use_physics, depth_idx=None):
     model.eval()
-    total_loss = 0.0
-    batch_count = 0
-    
+    total, count = 0.0, 0
     with torch.no_grad():
         for batch in loader:
             sss = batch["sss"].to(device)
             ssh = batch["ssh"].to(device)
+            target = select_target_depth(batch["target"].to(device), depth_idx=depth_idx)
+            x = build_2dto2d_features(sss, ssh, use_physics)
+            loss = F.mse_loss(model(x), target)
+            total += loss.item()
+            count += 1
+    return total / max(count, 1)
+
+
+def build_2dto3d_features(surface_raw):
+    ssh = surface_raw[:, 0:1]
+    sss = surface_raw[:, 1:2]
+    grad = compute_grad_ssh(ssh)
+    eke = compute_eke(ssh, DX, DY)
+    return torch.cat([ssh, sss, grad, eke], dim=1)
+
+
+def train_2dto3d_epoch(model, loader, optimizer, device, criterion):
+    model.train()
+    total, count = 0.0, 0
+    for batch in loader:
+        surface_raw = batch["surface_raw"].to(device)
+        target = batch["target"].to(device)
+        sla = batch.get("sla")
+        if sla is not None:
+            sla = sla.to(device)
+        pred = model(build_2dto3d_features(surface_raw))
+        loss, _ = criterion(pred, target, sla)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        total += loss.item()
+        count += 1
+    return total / max(count, 1)
+
+
+def validate_2dto3d(model, loader, device, criterion):
+    model.eval()
+    total, count = 0.0, 0
+    with torch.no_grad():
+        for batch in loader:
+            surface_raw = batch["surface_raw"].to(device)
             target = batch["target"].to(device)
-            
-            x = build_input_features(sss, ssh, use_physics_features)
-            pred = model(x)
-            
-            loss = F.mse_loss(pred, target)
-            total_loss += loss.item()
-            batch_count += 1
-    
-    return total_loss / batch_count
+            sla = batch.get("sla")
+            if sla is not None:
+                sla = sla.to(device)
+            loss, _ = criterion(model(build_2dto3d_features(surface_raw)), target, sla)
+            total += loss.item()
+            count += 1
+    return total / max(count, 1)
+
+
+def paradigm_of_method(method):
+    if method in PARADIGM_2DTO2D_METHODS:
+        return PARADIGM_2DTO2D
+    if method in PARADIGM_2DTO3D_METHODS:
+        return PARADIGM_2DTO3D
+    return PARADIGM_2DTO3D
+
+
+def train_one_model(
+    method,
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    scheduler,
+    device,
+    epochs,
+    patience,
+    checkpoint_path,
+    use_physics=False,
+    depth_idx=None,
+    criterion=None,
+):
+    best_val = float("inf")
+    patience_cnt = 0
+    train_losses, val_losses = [], []
+
+    for epoch in range(epochs):
+        if method == "ocean_transformer":
+            t_loss = train_2dto3d_epoch(model, train_loader, optimizer, device, criterion)
+            v_loss = validate_2dto3d(model, val_loader, device, criterion)
+        else:
+            t_loss = train_2dto2d_epoch(
+                model, train_loader, optimizer, device,
+                EDDY_UNET_LAMBDA_SMOOTH, use_physics, depth_idx=depth_idx
+            )
+            v_loss = validate_2dto2d(model, val_loader, device, use_physics, depth_idx=depth_idx)
+
+        scheduler.step()
+        train_losses.append(t_loss)
+        val_losses.append(v_loss)
+        lr_now = scheduler.get_last_lr()[0]
+        print(f"Epoch [{epoch + 1}/{epochs}] | Train: {t_loss:.6f} | Val: {v_loss:.6f} | LR: {lr_now:.2e}")
+
+        if v_loss < best_val:
+            best_val = v_loss
+            torch.save(model.state_dict(), checkpoint_path)
+            patience_cnt = 0
+            print(f"  -> 保存最佳模型 (val={v_loss:.6f})")
+        else:
+            patience_cnt += 1
+            if patience_cnt >= patience:
+                print(f"  -> 早停触发 (patience={patience})")
+                break
+
+    return best_val, train_losses, val_losses
+
+
+def parse_depth_indices(depth_indices_arg):
+    if not depth_indices_arg:
+        return list(range(len(DEPTH_LEVELS_26M)))
+    out = []
+    for item in depth_indices_arg.split(","):
+        idx = int(item.strip())
+        if idx < 0 or idx >= len(DEPTH_LEVELS_26M):
+            raise ValueError(f"depth index 越界: {idx}")
+        out.append(idx)
+    return out
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="统一训练入口（2dto2d / 2dto3d）")
+    parser.add_argument("--method", required=True, choices=sorted(TRAINABLE_METHODS))
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--data-dir", default=DATA_DIR)
+    parser.add_argument("--output-dir", default=OUTPUTS_ROOT)
+    parser.add_argument("--checkpoint-dir", default=CHECKPOINTS_ROOT)
+    parser.add_argument("--use-physics-features", action="store_true", default=EDDY_UNET_USE_PHYSICS_FEATURES)
+    parser.add_argument("--dummy", action="store_true", help="2dto3d(ocean_transformer) 使用合成数据")
+    parser.add_argument("--patience", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument(
+        "--depth-indices",
+        default=None,
+        help="2dto2d(eddy_unet) 调试开关，仅训练指定深度索引，逗号分隔",
+    )
+    return parser.parse_args()
 
 
 def main():
-    """主训练函数"""
-    
-    # 创建输出目录
-    os.makedirs("./outputs", exist_ok=True)
-    os.makedirs("./checkpoints", exist_ok=True)
-    
-    # 设置随机种子
-    torch.manual_seed(42)
-    np.random.seed(42)
-    
-    # 打印配置
+    args = parse_args()
+    method = args.method.strip().lower()
+    paradigm = paradigm_of_method(method)
+
+    device = get_device()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    out_dir = get_output_dir(paradigm, method, base_dir=args.output_dir)
+    ckpt_dir = get_checkpoint_dir(paradigm, method, base_dir=args.checkpoint_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
     print("=" * 60)
     print("训练配置")
     print("=" * 60)
-    print(f"批处理大小: {BATCH_SIZE}")
-    print(f"训练轮数: {EPOCHS}")
-    print(f"学习率: {LR}")
-    print(f"模型: {MODEL_NAME}")
-    print(f"使用物理特征: {USE_PHYSICS_FEATURES}")
-    print(f"光滑正则化系数: {LAMBDA_SMOOTH}")
-    print(f"计算设备: {DEVICE}")
+    print(f"方法:       {method}")
+    print(f"范式:       {paradigm}")
+    print(f"设备:       {device}")
+    print(f"输出目录:   {out_dir}")
+    print(f"权重目录:   {ckpt_dir}")
     print("=" * 60)
-    
-    # 加载数据
-    print("\n加载数据...")
-    dataset = DailySequenceEddyDataset(
-        DATA_DIR,
-        window_days=WINDOW_DAYS,
-        horizon_days=PREDICT_HORIZON_DAYS,
-        normalize=True,
-    )
-    data_info = dataset.get_data_info()
-    print(f"原始时间步: T={data_info['time_steps']}, H={data_info['height']}, W={data_info['width']}")
-    print(
-        f"序列参数: window_days={data_info['window_days']}, "
-        f"horizon_days={data_info['horizon_days']}, "
-        f"num_samples={data_info['num_samples']}"
-    )
-    print(f"SSH 范围: {data_info['ssh_range']}")
-    print(f"目标范围: {data_info['target_range']}")
-    
-    # 按年份切分：训练2019-2021，验证2022，测试2023
-    from datetime import datetime, timedelta
-    start_date = datetime.strptime(DATA_START_DATE, "%Y-%m-%d")
-    total_days = len(dataset)
-    train_end_date = datetime(2021, 12, 31)
-    val_end_date = datetime(2022, 12, 31)
-    test_end_date = datetime(2023, 12, 31)
 
-    train_days = (train_end_date - start_date).days + 1
-    val_days = (val_end_date - train_end_date).days
-    test_days = (test_end_date - val_end_date).days
+    if method == "ocean_transformer":
+        from datasets.dataset_2dto3d import TwoDto3DDataset
 
-    train_indices = list(range(0, min(train_days, total_days)))
-    val_start = train_days
-    val_indices = list(range(val_start, min(val_start + val_days, total_days)))
-    test_start = val_start + val_days
-    test_indices = list(range(test_start, min(test_start + test_days, total_days)))
+        epochs = args.epochs or TWODTO3D_EPOCHS
+        batch_size = args.batch_size or TWODTO3D_BATCH_SIZE
+        lr = args.lr or TWODTO3D_LR
+        patience = args.patience or TWODTO3D_PATIENCE
 
-    train_dataset = torch.utils.data.Subset(dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(dataset, val_indices)
-    test_dataset = torch.utils.data.Subset(dataset, test_indices)
-    
-    # 创建数据加载器
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    
-    print(f"训练集大小: {len(train_dataset)}")
-    print(f"验证集大小: {len(val_dataset)}")
-    print(f"测试集大小: {len(test_dataset)}")
-    
-    # 打印训练/验证/测试目标日期范围（按天）
-    series_start = datetime.strptime(DATA_START_DATE, "%Y-%m-%d")
-    if train_indices:
-        train_start_day = train_indices[0]
-        train_end_day = train_indices[-1]
-        print(
-            f"训练目标日期: {(series_start + timedelta(days=train_start_day)).strftime('%Y-%m-%d')} "
-            f"~ {(series_start + timedelta(days=train_end_day)).strftime('%Y-%m-%d')}"
-        )
-    if val_indices:
-        val_start_day = val_indices[0]
-        val_end_day = val_indices[-1]
-        print(
-            f"验证目标日期: {(series_start + timedelta(days=val_start_day)).strftime('%Y-%m-%d')} "
-            f"~ {(series_start + timedelta(days=val_end_day)).strftime('%Y-%m-%d')}"
-        )
-    if test_indices:
-        test_start_day = test_indices[0]
-        test_end_day = test_indices[-1]
-        print(
-            f"测试目标日期: {(series_start + timedelta(days=test_start_day)).strftime('%Y-%m-%d')} "
-            f"~ {(series_start + timedelta(days=test_end_day)).strftime('%Y-%m-%d')}"
-        )
-
-    # 创建模型
-    print("\n初始化模型...")
-    per_day_channels = 4 if USE_PHYSICS_FEATURES else 2
-    in_channels = per_day_channels * WINDOW_DAYS
-    model = build_model(MODEL_NAME, in_channels=in_channels).to(DEVICE)
-    print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # 创建优化器和学习率调度器
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
-    
-    
-    # 训练循环
-    print("\n开始训练...\n")
-    best_val_loss = float('inf')
-    patience = 10
-    patience_counter = 0
-    
-    for epoch in range(EPOCHS):
-        # 训练
-        train_loss = train_epoch(
-            model, train_loader, optimizer, DEVICE, LAMBDA_SMOOTH, USE_PHYSICS_FEATURES
-        )
-        
-        # 验证
-        val_loss = validate(model, val_loader, DEVICE, USE_PHYSICS_FEATURES)
-        
-        # 学习率调度
-        scheduler.step()
-        
-        # 打印进度
-        if VERBOSE and (epoch + 1) % 1 == 0:
-            print(f"Epoch [{epoch+1}/{EPOCHS}] | "
-                  f"Train Loss: {train_loss:.6f} | "
-                  f"Val Loss: {val_loss:.6f} | "
-                  f"LR: {scheduler.get_last_lr()[0]:.2e}")
-        
-        # 保存最佳模型
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), "./checkpoints/best_model.pth")
-            model_tag = MODEL_NAME.strip().lower()
-            torch.save(model.state_dict(), f"./checkpoints/{model_tag}_best_model.pth")
-            patience_counter = 0
-            if VERBOSE:
-                print(f"  ✓ 保存最佳模型 (val_loss: {val_loss:.6f})")
+        if args.dummy:
+            dataset = DummyTwoDto3DDataset(num_samples=200, H=32, W=32)
+            train_idx, val_idx = list(range(140)), list(range(140, 170))
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"\n早停触发 (patience={patience})")
-                break
-    
-    # 保存最终模型
-    torch.save(model.state_dict(), MODEL_SAVE_PATH)
-    print(f"\n✓ 模型已保存到 {MODEL_SAVE_PATH}")
-    print(f"✓ 最佳验证损失: {best_val_loss:.6f}")
-    
-    return model
+            dataset = TwoDto3DDataset(args.data_dir)
+            train_idx, val_idx, _ = get_year_split_indices(len(dataset), DATA_START_DATE)
 
+        train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size, shuffle=False)
 
-def main_minimal_daily():
-    """
-    最简训练函数（非滑动）：
-    当天输入 SST/SSS/SSH，预测当天 100m 温场。
-    """
-    os.makedirs("./checkpoints", exist_ok=True)
+        model = build_model(method).to(device)
+        criterion = PhysicsLoss(
+            depth_levels=TWODTO3D_DEPTH_LEVELS,
+            lambda_hydro=TWODTO3D_LAMBDA_HYDRO,
+            lambda_strat=TWODTO3D_LAMBDA_STRAT,
+        ).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=TWODTO3D_WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(epochs // 3, 1), gamma=0.5)
 
-    torch.manual_seed(42)
-    np.random.seed(42)
-
-    print("=" * 60)
-    print("最简训练（当天->当天）")
-    print("=" * 60)
-    print(f"模型: {MODEL_NAME}")
-    print(f"使用物理特征: {USE_PHYSICS_FEATURES}")
-    print(f"训练轮数: {EPOCHS}, 学习率: {LR}, 批处理: {BATCH_SIZE}")
-    print(f"设备: {DEVICE}")
-
-    dataset = EddyDataset(DATA_DIR, normalize=True)
-    data_info = dataset.get_data_info()
-    print(f"数据集: T={data_info['time_steps']}, H={data_info['height']}, W={data_info['width']}")
-
-    # 按年份切分：训练2019-2021，验证2022，测试2023
-    from datetime import datetime, timedelta
-    start_date = datetime.strptime(DATA_START_DATE, "%Y-%m-%d")
-    total_days = len(dataset)
-    train_end_date = datetime(2021, 12, 31)
-    val_end_date = datetime(2022, 12, 31)
-    test_end_date = datetime(2023, 12, 31)
-
-    train_days = (train_end_date - start_date).days + 1
-    val_days = (val_end_date - train_end_date).days
-    test_days = (test_end_date - val_end_date).days
-
-    train_indices = list(range(0, min(train_days, total_days)))
-    val_start = train_days
-    val_indices = list(range(val_start, min(val_start + val_days, total_days)))
-    test_start = val_start + val_days
-    test_indices = list(range(test_start, min(test_start + test_days, total_days)))
-
-    train_dataset = torch.utils.data.Subset(dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(dataset, val_indices)
-    test_dataset = torch.utils.data.Subset(dataset, test_indices)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-    series_start = datetime.strptime(DATA_START_DATE, "%Y-%m-%d")
-    print(
-        f"训练日期: {series_start.strftime('%Y-%m-%d')} ~ "
-        f"{(series_start + timedelta(days=train_indices[-1] if train_indices else 0)).strftime('%Y-%m-%d')}"
-    )
-    print(
-        f"验证日期: {(series_start + timedelta(days=val_indices[0] if val_indices else 0)).strftime('%Y-%m-%d')} ~ "
-        f"{(series_start + timedelta(days=val_indices[-1] if val_indices else 0)).strftime('%Y-%m-%d')}"
-    )
-    print(
-        f"测试日期: {(series_start + timedelta(days=test_indices[0] if test_indices else 0)).strftime('%Y-%m-%d')} ~ "
-        f"{(series_start + timedelta(days=test_indices[-1] if test_indices else 0)).strftime('%Y-%m-%d')}"
-    )
-
-    in_channels = 4 if USE_PHYSICS_FEATURES else 2
-    model = build_model(MODEL_NAME, in_channels=in_channels).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-
-    best_val_loss = float("inf")
-    train_losses = []
-    val_losses = []
-    
-    for epoch in range(EPOCHS):
-        train_loss = train_epoch(
-            model, train_loader, optimizer, DEVICE, lambda_smooth=0.0, use_physics_features=USE_PHYSICS_FEATURES
+        best_ckpt = os.path.join(ckpt_dir, f"{method}_best.pth")
+        best_val, train_losses, val_losses = train_one_model(
+            method, model, train_loader, val_loader, optimizer, scheduler, device,
+            epochs, patience, best_ckpt, criterion=criterion
         )
-        val_loss = validate(model, val_loader, DEVICE, use_physics_features=USE_PHYSICS_FEATURES)
-        
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
+        np.savez(os.path.join(out_dir, f"training_history_{method}.npz"), train_losses=train_losses, val_losses=val_losses)
+        save_loss_curve(train_losses, val_losses, os.path.join(out_dir, f"loss_{method}.png"))
+        print(f"\n训练完成。最佳验证损失: {best_val:.6f}")
+        print(f"最佳权重: {best_ckpt}")
+        return
 
-        print(f"Epoch [{epoch+1}/{EPOCHS}] | Train: {train_loss:.6f} | Val: {val_loss:.6f}")
+    dataset = EddyDataset(args.data_dir, normalize=True)
+    train_idx, val_idx, _ = get_year_split_indices(len(dataset), DATA_START_DATE)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), "./checkpoints/minimal_daily_best_model.pth")
-            torch.save(model.state_dict(), MODEL_SAVE_PATH)
+    if method == "eddy_unet":
+        depth_indices = parse_depth_indices(args.depth_indices)
+        epochs = args.epochs or EDDY_UNET_EPOCHS
+        batch_size = args.batch_size or EDDY_UNET_BATCH_SIZE
+        lr = args.lr or EDDY_UNET_LR
+        patience = args.patience or EDDY_UNET_PATIENCE
 
-    # 保存训练历史
-    np.savez("./outputs/training_history.npz", train_losses=train_losses, val_losses=val_losses)
-    
-    print(f"✓ 最佳验证损失: {best_val_loss:.6f}")
-    print(f"✓ 最佳模型: ./checkpoints/minimal_daily_best_model.pth")
-    print(f"✓ 兼容模型: {MODEL_SAVE_PATH}")
-    return model
+        train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size, shuffle=False)
+        in_ch = EDDY_UNET_IN_CHANNELS_PHYS if args.use_physics_features else EDDY_UNET_IN_CHANNELS_NO_PHYS
+
+        for depth_idx in depth_indices:
+            depth_m = DEPTH_LEVELS_26M[depth_idx]
+            print("\n" + "-" * 60)
+            print(f"训练深度层: idx={depth_idx}, depth={depth_m}m")
+            print("-" * 60)
+
+            model = build_model("eddy_unet", in_channels=in_ch, out_channels=1).to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=EDDY_UNET_WEIGHT_DECAY)
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer, step_size=max(epochs // 3, 1), gamma=0.5
+            )
+            ckpt_name = EDDY_UNET_CKPT_NAME_TEMPLATE.format(depth_m=depth_m)
+            ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+
+            best_val, train_losses, val_losses = train_one_model(
+                "eddy_unet",
+                model,
+                train_loader,
+                val_loader,
+                optimizer,
+                scheduler,
+                device,
+                epochs,
+                patience,
+                ckpt_path,
+                use_physics=args.use_physics_features,
+                depth_idx=depth_idx,
+            )
+
+            hist_name = EDDY_UNET_HISTORY_NAME_TEMPLATE.format(depth_m=depth_m)
+            curve_name = EDDY_UNET_LOSS_CURVE_TEMPLATE.format(depth_m=depth_m)
+            np.savez(os.path.join(out_dir, hist_name), train_losses=train_losses, val_losses=val_losses)
+            save_loss_curve(train_losses, val_losses, os.path.join(out_dir, curve_name))
+            print(f"深度 {depth_m}m 训练完成，best val={best_val:.6f}")
+        return
+
+    # 其余 2dto3d 内的 CNN 方法：保持单模型多通道训练
+    epochs = args.epochs or EDDY_UNET_EPOCHS
+    batch_size = args.batch_size or EDDY_UNET_BATCH_SIZE
+    lr = args.lr or EDDY_UNET_LR
+    patience = args.patience or EDDY_UNET_PATIENCE
+    in_ch = EDDY_UNET_IN_CHANNELS_PHYS if args.use_physics_features else EDDY_UNET_IN_CHANNELS_NO_PHYS
+
+    train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size, shuffle=False)
+
+    sample_target = dataset[0]["target"]
+    out_ch = int(sample_target.shape[0]) if sample_target.ndim == 3 else len(DEPTH_LEVELS_26M)
+    model = build_model(method, in_channels=in_ch, out_channels=out_ch).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=EDDY_UNET_WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(epochs // 3, 1), gamma=0.5)
+    ckpt_path = os.path.join(ckpt_dir, f"{method}_best.pth")
+
+    best_val, train_losses, val_losses = train_one_model(
+        method,
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        device,
+        epochs,
+        patience,
+        ckpt_path,
+        use_physics=args.use_physics_features,
+    )
+    np.savez(os.path.join(out_dir, f"training_history_{method}.npz"), train_losses=train_losses, val_losses=val_losses)
+    save_loss_curve(train_losses, val_losses, os.path.join(out_dir, f"loss_{method}.png"))
+    print(f"\n训练完成。最佳验证损失: {best_val:.6f}")
+    print(f"最佳权重: {ckpt_path}")
 
 
+if __name__ == "__main__":
+    main()
