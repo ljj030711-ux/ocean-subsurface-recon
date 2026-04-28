@@ -35,13 +35,13 @@ DEPTH_MAX = 300
 DX = 10000.0
 DY = 10000.0
 
-# ==================== 范式定义（替代旧命名） ====================
+# ==================== 范式定义 ====================
 
 PARADIGM_2DTO2D = "2dto2d"
 PARADIGM_2DTO3D = "2dto3d"
 
-PARADIGM_2DTO2D_METHODS = {"eddy_unet"}
-PARADIGM_2DTO3D_METHODS = {"2dvar", "modas", "ocean_transformer", "eddy_resnet", "eddy_cnn"}
+PARADIGM_2DTO2D_METHODS = {"eddy_unet","eddy_resnet", "eddy_cnn"}
+PARADIGM_2DTO3D_METHODS = {"2dvar", "modas", "ocean_transformer"}
 
 # 指定 26 层深度（单位 m）
 DEPTH_LEVELS_26M = [

@@ -5,6 +5,7 @@ import os
 import numpy as np
 
 from config import TWODTO3D_SURFACE_FILENAME, TWODTO3D_TARGET_FILENAME
+from datasets.climatology_normalizer import MonthlyClimatologyLayerStdNormalizer
 from utils.data_quality import report_missing_values, sanitize_with_value
 
 
@@ -26,24 +27,40 @@ def validate_2dto3d_shapes(surface_raw, target_data):
     """校验 2dto3d 数据 shape。"""
     if surface_raw.ndim != 4 or surface_raw.shape[1] != 2:
         raise ValueError(f"surface_raw 需要 (T,2,H,W)，实际: {surface_raw.shape}")
-    if target_data.ndim != 4:
-        raise ValueError(f"target_data 需要 (T,D,H,W)，实际: {target_data.shape}")
+    if target_data.ndim not in (4, 5):
+        raise ValueError(f"target_data 需要 (T,D,H,W) 或 (T,D,H,W,V)，实际: {target_data.shape}")
     if surface_raw.shape[0] != target_data.shape[0]:
         raise ValueError("海表与水下真值时间步数不一致")
-    if surface_raw.shape[2:] != target_data.shape[2:]:
+    if surface_raw.shape[2:] != target_data.shape[2:4]:
         raise ValueError("海表与水下真值空间分辨率不一致")
 
 
-def clean_2dto3d(surface_raw, target_data, normalize=False):
-    """缺失值处理与可选通道标准化。"""
+def clean_2dto3d(surface_raw, target_data, normalize=False, months=None, fit_indices=None):
+    """缺失值处理与可选月气候态距平归一化。"""
     report_missing_values("2dto3d.surface_raw", surface_raw)
     report_missing_values("2dto3d.target_data", target_data)
 
+    if normalize:
+        if months is None:
+            raise ValueError("normalize=True 时必须提供 months")
+        surface_norm = MonthlyClimatologyLayerStdNormalizer().fit(
+            surface_raw, months, fit_indices=fit_indices
+        )
+        target_norm = MonthlyClimatologyLayerStdNormalizer().fit(
+            target_data, months, fit_indices=fit_indices
+        )
+        stats = {
+            "normalization": "monthly_climatology_layer_std",
+            "surface_raw": surface_norm.to_stats(),
+            "target": target_norm.to_stats(),
+        }
+        return (
+            surface_norm.transform(surface_raw, months),
+            target_norm.transform(target_data, months),
+            stats,
+        )
+
+    stats = {"normalization": "none"}
     surface_raw = sanitize_with_value(surface_raw, fill_value=0.0)
     target_data = sanitize_with_value(target_data, fill_value=0.0)
-
-    if normalize:
-        for c in range(surface_raw.shape[1]):
-            ch = surface_raw[:, c]
-            surface_raw[:, c] = (ch - ch.mean()) / (ch.std() + 1e-6)
-    return surface_raw, target_data
+    return surface_raw, target_data, stats

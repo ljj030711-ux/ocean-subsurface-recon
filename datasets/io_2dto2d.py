@@ -5,6 +5,7 @@ import os
 import numpy as np
 
 from config import TWODTO2D_SURFACE_FILENAME, TWODTO2D_TARGET_FILENAME
+from datasets.climatology_normalizer import MonthlyClimatologyLayerStdNormalizer
 from utils.data_quality import report_missing_values, sanitize_with_value
 
 
@@ -59,36 +60,46 @@ def validate_2dto2d_shapes(sss, ssh, target):
     return num_depths
 
 
-def clean_and_normalize_2dto2d(sss, ssh, target, normalize=False):
-    """缺失值处理与可选标准化，并返回统计量。"""
+def clean_and_normalize_2dto2d(
+    sss,
+    ssh,
+    target,
+    normalize=False,
+    months=None,
+    fit_indices=None,
+):
+    """缺失值处理与可选月气候态距平归一化，并返回统计量。"""
     report_missing_values("2dto2d.sss", sss)
     report_missing_values("2dto2d.ssh", ssh)
     report_missing_values("2dto2d.target", target)
 
-    sss_mean = np.nanmean(sss)
-    ssh_mean = np.nanmean(ssh)
-    target_mean = np.nanmean(target)
-
-    sss = sanitize_with_value(sss, fill_value=(sss_mean if not np.isnan(sss_mean) else 0.0))
-    ssh = sanitize_with_value(ssh, fill_value=(ssh_mean if not np.isnan(ssh_mean) else 0.0))
-    target = sanitize_with_value(
-        target, fill_value=(target_mean if not np.isnan(target_mean) else 0.0)
-    )
-
-    sss_std = float(sss.std() + 1e-6)
-    ssh_std = float(ssh.std() + 1e-6)
-    target_std = float(target.std() + 1e-6)
-    stats = {
-        "sss_mean": float(sss.mean()),
-        "sss_std": sss_std,
-        "ssh_mean": float(ssh.mean()),
-        "ssh_std": ssh_std,
-        "target_mean": float(target.mean()),
-        "target_std": target_std,
-    }
-
     if normalize:
-        sss = (sss - stats["sss_mean"]) / sss_std
-        ssh = (ssh - stats["ssh_mean"]) / ssh_std
-        target = (target - stats["target_mean"]) / target_std
+        if months is None:
+            raise ValueError("normalize=True 时必须提供 months")
+        sss_norm = MonthlyClimatologyLayerStdNormalizer().fit(
+            sss, months, fit_indices=fit_indices
+        )
+        ssh_norm = MonthlyClimatologyLayerStdNormalizer().fit(
+            ssh, months, fit_indices=fit_indices
+        )
+        target_norm = MonthlyClimatologyLayerStdNormalizer().fit(
+            target, months, fit_indices=fit_indices
+        )
+        stats = {
+            "normalization": "monthly_climatology_layer_std",
+            "sss": sss_norm.to_stats(),
+            "ssh": ssh_norm.to_stats(),
+            "target": target_norm.to_stats(),
+        }
+        return (
+            sss_norm.transform(sss, months),
+            ssh_norm.transform(ssh, months),
+            target_norm.transform(target, months),
+            stats,
+        )
+
+    stats = {"normalization": "none"}
+    sss = sanitize_with_value(sss, fill_value=0.0)
+    ssh = sanitize_with_value(ssh, fill_value=0.0)
+    target = sanitize_with_value(target, fill_value=0.0)
     return sss, ssh, target, stats

@@ -6,6 +6,8 @@
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from config import DATA_START_DATE, TRAIN_END_DATE
+from datasets.date_utils import generate_month_numbers, indices_until_date
 from datasets.io_2dto2d import (
     clean_and_normalize_2dto2d,
     load_2dto2d_raw,
@@ -34,8 +36,19 @@ class EddyDataset(Dataset):
             data_dir, target_filename=target_filename
         )
         self.num_depths = validate_2dto2d_shapes(self.sss, self.ssh, self.target)
+        self.months = np.asarray(
+            generate_month_numbers(DATA_START_DATE, self.sss.shape[0]), dtype=np.int64
+        )
+        self.fit_indices = indices_until_date(
+            self.sss.shape[0], DATA_START_DATE, TRAIN_END_DATE
+        )
         self.sss, self.ssh, self.target, self.norm_stats = clean_and_normalize_2dto2d(
-            self.sss, self.ssh, self.target, normalize=self.normalize
+            self.sss,
+            self.ssh,
+            self.target,
+            normalize=self.normalize,
+            months=self.months,
+            fit_indices=self.fit_indices,
         )
         
         # 数据统计

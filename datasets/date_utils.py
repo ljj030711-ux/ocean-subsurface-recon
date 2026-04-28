@@ -24,3 +24,22 @@ def date_to_index(select_day, start_date="2019-01-01", end_date="2023-12-31"):
     if select_day not in full:
         raise ValueError(f"日期不在范围 [{start_date}, {end_date}] 内：{select_day}")
     return full.index(select_day)
+
+
+def generate_month_numbers(start_date_str, total_len):
+    """按日步长从起始日期生成每个样本对应的月份编号（1..12）。"""
+    start = datetime.strptime(start_date_str, "%Y-%m-%d")
+    return [
+        (start + timedelta(days=i)).month
+        for i in range(int(total_len))
+    ]
+
+
+def indices_until_date(total_len, start_date_str, end_date_str):
+    """返回 [start, end] 闭区间内、且不超过 total_len 的时间索引。"""
+    start = datetime.strptime(start_date_str, "%Y-%m-%d")
+    end = datetime.strptime(end_date_str, "%Y-%m-%d")
+    if end < start:
+        return []
+    n = min((end - start).days + 1, int(total_len))
+    return list(range(max(n, 0)))

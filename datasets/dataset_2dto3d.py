@@ -4,6 +4,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from config import DATA_START_DATE, TRAIN_END_DATE
+from datasets.date_utils import generate_month_numbers, indices_until_date
 from datasets.io_2dto3d import clean_2dto3d, load_2dto3d_raw, validate_2dto3d_shapes
 
 
@@ -49,9 +51,6 @@ class TwoDto3DDataset(Dataset):
 
         self.surface_raw, self.target_data = load_2dto3d_raw(data_dir)
         validate_2dto3d_shapes(self.surface_raw, self.target_data)
-        self.surface_raw, self.target_data = clean_2dto3d(
-            self.surface_raw, self.target_data, normalize=normalize
-        )
 
         if self.target_data.ndim == 4:
             t, d, h, w = self.target_data.shape
@@ -62,6 +61,21 @@ class TwoDto3DDataset(Dataset):
             pass
         else:
             raise ValueError(f"target_data 需要 (T,D,H,W) 或 (T,D,H,W,2)，实际：{self.target_data.shape}")
+
+        self.months = np.asarray(
+            generate_month_numbers(DATA_START_DATE, self.surface_raw.shape[0]),
+            dtype=np.int64,
+        )
+        self.fit_indices = indices_until_date(
+            self.surface_raw.shape[0], DATA_START_DATE, TRAIN_END_DATE
+        )
+        self.surface_raw, self.target_data, self.norm_stats = clean_2dto3d(
+            self.surface_raw,
+            self.target_data,
+            normalize=normalize,
+            months=self.months,
+            fit_indices=self.fit_indices,
+        )
 
         self.T = int(self.surface_raw.shape[0])
 
@@ -74,3 +88,7 @@ class TwoDto3DDataset(Dataset):
             "target": torch.tensor(self.target_data[idx], dtype=torch.float32),
             "sla": torch.tensor(self.surface_raw[idx, 0], dtype=torch.float32),
         }
+
+    def get_norm_stats(self):
+        """返回标准化统计量（用于反标准化推理结果）。"""
+        return dict(self.norm_stats)

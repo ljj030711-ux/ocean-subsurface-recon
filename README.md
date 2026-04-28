@@ -56,7 +56,7 @@ flowchart LR
 ## 目录结构
 
 ```text
-eddy_inversion/
+ocean-subsurface-recon/
 ├── config.py                     # 统一配置：范式、超参数、路径、常量
 ├── train.py                      # 训练入口（2dto2d/2dto3d）
 ├── test.py                       # 推理评估入口（2dto2d/2dto3d）
@@ -129,8 +129,9 @@ python test.py --method modas --select-day 2023-06-15 --target-level 10 \
 
 `summary` 中包含：
 
-- `metric_space`：指标计算口径（`physical` 或 `raw`）
 - `metric_units`：`mse/rmse/mae/r2` 对应单位说明
+
+所有模型的预测产物、图和指标均使用原始物理单位。深度学习模型会在训练/推理输入侧使用训练期拟合的月气候态距平和分层标准差归一化，并在评估前反归一化；MODAS 和 2DVar 保持原始单位流程。
 
 ## 配置索引（config.py）
 
@@ -139,4 +140,3 @@ python test.py --method modas --select-day 2023-06-15 --target-level 10 \
 - eddy_unet 训练：`EDDY_UNET_*`
 - ocean_transformer 训练：`TWODTO3D_*`
 - 推理可视化：`INFER_*`
-

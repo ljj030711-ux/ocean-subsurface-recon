@@ -33,6 +33,7 @@ from config import (
     get_output_dir,
 )
 from datasets.date_utils import date_to_index
+from datasets.climatology_normalizer import MonthlyClimatologyLayerStdNormalizer
 from datasets.non_dl_preprocess import get_dataset_split, load_and_validate, load_sla_sss
 from utils.metrics import (
     compute_grid_metrics, extract_level_map, save_grid_metrics,
@@ -87,7 +88,7 @@ def summary_filename(method, date_str):
 
 
 def predict_non_dl(args):
-    """运行 2DVar 或 MODAS 反演，返回 (y_pred, y_true_or_None, eval_meta)"""
+    """运行 2DVar 或 MODAS 反演，返回原始单位的 (y_pred, y_true_or_None)。"""
     sws_true_full = None
 
     if args.method == "2dvar":
@@ -113,7 +114,7 @@ def predict_non_dl(args):
     if sws_true_full is not None:
         y_true = sws_true_full[t:t + 1]
 
-    return y_pred, y_true, {"metric_space": "raw"}
+    return y_pred, y_true
 
 
 # ==================== DL 预测 (2dto3d / 2dto2d) ====================
@@ -145,7 +146,7 @@ def build_2dto3d_features(surface_raw):
 
 
 def predict_2dto3d(args):
-    """2dto3d(ocean_transformer) 前向推理，返回 (y_pred, y_true_or_None, eval_meta)"""
+    """2dto3d(ocean_transformer) 前向推理，返回原始单位的 (y_pred, y_true)。"""
     from train import build_model
     device = _get_device()
 
@@ -164,7 +165,7 @@ def predict_2dto3d(args):
                 len(dataset) - 1)
     else:
         from datasets.dataset_2dto3d import TwoDto3DDataset
-        dataset = TwoDto3DDataset(args.data_dir)
+        dataset = TwoDto3DDataset(args.data_dir, normalize=True)
         t = date_to_index(args.select_day, DATA_START_DATE, DATA_END_DATE)
 
     sample = dataset[t]
@@ -176,7 +177,14 @@ def predict_2dto3d(args):
 
     y_pred = pred.cpu().numpy()                    # (1, D, H, W, 2)
     y_true = sample["target"].numpy()[np.newaxis]  # (1, D, H, W, 2)
-    return y_pred, y_true, {"metric_space": "raw"}
+    if not args.dummy:
+        target_norm = MonthlyClimatologyLayerStdNormalizer.from_stats(
+            dataset.get_norm_stats()["target"]
+        )
+        months = np.asarray([dataset.months[t]], dtype=np.int64)
+        y_pred = target_norm.inverse_transform(y_pred, months)
+        y_true = target_norm.inverse_transform(y_true, months)
+    return y_pred, y_true
 
 
 def predict_2dto2d(args):
@@ -230,15 +238,13 @@ def predict_2dto2d(args):
 
     y_true = sample["target"].unsqueeze(0).numpy()      # (1, C, H, W)
 
-    # eddy_unet 在 test 阶段反标准化到物理单位（psu）
-    if args.method == "eddy_unet":
-        target_mean = float(norm_stats["target_mean"])
-        target_std = float(norm_stats["target_std"])
-        y_pred = y_pred * target_std + target_mean
-        y_true = y_true * target_std + target_mean
-        return y_pred, y_true, {"metric_space": "physical"}
+    if norm_stats.get("normalization") == "monthly_climatology_layer_std":
+        target_norm = MonthlyClimatologyLayerStdNormalizer.from_stats(norm_stats["target"])
+        months = np.asarray([dataset.months[t]], dtype=np.int64)
+        y_pred = target_norm.inverse_transform(y_pred, months)
+        y_true = target_norm.inverse_transform(y_true, months)
 
-    return y_pred, y_true, {"metric_space": "raw"}
+    return y_pred, y_true
 
 
 # ==================== 统一输出 ====================
@@ -254,7 +260,31 @@ def _scalar_metrics(y_true_flat, y_pred_flat):
     }
 
 
-def save_outputs(args, y_pred, y_true, out_dir, eval_meta=None):
+def _metric_units(is_2dto3d):
+    if is_2dto3d:
+        return {
+            "temperature": {
+                "mse": "degC^2",
+                "rmse": "degC",
+                "mae": "degC",
+                "r2": "dimensionless",
+            },
+            "salinity": {
+                "mse": "psu^2",
+                "rmse": "psu",
+                "mae": "psu",
+                "r2": "dimensionless",
+            },
+        }
+    return {
+        "mse": "psu^2",
+        "rmse": "psu",
+        "mae": "psu",
+        "r2": "dimensionless",
+    }
+
+
+def save_outputs(args, y_pred, y_true, out_dir):
     """统一产物保存：npy / npz / 2D 图 / 3D 剖面 / summary.json"""
     method = args.method
     day = args.select_day
@@ -265,22 +295,12 @@ def save_outputs(args, y_pred, y_true, out_dir, eval_meta=None):
     np.save(os.path.join(out_dir, pred_filename(method, day)), y_pred)
     print(f"预测结果: {pred_filename(method, day)}  shape={y_pred.shape}")
 
-    metric_space = "raw"
-    if eval_meta is not None:
-        metric_space = eval_meta.get("metric_space", metric_space)
-
     summary = {
         "method": method,
         "select_day": day,
         "target_level": level,
         "pred_shape": list(y_pred.shape),
-        "metric_space": metric_space,
-        "metric_units": {
-            "mse": "psu^2",
-            "rmse": "psu",
-            "mae": "psu",
-            "r2": "dimensionless",
-        },
+        "metric_units": _metric_units(is_2dto3d),
         "variables": {},
     }
 
@@ -419,15 +439,15 @@ def main():
     print("=" * 60)
 
     if method in NON_DL_METHODS:
-        y_pred, y_true, eval_meta = predict_non_dl(args)
+        y_pred, y_true = predict_non_dl(args)
     elif method == "ocean_transformer":
-        y_pred, y_true, eval_meta = predict_2dto3d(args)
+        y_pred, y_true = predict_2dto3d(args)
     elif method in (DL_2DTO2D_METHODS | DL_2DTO3D_METHODS):
-        y_pred, y_true, eval_meta = predict_2dto2d(args)
+        y_pred, y_true = predict_2dto2d(args)
     else:
         raise ValueError(f"未知方法: {method}")
 
-    save_outputs(args, y_pred, y_true, out_dir, eval_meta=eval_meta)
+    save_outputs(args, y_pred, y_true, out_dir)
     print("\n预测评估完成。")
 
 

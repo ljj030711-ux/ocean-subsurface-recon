@@ -353,7 +353,7 @@ def main():
             dataset = DummyTwoDto3DDataset(num_samples=200, H=32, W=32)
             train_idx, val_idx = list(range(140)), list(range(140, 170))
         else:
-            dataset = TwoDto3DDataset(args.data_dir)
+            dataset = TwoDto3DDataset(args.data_dir, normalize=True)
             train_idx, val_idx, _ = get_year_split_indices(len(dataset), DATA_START_DATE)
 
         train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
