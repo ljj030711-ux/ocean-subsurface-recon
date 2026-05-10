@@ -1,19 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 上传代码：
-#   cd /Users/lijunjie/Documents/python/ocean-subsurface-recon
-#   ./scripts/deploy_upload.sh
-#
-# 只上传数据：
-#   rsync -avP -e "ssh -p 35533" data/ root@connect.bjb2.seetacloud.com:/root/ocean-subsurface-recon/data/
-#
-# 只上传某一个数据子目录，例如 data/raw/mur_sst：
-#   rsync -avP -e "ssh -p 35533" data/raw/mur_sst/ root@connect.bjb2.seetacloud.com:/root/ocean-subsurface-recon/data/raw/mur_sst/
-#
-# 这个脚本只上传代码，不上传 data、checkpoints、outputs、
-# 本地 conda 环境、缓存文件和旧的压缩包。
-
 PROJECT_NAME="ocean-subsurface-recon"
 SERVER_USER="${SERVER_USER:-root}"
 SERVER_HOST="${SERVER_HOST:-connect.bjb2.seetacloud.com}"
