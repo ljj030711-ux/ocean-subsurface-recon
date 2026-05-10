@@ -1,10 +1,10 @@
 # Eddy Inversion
 
-海洋反演项目：由海表场（SLA/SSS）重建水下多深度盐度/温盐结构，统一支持变分、统计与深度学习方法。
+海洋反演项目：由海表场（SST/SSH/SSS）重建水下多深度温度或盐度结构，统一支持变分、统计与深度学习方法。
 
 ## 建模范式
 
-- `2dto2d`：每个深度训练一个独立模型（当前：`eddy_unet`）。
+- `2dto2d`：每个变量、每个深度训练一个独立模型（当前：`Du_Unet`）。
 - `2dto3d`：单模型一次输出所有深度（当前：`2dvar`、`modas`、`ocean_transformer`）。
 
 输出目录统一为：
@@ -14,12 +14,13 @@
 
 ## 模型思路
 
-### 1) eddy_unet（2dto2d）
+### 1) Du_Unet（2dto2d）
 
-- 思路：每层深度训练一个 2D->2D UNet，26 层对应 26 个 checkpoint。
+- 思路：SST 高分辨率分支处理 `(B,1,160,160)`，SSH+SSS 低分辨率分支处理 `(B,2,64,64)`，融合后输出单层 `(B,1,64,64)`。
+- 训练：一次选择 `temperature` 或 `salinity`，循环 5-300m 共 25 层；两类变量分别训练后共 50 个 checkpoint。
 - 训练：按深度列表循环，目标为单层 `(B,1,H,W)`。
-- 推理：逐深度加载模型并拼装为 `(1,26,H,W)`，再统一评估与绘图。
-- 评估口径：`test.py` 中会将标准化输出反标准化回物理量后再评估，`MAE/RMSE` 单位为 `psu`，`MSE` 为 `psu^2`。
+- 推理：逐深度加载模型并拼装为 `(1,25,64,64)`，再统一评估与绘图。
+- 评估口径：`test.py` 中会将标准化输出反标准化回温度或盐度物理量后再评估。
 
 ### 2) 2dvar（2dto3d）
 
@@ -66,8 +67,8 @@ ocean-subsurface-recon/
 │   ├── io_2dto3d.py
 │   ├── non_dl_preprocess.py
 │   ├── date_utils.py
-│   ├── eddy_dataset.py
-│   └── twodto3d_dataset.py
+│   ├── dataset_2dto2d.py
+│   └── dataset_2dto3d.py
 ├── utils/                        # physics / loss / metrics / viz
 ├── outputs/
 │   ├── 2dto2d/
@@ -88,8 +89,12 @@ pip install -r requirements.txt
 ### 训练
 
 ```bash
-# 2dto2d: eddy_unet（26层循环训练）
-python train.py --method eddy_unet --data-dir ./data/raw
+# 2dto2d: Du_Unet（一次训练一个变量的25层）
+python train.py --method Du_Unet --target-var temperature \
+  --start-date 2021-01-01 --end-date 2023-12-31 --data-dir ./data/raw
+  # --depth-indices 9 可选，第9个深度，不是9m
+python train.py --method Du_Unet --target-var salinity \
+  --start-date 2021-01-01 --end-date 2023-12-31 --data-dir ./data/raw
 
 # 2dto3d: ocean_transformer
 python train.py --method ocean_transformer --data-dir ./data/raw
@@ -98,9 +103,10 @@ python train.py --method ocean_transformer --data-dir ./data/raw
 ### 推理评估
 
 ```bash
-# 2dto2d: eddy_unet（逐层加载checkpoint并拼装）
-python test.py --method eddy_unet --select-day 2023-06-15 --target-level 10 \
-  --data-dir ./data/raw --checkpoint-dir ./checkpoints/2dto2d/eddy_unet
+# 2dto2d: Du_Unet（逐层加载checkpoint并拼装）
+python test.py --method Du_Unet --target-var temperature --select-day 2023-06-15 --target-level 10 \
+  --start-date 2021-01-01 --end-date 2023-12-31 \
+  --data-dir ./data/raw --checkpoint-dir ./checkpoints/2dto2d/Du_Unet
 
 # 2dto3d: 2dvar
 python test.py --method 2dvar --select-day 2023-06-15 --target-level 10 \
@@ -136,7 +142,7 @@ python test.py --method modas --select-day 2023-06-15 --target-level 10 \
 ## 配置索引（config.py）
 
 - 范式与方法：`PARADIGM_2DTO2D_METHODS`、`PARADIGM_2DTO3D_METHODS`
-- 深度列表：`DEPTH_LEVELS_26M`
-- eddy_unet 训练：`EDDY_UNET_*`
+- 深度列表：`DEPTH_LEVELS_25M`（Du_Unet）、`DEPTH_LEVELS_26M`（旧 2dto3d/Non-DL）
+- Du_Unet 训练：`DU_UNET_*`
 - ocean_transformer 训练：`TWODTO3D_*`
 - 推理可视化：`INFER_*`

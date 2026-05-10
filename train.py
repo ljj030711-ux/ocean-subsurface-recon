@@ -17,21 +17,19 @@ from config import (
     CHECKPOINTS_ROOT,
     DATA_DIR,
     DATA_START_DATE,
-    DEPTH_LEVELS_26M,
+    DEPTH_LEVELS_25M,
     DX,
     DY,
-    EDDY_UNET_BATCH_SIZE,
-    EDDY_UNET_CKPT_NAME_TEMPLATE,
-    EDDY_UNET_EPOCHS,
-    EDDY_UNET_HISTORY_NAME_TEMPLATE,
-    EDDY_UNET_IN_CHANNELS_NO_PHYS,
-    EDDY_UNET_IN_CHANNELS_PHYS,
-    EDDY_UNET_LAMBDA_SMOOTH,
-    EDDY_UNET_LOSS_CURVE_TEMPLATE,
-    EDDY_UNET_LR,
-    EDDY_UNET_PATIENCE,
-    EDDY_UNET_USE_PHYSICS_FEATURES,
-    EDDY_UNET_WEIGHT_DECAY,
+    DU_UNET_BATCH_SIZE,
+    DU_UNET_CKPT_NAME_TEMPLATE,
+    DU_UNET_EPOCHS,
+    DU_UNET_HISTORY_NAME_TEMPLATE,
+    DU_UNET_LAMBDA_SMOOTH,
+    DU_UNET_LOSS_CURVE_TEMPLATE,
+    DU_UNET_LR,
+    DU_UNET_PATIENCE,
+    DU_UNET_WEIGHT_DECAY,
+    TWODTO3D_DATA_START_DATE,
     TWODTO3D_BATCH_SIZE,
     TWODTO3D_D_MODEL,
     TWODTO3D_DEPTH_LAYERS,
@@ -57,26 +55,22 @@ from config import (
     get_checkpoint_dir,
     get_output_dir,
 )
-from datasets.eddy_dataset import EddyDataset
+from datasets.dataset_2dto2d import Dataset2Dto2D
 from datasets.dataset_2dto3d import DummyTwoDto3DDataset
-from models.eddy_cnn import EddyAwareCNN, EddyResNet, EddyUNet
+from models.du_unet import Du_Unet
 from models.ocean_transformer import OceanTransformer
 from utils.physics import compute_eke, compute_grad_ssh
 from utils.physics_loss import PhysicsLoss
 
-TRAINABLE_METHODS = {"eddy_unet", "eddy_resnet", "eddy_cnn", "ocean_transformer"}
+TRAINABLE_METHODS = {"du_unet", "ocean_transformer"}
 
 
 def build_model(method, **kwargs):
     """根据 method 构建模型。"""
     name = method.strip().lower()
     out_ch = kwargs.get("out_channels", 1)
-    if name in {"eddy_unet", "unet"}:
-        return EddyUNet(in_channels=kwargs.get("in_channels", EDDY_UNET_IN_CHANNELS_NO_PHYS), out_channels=out_ch)
-    if name in {"eddy_resnet", "resnet"}:
-        return EddyResNet(in_channels=kwargs.get("in_channels", EDDY_UNET_IN_CHANNELS_NO_PHYS), out_channels=out_ch)
-    if name in {"eddy_cnn", "cnn", "eddyawarecnn"}:
-        return EddyAwareCNN(in_channels=kwargs.get("in_channels", EDDY_UNET_IN_CHANNELS_NO_PHYS), out_channels=out_ch)
+    if name in {"du_unet", "du-unet"}:
+        return Du_Unet(out_channels=out_ch)
     if name == "ocean_transformer":
         return OceanTransformer(
             in_channels=kwargs.get("in_channels", TWODTO3D_IN_CHANNELS),
@@ -132,14 +126,6 @@ def smooth_loss(x):
     return loss_x + loss_y
 
 
-def build_2dto2d_features(sss, ssh, use_physics):
-    if use_physics:
-        eke = compute_eke(ssh, DX, DY)
-        grad = compute_grad_ssh(ssh)
-        return torch.cat([sss, ssh, eke, grad], dim=1)
-    return torch.cat([sss, ssh], dim=1)
-
-
 def select_target_depth(target, depth_idx=None):
     if depth_idx is None:
         return target
@@ -148,15 +134,14 @@ def select_target_depth(target, depth_idx=None):
     return target[:, depth_idx : depth_idx + 1]
 
 
-def train_2dto2d_epoch(model, loader, optimizer, device, lambda_smooth, use_physics, depth_idx=None):
+def train_2dto2d_epoch(model, loader, optimizer, device, lambda_smooth, depth_idx=None):
     model.train()
     total, count = 0.0, 0
     for batch in loader:
-        sss = batch["sss"].to(device)
-        ssh = batch["ssh"].to(device)
+        sst = batch["sst"].to(device)
+        ssh_sss = batch["ssh_sss"].to(device)
         target = select_target_depth(batch["target"].to(device), depth_idx=depth_idx)
-        x = build_2dto2d_features(sss, ssh, use_physics)
-        pred = model(x)
+        pred = model(sst, ssh_sss)
         loss = F.mse_loss(pred, target) + lambda_smooth * smooth_loss(pred)
         optimizer.zero_grad()
         loss.backward()
@@ -167,16 +152,15 @@ def train_2dto2d_epoch(model, loader, optimizer, device, lambda_smooth, use_phys
     return total / max(count, 1)
 
 
-def validate_2dto2d(model, loader, device, use_physics, depth_idx=None):
+def validate_2dto2d(model, loader, device, depth_idx=None):
     model.eval()
     total, count = 0.0, 0
     with torch.no_grad():
         for batch in loader:
-            sss = batch["sss"].to(device)
-            ssh = batch["ssh"].to(device)
+            sst = batch["sst"].to(device)
+            ssh_sss = batch["ssh_sss"].to(device)
             target = select_target_depth(batch["target"].to(device), depth_idx=depth_idx)
-            x = build_2dto2d_features(sss, ssh, use_physics)
-            loss = F.mse_loss(model(x), target)
+            loss = F.mse_loss(model(sst, ssh_sss), target)
             total += loss.item()
             count += 1
     return total / max(count, 1)
@@ -245,7 +229,6 @@ def train_one_model(
     epochs,
     patience,
     checkpoint_path,
-    use_physics=False,
     depth_idx=None,
     criterion=None,
 ):
@@ -260,9 +243,9 @@ def train_one_model(
         else:
             t_loss = train_2dto2d_epoch(
                 model, train_loader, optimizer, device,
-                EDDY_UNET_LAMBDA_SMOOTH, use_physics, depth_idx=depth_idx
+                DU_UNET_LAMBDA_SMOOTH, depth_idx=depth_idx
             )
-            v_loss = validate_2dto2d(model, val_loader, device, use_physics, depth_idx=depth_idx)
+            v_loss = validate_2dto2d(model, val_loader, device, depth_idx=depth_idx)
 
         scheduler.step()
         train_losses.append(t_loss)
@@ -285,12 +268,13 @@ def train_one_model(
 
 
 def parse_depth_indices(depth_indices_arg):
+    # 如果没穿，训练该变量的全部 25 个深度层
     if not depth_indices_arg:
-        return list(range(len(DEPTH_LEVELS_26M)))
+        return list(range(len(DEPTH_LEVELS_25M)))
     out = []
     for item in depth_indices_arg.split(","):
         idx = int(item.strip())
-        if idx < 0 or idx >= len(DEPTH_LEVELS_26M):
+        if idx < 0 or idx >= len(DEPTH_LEVELS_25M):
             raise ValueError(f"depth index 越界: {idx}")
         out.append(idx)
     return out
@@ -298,21 +282,26 @@ def parse_depth_indices(depth_indices_arg):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="统一训练入口（2dto2d / 2dto3d）")
-    parser.add_argument("--method", required=True, choices=sorted(TRAINABLE_METHODS))
+    parser.add_argument("--method", required=True)
+    parser.add_argument("--target-var", choices=["temperature", "salinity"], default="temperature",
+                        help="Du_Unet 训练目标变量")
+    parser.add_argument("--start-date", default=DATA_START_DATE,
+                        help="Du_Unet 使用的数据起始日期 YYYY-MM-DD")
+    parser.add_argument("--end-date", default=None,
+                        help="Du_Unet 使用的数据结束日期 YYYY-MM-DD，默认使用配置中的结束日期")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--data-dir", default=DATA_DIR)
     parser.add_argument("--output-dir", default=OUTPUTS_ROOT)
     parser.add_argument("--checkpoint-dir", default=CHECKPOINTS_ROOT)
-    parser.add_argument("--use-physics-features", action="store_true", default=EDDY_UNET_USE_PHYSICS_FEATURES)
     parser.add_argument("--dummy", action="store_true", help="2dto3d(ocean_transformer) 使用合成数据")
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument(
         "--depth-indices",
         default=None,
-        help="2dto2d(eddy_unet) 调试开关，仅训练指定深度索引，逗号分隔",
+        help="2dto2d(Du_Unet) 调试开关，仅训练指定深度索引，逗号分隔",
     )
     return parser.parse_args()
 
@@ -320,21 +309,26 @@ def parse_args():
 def main():
     args = parse_args()
     method = args.method.strip().lower()
+    if method in {"du-unet"}:
+        method = "du_unet"
+    if method not in TRAINABLE_METHODS:
+        raise ValueError(f"未识别的方法: {args.method}")
     paradigm = paradigm_of_method(method)
+    method_dir = "Du_Unet" if method == "du_unet" else method
 
     device = get_device()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    out_dir = get_output_dir(paradigm, method, base_dir=args.output_dir)
-    ckpt_dir = get_checkpoint_dir(paradigm, method, base_dir=args.checkpoint_dir)
+    out_dir = get_output_dir(paradigm, method_dir, base_dir=args.output_dir)
+    ckpt_dir = get_checkpoint_dir(paradigm, method_dir, base_dir=args.checkpoint_dir)
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 
     print("=" * 60)
     print("训练配置")
     print("=" * 60)
-    print(f"方法:       {method}")
+    print(f"方法:       {method_dir}")
     print(f"范式:       {paradigm}")
     print(f"设备:       {device}")
     print(f"输出目录:   {out_dir}")
@@ -354,7 +348,7 @@ def main():
             train_idx, val_idx = list(range(140)), list(range(140, 170))
         else:
             dataset = TwoDto3DDataset(args.data_dir, normalize=True)
-            train_idx, val_idx, _ = get_year_split_indices(len(dataset), DATA_START_DATE)
+            train_idx, val_idx, _ = get_year_split_indices(len(dataset), TWODTO3D_DATA_START_DATE)
 
         train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size, shuffle=False)
@@ -379,36 +373,48 @@ def main():
         print(f"最佳权重: {best_ckpt}")
         return
 
-    dataset = EddyDataset(args.data_dir, normalize=True)
-    train_idx, val_idx, _ = get_year_split_indices(len(dataset), DATA_START_DATE)
+    dataset = Dataset2Dto2D(
+        args.data_dir,
+        normalize=True,
+        target_var=args.target_var,
+        start_date=args.start_date,
+        end_date=args.end_date,
+    )
+    train_idx, val_idx, _ = get_year_split_indices(len(dataset), dataset.start_date)
+    if len(train_idx) == 0 or len(val_idx) == 0:
+        raise ValueError(
+            f"当前日期范围 [{dataset.start_date}, {dataset.end_date}] 无法形成训练/验证集；"
+            "建议本地调试使用 --start-date 2021-01-01 --end-date 2023-12-31"
+        )
 
-    if method == "eddy_unet":
+    if method == "du_unet":
         depth_indices = parse_depth_indices(args.depth_indices)
-        epochs = args.epochs or EDDY_UNET_EPOCHS
-        batch_size = args.batch_size or EDDY_UNET_BATCH_SIZE
-        lr = args.lr or EDDY_UNET_LR
-        patience = args.patience or EDDY_UNET_PATIENCE
+        epochs = args.epochs or DU_UNET_EPOCHS
+        batch_size = args.batch_size or DU_UNET_BATCH_SIZE
+        lr = args.lr or DU_UNET_LR
+        patience = args.patience or DU_UNET_PATIENCE
 
         train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size, shuffle=False)
-        in_ch = EDDY_UNET_IN_CHANNELS_PHYS if args.use_physics_features else EDDY_UNET_IN_CHANNELS_NO_PHYS
 
         for depth_idx in depth_indices:
-            depth_m = DEPTH_LEVELS_26M[depth_idx]
+            depth_m = DEPTH_LEVELS_25M[depth_idx]
             print("\n" + "-" * 60)
-            print(f"训练深度层: idx={depth_idx}, depth={depth_m}m")
+            print(f"训练变量: {args.target_var} | 深度层: idx={depth_idx}, depth={depth_m}m")
             print("-" * 60)
 
-            model = build_model("eddy_unet", in_channels=in_ch, out_channels=1).to(device)
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=EDDY_UNET_WEIGHT_DECAY)
+            model = build_model("du_unet", out_channels=1).to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=DU_UNET_WEIGHT_DECAY)
             scheduler = torch.optim.lr_scheduler.StepLR(
                 optimizer, step_size=max(epochs // 3, 1), gamma=0.5
             )
-            ckpt_name = EDDY_UNET_CKPT_NAME_TEMPLATE.format(depth_m=depth_m)
+            ckpt_name = DU_UNET_CKPT_NAME_TEMPLATE.format(
+                target_var=args.target_var, depth_m=depth_m
+            )
             ckpt_path = os.path.join(ckpt_dir, ckpt_name)
 
             best_val, train_losses, val_losses = train_one_model(
-                "eddy_unet",
+                "du_unet",
                 model,
                 train_loader,
                 val_loader,
@@ -418,51 +424,21 @@ def main():
                 epochs,
                 patience,
                 ckpt_path,
-                use_physics=args.use_physics_features,
                 depth_idx=depth_idx,
             )
 
-            hist_name = EDDY_UNET_HISTORY_NAME_TEMPLATE.format(depth_m=depth_m)
-            curve_name = EDDY_UNET_LOSS_CURVE_TEMPLATE.format(depth_m=depth_m)
+            hist_name = DU_UNET_HISTORY_NAME_TEMPLATE.format(
+                target_var=args.target_var, depth_m=depth_m
+            )
+            curve_name = DU_UNET_LOSS_CURVE_TEMPLATE.format(
+                target_var=args.target_var, depth_m=depth_m
+            )
             np.savez(os.path.join(out_dir, hist_name), train_losses=train_losses, val_losses=val_losses)
             save_loss_curve(train_losses, val_losses, os.path.join(out_dir, curve_name))
             print(f"深度 {depth_m}m 训练完成，best val={best_val:.6f}")
         return
 
-    # 其余 2dto3d 内的 CNN 方法：保持单模型多通道训练
-    epochs = args.epochs or EDDY_UNET_EPOCHS
-    batch_size = args.batch_size or EDDY_UNET_BATCH_SIZE
-    lr = args.lr or EDDY_UNET_LR
-    patience = args.patience or EDDY_UNET_PATIENCE
-    in_ch = EDDY_UNET_IN_CHANNELS_PHYS if args.use_physics_features else EDDY_UNET_IN_CHANNELS_NO_PHYS
-
-    train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size, shuffle=False)
-
-    sample_target = dataset[0]["target"]
-    out_ch = int(sample_target.shape[0]) if sample_target.ndim == 3 else len(DEPTH_LEVELS_26M)
-    model = build_model(method, in_channels=in_ch, out_channels=out_ch).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=EDDY_UNET_WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(epochs // 3, 1), gamma=0.5)
-    ckpt_path = os.path.join(ckpt_dir, f"{method}_best.pth")
-
-    best_val, train_losses, val_losses = train_one_model(
-        method,
-        model,
-        train_loader,
-        val_loader,
-        optimizer,
-        scheduler,
-        device,
-        epochs,
-        patience,
-        ckpt_path,
-        use_physics=args.use_physics_features,
-    )
-    np.savez(os.path.join(out_dir, f"training_history_{method}.npz"), train_losses=train_losses, val_losses=val_losses)
-    save_loss_curve(train_losses, val_losses, os.path.join(out_dir, f"loss_{method}.png"))
-    print(f"\n训练完成。最佳验证损失: {best_val:.6f}")
-    print(f"最佳权重: {ckpt_path}")
+    raise ValueError(f"未识别的方法: {method}")
 
 
 if __name__ == "__main__":

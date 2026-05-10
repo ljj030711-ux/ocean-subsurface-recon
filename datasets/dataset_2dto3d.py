@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from config import DATA_START_DATE, TRAIN_END_DATE
+from config import TWODTO3D_DATA_START_DATE, TRAIN_END_DATE
 from datasets.date_utils import generate_month_numbers, indices_until_date
 from datasets.io_2dto3d import clean_2dto3d, load_2dto3d_raw, validate_2dto3d_shapes
 
@@ -63,11 +63,11 @@ class TwoDto3DDataset(Dataset):
             raise ValueError(f"target_data 需要 (T,D,H,W) 或 (T,D,H,W,2)，实际：{self.target_data.shape}")
 
         self.months = np.asarray(
-            generate_month_numbers(DATA_START_DATE, self.surface_raw.shape[0]),
+            generate_month_numbers(TWODTO3D_DATA_START_DATE, self.surface_raw.shape[0]),
             dtype=np.int64,
         )
         self.fit_indices = indices_until_date(
-            self.surface_raw.shape[0], DATA_START_DATE, TRAIN_END_DATE
+            self.surface_raw.shape[0], TWODTO3D_DATA_START_DATE, TRAIN_END_DATE
         )
         self.surface_raw, self.target_data, self.norm_stats = clean_2dto3d(
             self.surface_raw,

@@ -53,8 +53,8 @@ def main():
     """
     主函数
     """
-    print(report_missing_values("sla_sss", np.load("data/raw/sla_sss_2019-01-01_2023-12-31_10_18_110_118.npy")))
-    print(report_missing_values("sws_true", np.load("data/raw/sws_2019-01-01_2023-12-31_10_18_110_118_0-300.npy")))
+    print(report_missing_values("sla_sss", np.load("data/raw/SSH_2002-01-01_2023-12-31_10_18_110_118.npy")))
+    print(report_missing_values("sws_true", np.load("data/raw/T-FIELD_2002-01-01_2023-12-31_10_18_110_118.npy")))
 
 if __name__ == "__main__":
     main()

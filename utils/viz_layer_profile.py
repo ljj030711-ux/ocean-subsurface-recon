@@ -12,7 +12,7 @@ plt.rcParams['axes.unicode_minus'] = False
 
 def plot_3d_metric_profile(npz_path, metric_name="rmse", output_img_path=None,
                            lon_range=(110, 118), lat_range=(10, 18),
-                           z_max=300, smooth_sigma=1.2):
+                           z_max=300, smooth_sigma=1.2, cbar_label=None):
     """
     三维经纬-深度剖面图（3 条经度剖面）。
 
@@ -85,12 +85,13 @@ def plot_3d_metric_profile(npz_path, metric_name="rmse", output_img_path=None,
     ax.set_zticks(np.linspace(0, z_max, 7))
     ax.view_init(elev=15, azim=-60)
 
-    metric_label_map = {
-        "rmse": "RMSE (psu)", "mae": "MAE (psu)", "mse": "MSE (psu²)",
-    }
-    cbar_label = metric_label_map.get(
-        metric_key.lower(), metric_key.upper().replace("^2", "²")
-    )
+    if cbar_label is None:
+        metric_label_map = {
+            "rmse": "RMSE (psu)", "mae": "MAE (psu)", "mse": "MSE (psu²)",
+        }
+        cbar_label = metric_label_map.get(
+            metric_key.lower(), metric_key.upper().replace("^2", "²")
+        )
     mappable = cm.ScalarMappable(norm=norm, cmap=cmap_obj)
     mappable.set_array(metric_smoothed)
     cbar = fig.colorbar(mappable, ax=ax, shrink=0.7, pad=0.1)

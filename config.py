@@ -8,15 +8,17 @@ DATA_DIR = "./data/raw"
 OUTPUTS_ROOT = "./outputs"
 CHECKPOINTS_ROOT = "./checkpoints"
 
-DATA_START_DATE = "2019-01-01"
+DATA_START_DATE = "2002-01-01"
 DATA_END_DATE = "2023-12-31"
+TWODTO3D_DATA_START_DATE = "2019-01-01"
+TWODTO3D_DATA_END_DATE = "2023-12-31"
 
 TRAIN_END_DATE = "2021-12-31"
 VAL_START_DATE = "2022-01-01"
 VAL_END_DATE = "2022-12-31"
 TEST_START_DATE = "2023-01-01"
 TEST_END_DATE = "2023-12-31"
-TOTAL_DAYS = 1826
+TOTAL_DAYS = 8035
 
 WINDOW_DAYS = 1
 PREDICT_HORIZON_DAYS = 0
@@ -40,7 +42,7 @@ DY = 10000.0
 PARADIGM_2DTO2D = "2dto2d"
 PARADIGM_2DTO3D = "2dto3d"
 
-PARADIGM_2DTO2D_METHODS = {"eddy_unet","eddy_resnet", "eddy_cnn"}
+PARADIGM_2DTO2D_METHODS = {"du_unet"}
 PARADIGM_2DTO3D_METHODS = {"2dvar", "modas", "ocean_transformer"}
 
 # 指定 26 层深度（单位 m）
@@ -48,6 +50,9 @@ DEPTH_LEVELS_26M = [
     0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
     65, 70, 80, 90, 100, 125, 150, 175, 200, 225, 250, 275, 300
 ]
+
+# Du_Unet 使用 5-300m 共 25 层，每层、每个变量训练一个独立 2D->2D 模型。
+DEPTH_LEVELS_25M = DEPTH_LEVELS_26M[1:]
 
 
 def get_output_dir(paradigm, method, base_dir=OUTPUTS_ROOT):
@@ -60,29 +65,31 @@ def get_checkpoint_dir(paradigm, method, base_dir=CHECKPOINTS_ROOT):
 
 # ==================== 数据文件管理 ====================
 
-# 海表与真值（默认都从 DATA_DIR 读取）
-TWODTO2D_SURFACE_FILENAME = "sla_sss_2019-01-01_2023-12-31_10_18_110_118.npy"
-TWODTO2D_TARGET_FILENAME = "sws_2019-01-01_2023-12-31_10_18_110_118_0-300.npy"
+# Du_Unet 海表输入与温盐真值（默认都从 DATA_DIR 读取）
+TWODTO2D_SST_FILENAME = "SST_2002-01-01_2023-12-31_10_18_110_118.npy"
+TWODTO2D_SSH_FILENAME = "SSH_2002-01-01_2023-12-31_10_18_110_118.npy"
+TWODTO2D_SSS_FILENAME = "SSS_2002-01-01_2023-12-31_10_18_110_118.npy"
+TWODTO2D_TARGET_FILENAMES = {
+    "temperature": "T-FIELD_2002-01-01_2023-12-31_10_18_110_118.npy",
+    "salinity": "S-FIELD_2002-01-01_2023-12-31_10_18_110_118.npy",
+}
 
-TWODTO3D_SURFACE_FILENAME = TWODTO2D_SURFACE_FILENAME
-TWODTO3D_TARGET_FILENAME = TWODTO2D_TARGET_FILENAME
+# 2dto3d 旧流程暂时保持原始 2019-2023 数据文件。
+TWODTO3D_SURFACE_FILENAME = "sla_sss_2019-01-01_2023-12-31_10_18_110_118.npy"
+TWODTO3D_TARGET_FILENAME = "sws_2019-01-01_2023-12-31_10_18_110_118_0-300.npy"
 
-# ==================== EddyUNet（2dto2d） ====================
+# ==================== Du_Unet（2dto2d） ====================
 
-EDDY_UNET_USE_PHYSICS_FEATURES = False
-EDDY_UNET_IN_CHANNELS_NO_PHYS = 2
-EDDY_UNET_IN_CHANNELS_PHYS = 4
+DU_UNET_EPOCHS = 20
+DU_UNET_BATCH_SIZE = 4
+DU_UNET_LR = 1e-3
+DU_UNET_WEIGHT_DECAY = 1e-5
+DU_UNET_PATIENCE = 10
+DU_UNET_LAMBDA_SMOOTH = 0.1
 
-EDDY_UNET_EPOCHS = 20
-EDDY_UNET_BATCH_SIZE = 4
-EDDY_UNET_LR = 1e-3
-EDDY_UNET_WEIGHT_DECAY = 1e-5
-EDDY_UNET_PATIENCE = 10
-EDDY_UNET_LAMBDA_SMOOTH = 0.1
-
-EDDY_UNET_CKPT_NAME_TEMPLATE = "eddy_unet_depth{depth_m}m_best.pth"
-EDDY_UNET_HISTORY_NAME_TEMPLATE = "training_history_eddy_unet_depth{depth_m}m.npz"
-EDDY_UNET_LOSS_CURVE_TEMPLATE = "loss_eddy_unet_depth{depth_m}m.png"
+DU_UNET_CKPT_NAME_TEMPLATE = "Du_Unet_{target_var}_depth{depth_m}m_best.pth"
+DU_UNET_HISTORY_NAME_TEMPLATE = "training_history_Du_Unet_{target_var}_depth{depth_m}m.npz"
+DU_UNET_LOSS_CURVE_TEMPLATE = "loss_Du_Unet_{target_var}_depth{depth_m}m.png"
 
 # ==================== 2dvar（2dto3d） ====================
 
