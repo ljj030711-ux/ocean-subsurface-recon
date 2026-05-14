@@ -68,12 +68,13 @@ def clean_and_normalize_2dto2d(
     normalize=False,
     months=None,
     fit_indices=None,
+    start_date=None,
 ):
     """缺失值处理与可选月气候态距平归一化，并返回统计量。"""
-    report_missing_values("2dto2d.sst", sst)
-    report_missing_values("2dto2d.ssh", ssh)
-    report_missing_values("2dto2d.sss", sss)
-    report_missing_values("2dto2d.target", target)
+    report_missing_values("2dto2d.sst", sst, start_date=start_date)
+    report_missing_values("2dto2d.ssh", ssh, start_date=start_date)
+    report_missing_values("2dto2d.sss", sss, start_date=start_date)
+    report_missing_values("2dto2d.target", target, start_date=start_date, depth_dim=1)
 
     if normalize:
         if months is None:

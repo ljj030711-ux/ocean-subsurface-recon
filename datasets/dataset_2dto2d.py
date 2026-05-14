@@ -92,6 +92,7 @@ class Dataset2Dto2D(Dataset):
             normalize=self.normalize,
             months=self.months,
             fit_indices=self.fit_indices,
+            start_date=self.start_date,
         )
         
         # 数据统计
