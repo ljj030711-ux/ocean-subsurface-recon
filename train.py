@@ -7,7 +7,6 @@ from datetime import datetime
 import matplotlib
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 matplotlib.use("Agg")
@@ -24,7 +23,6 @@ from config import (
     DU_UNET_CKPT_NAME_TEMPLATE,
     DU_UNET_EPOCHS,
     DU_UNET_HISTORY_NAME_TEMPLATE,
-    DU_UNET_LAMBDA_SMOOTH,
     DU_UNET_LOSS_CURVE_TEMPLATE,
     DU_UNET_LR,
     DU_UNET_PATIENCE,
@@ -54,11 +52,14 @@ from config import (
     SEED,
     get_checkpoint_dir,
     get_output_dir,
+    get_variable_checkpoint_dir,
+    get_variable_output_dir,
 )
 from datasets.dataset_2dto2d import Dataset2Dto2D
 from datasets.dataset_2dto3d import DummyTwoDto3DDataset
 from models.du_unet import Du_Unet
 from models.ocean_transformer import OceanTransformer
+from utils.losses import masked_rmse_loss
 from utils.physics import compute_eke, compute_grad_ssh
 from utils.physics_loss import PhysicsLoss
 
@@ -120,12 +121,6 @@ def save_loss_curve(train_losses, val_losses, output_path):
     print(f"损失曲线已保存至：{output_path}")
 
 
-def smooth_loss(x):
-    loss_x = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
-    loss_y = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean()
-    return loss_x + loss_y
-
-
 def select_target_depth(target, depth_idx=None):
     if depth_idx is None:
         return target
@@ -134,15 +129,16 @@ def select_target_depth(target, depth_idx=None):
     return target[:, depth_idx : depth_idx + 1]
 
 
-def train_2dto2d_epoch(model, loader, optimizer, device, lambda_smooth, depth_idx=None):
+def train_2dto2d_epoch(model, loader, optimizer, device, depth_idx=None):
     model.train()
     total, count = 0.0, 0
     for batch in loader:
         sst = batch["sst"].to(device)
         ssh_sss = batch["ssh_sss"].to(device)
         target = select_target_depth(batch["target"].to(device), depth_idx=depth_idx)
+        target_mask = select_target_depth(batch["target_mask"].to(device), depth_idx=depth_idx)
         pred = model(sst, ssh_sss)
-        loss = F.mse_loss(pred, target) + lambda_smooth * smooth_loss(pred)
+        loss = masked_rmse_loss(pred, target, target_mask)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -160,7 +156,8 @@ def validate_2dto2d(model, loader, device, depth_idx=None):
             sst = batch["sst"].to(device)
             ssh_sss = batch["ssh_sss"].to(device)
             target = select_target_depth(batch["target"].to(device), depth_idx=depth_idx)
-            loss = F.mse_loss(model(sst, ssh_sss), target)
+            target_mask = select_target_depth(batch["target_mask"].to(device), depth_idx=depth_idx)
+            loss = masked_rmse_loss(model(sst, ssh_sss), target, target_mask)
             total += loss.item()
             count += 1
     return total / max(count, 1)
@@ -242,8 +239,7 @@ def train_one_model(
             v_loss = validate_2dto3d(model, val_loader, device, criterion)
         else:
             t_loss = train_2dto2d_epoch(
-                model, train_loader, optimizer, device,
-                DU_UNET_LAMBDA_SMOOTH, depth_idx=depth_idx
+                model, train_loader, optimizer, device, depth_idx=depth_idx
             )
             v_loss = validate_2dto2d(model, val_loader, device, depth_idx=depth_idx)
 
@@ -320,8 +316,16 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    out_dir = get_output_dir(paradigm, method_dir, base_dir=args.output_dir)
-    ckpt_dir = get_checkpoint_dir(paradigm, method_dir, base_dir=args.checkpoint_dir)
+    if method == "du_unet":
+        out_dir = get_variable_output_dir(
+            paradigm, method_dir, args.target_var, base_dir=args.output_dir
+        )
+        ckpt_dir = get_variable_checkpoint_dir(
+            paradigm, method_dir, args.target_var, base_dir=args.checkpoint_dir
+        )
+    else:
+        out_dir = get_output_dir(paradigm, method_dir, base_dir=args.output_dir)
+        ckpt_dir = get_checkpoint_dir(paradigm, method_dir, base_dir=args.checkpoint_dir)
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 

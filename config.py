@@ -45,7 +45,7 @@ PARADIGM_2DTO3D = "2dto3d"
 PARADIGM_2DTO2D_METHODS = {"du_unet"}
 PARADIGM_2DTO3D_METHODS = {"2dvar", "modas", "ocean_transformer"}
 
-# 指定 26 层深度（单位 m）
+# 指定 26 层深度（旧参数， 单位 m）
 DEPTH_LEVELS_26M = [
     0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
     65, 70, 80, 90, 100, 125, 150, 175, 200, 225, 250, 275, 300
@@ -54,7 +54,7 @@ DEPTH_LEVELS_26M = [
 # Du_Unet 使用 5-300m 共 25 层，每层、每个变量训练一个独立 2D->2D 模型。
 DEPTH_LEVELS_25M = DEPTH_LEVELS_26M[1:]
 
-
+# 结果保存路径拼接
 def get_output_dir(paradigm, method, base_dir=OUTPUTS_ROOT):
     return f"{base_dir}/{paradigm}/{method}"
 
@@ -81,11 +81,11 @@ TWODTO3D_TARGET_FILENAME = "sws_2019-01-01_2023-12-31_10_18_110_118_0-300.npy"
 # ==================== Du_Unet（2dto2d） ====================
 
 DU_UNET_EPOCHS = 20
-DU_UNET_BATCH_SIZE = 4
+DU_UNET_BATCH_SIZE = 32
 DU_UNET_LR = 1e-3
 DU_UNET_WEIGHT_DECAY = 1e-5
 DU_UNET_PATIENCE = 10
-DU_UNET_LAMBDA_SMOOTH = 0.1
+DU_UNET_LAMBDA_SMOOTH = 0
 
 DU_UNET_CKPT_NAME_TEMPLATE = "Du_Unet_{target_var}_depth{depth_m}m_best.pth"
 DU_UNET_HISTORY_NAME_TEMPLATE = "training_history_Du_Unet_{target_var}_depth{depth_m}m.npz"

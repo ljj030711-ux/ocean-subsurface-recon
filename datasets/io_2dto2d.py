@@ -75,6 +75,7 @@ def clean_and_normalize_2dto2d(
     report_missing_values("2dto2d.ssh", ssh, start_date=start_date)
     report_missing_values("2dto2d.sss", sss, start_date=start_date)
     report_missing_values("2dto2d.target", target, start_date=start_date, depth_dim=1)
+    target_mask = np.isfinite(target).astype(np.float32)
 
     if normalize:
         if months is None:
@@ -103,6 +104,7 @@ def clean_and_normalize_2dto2d(
             ssh_norm.transform(ssh, months),
             sss_norm.transform(sss, months),
             target_norm.transform(target, months),
+            target_mask,
             stats,
         )
 
@@ -111,4 +113,4 @@ def clean_and_normalize_2dto2d(
     ssh = sanitize_with_value(ssh, fill_value=0.0)
     sss = sanitize_with_value(sss, fill_value=0.0)
     target = sanitize_with_value(target, fill_value=0.0)
-    return sst, ssh, sss, target, stats
+    return sst, ssh, sss, target, target_mask, stats

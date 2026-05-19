@@ -33,13 +33,14 @@ from config import (
     TWODTO3D_DEPTH_LEVELS,
     get_checkpoint_dir,
     get_output_dir,
+    get_variable_output_dir,
 )
 from datasets.date_utils import date_to_index
 from datasets.climatology_normalizer import MonthlyClimatologyLayerStdNormalizer
 from datasets.non_dl_preprocess import get_dataset_split, load_and_validate, load_sla_sss
 from utils.metrics import (
     compute_grid_metrics, extract_level_map, save_grid_metrics,
-    mse, rmse, mae, r2,
+    scalar_metrics,
 )
 from utils.viz_layer_2d import plot_level_map
 from utils.viz_layer_profile import plot_3d_metric_profile
@@ -213,20 +214,28 @@ def predict_2dto2d(args):
     sst = sample["sst"].unsqueeze(0).to(device)
     ssh_sss = sample["ssh_sss"].unsqueeze(0).to(device)
 
-    ckpt_dir = args.checkpoint_dir or get_checkpoint_dir(
-        PARADIGM_2DTO2D, "Du_Unet", base_dir=CHECKPOINTS_ROOT
-    )
+    ckpt_dirs = _du_unet_checkpoint_dirs(args)
     pred_list = []
     for depth_m in DEPTH_LEVELS_25M:
         ckpt_name = DU_UNET_CKPT_NAME_TEMPLATE.format(
             target_var=args.target_var, depth_m=depth_m
         )
-        ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+        ckpt_path = next(
+            (
+                os.path.join(candidate_dir, ckpt_name)
+                for candidate_dir in ckpt_dirs
+                if os.path.exists(os.path.join(candidate_dir, ckpt_name))
+            ),
+            os.path.join(ckpt_dirs[0], ckpt_name),
+        )
         model = build_model("du_unet", out_channels=1).to(device)
         if os.path.exists(ckpt_path):
             model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
         else:
-            print(f"[警告] 未找到 {args.target_var} 深度 {depth_m}m checkpoint：{ckpt_path}，将使用随机权重")
+            print(
+                f"[警告] 未找到 {args.target_var} 深度 {depth_m}m checkpoint；"
+                f"已查找：{', '.join(os.path.join(d, ckpt_name) for d in ckpt_dirs)}，将使用随机权重"
+            )
         model.eval()
         with torch.no_grad():
             pred_layer = model(sst, ssh_sss).cpu().numpy()
@@ -234,6 +243,7 @@ def predict_2dto2d(args):
     y_pred = np.concatenate(pred_list, axis=1)
 
     y_true = sample["target"].unsqueeze(0).numpy()      # (1, C, H, W)
+    target_mask = sample["target_mask"].unsqueeze(0).numpy()
 
     if norm_stats.get("normalization") == "monthly_climatology_layer_std":
         target_norm = MonthlyClimatologyLayerStdNormalizer.from_stats(norm_stats["target"])
@@ -241,21 +251,10 @@ def predict_2dto2d(args):
         y_pred = target_norm.inverse_transform(y_pred, months)
         y_true = target_norm.inverse_transform(y_true, months)
 
-    return y_pred, y_true
+    return y_pred, y_true, target_mask
 
 
 # ==================== 统一输出 ====================
-
-def _scalar_metrics(y_true_flat, y_pred_flat):
-    mask = np.isfinite(y_true_flat) & np.isfinite(y_pred_flat)
-    yt, yp = y_true_flat[mask], y_pred_flat[mask]
-    return {
-        "mse": float(mse(yt, yp)),
-        "rmse": float(rmse(yt, yp)),
-        "mae": float(mae(yt, yp)),
-        "r2": float(r2(yt, yp)),
-    }
-
 
 def _metric_units(is_2dto3d):
     if is_2dto3d:
@@ -265,12 +264,14 @@ def _metric_units(is_2dto3d):
                 "rmse": "degC",
                 "mae": "degC",
                 "r2": "dimensionless",
+                "correlation": "dimensionless",
             },
             "salinity": {
                 "mse": "psu^2",
                 "rmse": "psu",
                 "mae": "psu",
                 "r2": "dimensionless",
+                "correlation": "dimensionless",
             },
         }
     return {
@@ -278,6 +279,7 @@ def _metric_units(is_2dto3d):
         "rmse": "physical_unit",
         "mae": "physical_unit",
         "r2": "dimensionless",
+        "correlation": "dimensionless",
     }
 
 
@@ -287,6 +289,22 @@ def _target_var_for_outputs(args, is_2dto3d):
     if getattr(args, "method", None) == "Du_Unet":
         return getattr(args, "target_var", None)
     return None
+
+
+def _du_unet_checkpoint_dirs(args):
+    base_dir = args.checkpoint_dir or get_checkpoint_dir(
+        PARADIGM_2DTO2D, "Du_Unet", base_dir=CHECKPOINTS_ROOT
+    )
+    if os.path.basename(os.path.normpath(base_dir)) == args.target_var:
+        candidates = [base_dir, os.path.dirname(os.path.normpath(base_dir))]
+    else:
+        candidates = [os.path.join(base_dir, args.target_var), base_dir]
+
+    ordered = []
+    for path in candidates:
+        if path and path not in ordered:
+            ordered.append(path)
+    return ordered
 
 
 def _depth_label_2dto2d(level_idx):
@@ -329,6 +347,12 @@ def _finite_vmin_vmax(*arrays):
         pad = abs(vmin) * 0.05 if vmin else 1.0
         return vmin - pad, vmax + pad
     return vmin, vmax
+
+
+def _apply_mask(array, mask):
+    if mask is None:
+        return array
+    return np.where(mask.astype(bool), array, np.nan)
 
 
 def plot_prediction_truth_error_panel(
@@ -377,7 +401,7 @@ def plot_prediction_truth_error_panel(
     print(f"预测-真值-误差三联图已保存至：{output_path}")
 
 
-def save_outputs(args, y_pred, y_true, out_dir):
+def save_outputs(args, y_pred, y_true, out_dir, mask=None):
     """统一产物保存：npy / npz / 2D 图 / 3D 剖面 / summary.json"""
     method = args.method
     day = args.select_day
@@ -440,7 +464,7 @@ def save_outputs(args, y_pred, y_true, out_dir):
             for vi, vname in enumerate(["temperature", "salinity"]):
                 vp = y_pred[..., vi]
                 vt = y_true[..., vi]
-                summary["variables"][vname] = _scalar_metrics(vt.flatten(), vp.flatten())
+                summary["variables"][vname] = scalar_metrics(vt, vp)
 
             pred_all = y_pred[0]
             true_all = y_true[0]
@@ -465,19 +489,24 @@ def save_outputs(args, y_pred, y_true, out_dir):
                 lon_range=LON_RANGE, lat_range=LAT_RANGE,
                 z_max=INFER_PROFILE_ZMAX)
         else:
-            grid = compute_grid_metrics(y_true, y_pred)
+            grid = compute_grid_metrics(y_true, y_pred, mask=mask)
             metrics_name = metrics_filename(method, day, target_var=output_target_var)
             npz_path = os.path.join(out_dir, metrics_name)
             save_grid_metrics(grid, npz_path)
 
-            summary["variables"][getattr(args, "target_var", "target")] = _scalar_metrics(
-                y_true.flatten(), y_pred.flatten())
+            summary["variables"][getattr(args, "target_var", "target")] = scalar_metrics(
+                y_true, y_pred, mask=mask)
 
             if y_true.ndim >= 3 and (y_true.ndim < 4 or y_true.shape[1] > 1):
                 mae_level = extract_level_map(grid["mae"], level)
                 if output_target_var:
                     pred_level = y_pred[0, level] if y_pred.ndim == 4 else y_pred[level]
                     true_level = y_true[0, level] if y_true.ndim == 4 else y_true[level]
+                    mask_level = None
+                    if mask is not None:
+                        mask_level = mask[0, level] if mask.ndim == 4 else mask[level]
+                        pred_level = _apply_mask(pred_level, mask_level)
+                        true_level = _apply_mask(true_level, mask_level)
                     panel_path = os.path.join(
                         out_dir,
                         map_filename("panel", level, method, day, target_var=output_target_var),
@@ -563,7 +592,12 @@ def main():
         paradigm = PARADIGM_2DTO2D
     else:
         paradigm = PARADIGM_2DTO3D
-    out_dir = get_output_dir(paradigm, args.method, base_dir=args.output_dir)
+    if method == "du_unet":
+        out_dir = get_variable_output_dir(
+            paradigm, args.method, args.target_var, base_dir=args.output_dir
+        )
+    else:
+        out_dir = get_output_dir(paradigm, args.method, base_dir=args.output_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 60)
@@ -573,14 +607,16 @@ def main():
 
     if method in NON_DL_METHODS:
         y_pred, y_true = predict_non_dl(args)
+        mask = None
     elif method == "ocean_transformer":
         y_pred, y_true = predict_2dto3d(args)
+        mask = None
     elif method in DL_2DTO2D_METHODS:
-        y_pred, y_true = predict_2dto2d(args)
+        y_pred, y_true, mask = predict_2dto2d(args)
     else:
         raise ValueError(f"未知方法: {method}")
 
-    save_outputs(args, y_pred, y_true, out_dir)
+    save_outputs(args, y_pred, y_true, out_dir, mask=mask)
     print("\n预测评估完成。")
 
 

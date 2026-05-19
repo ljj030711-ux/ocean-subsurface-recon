@@ -11,6 +11,8 @@
 
 - `outputs/{paradigm}/{method}/...`
 - `checkpoints/{paradigm}/{method}/...`
+- Du_Unet 按变量额外分目录：`outputs/2dto2d/Du_Unet/{temperature|salinity}/...`
+- Du_Unet 权重按变量额外分目录：`checkpoints/2dto2d/Du_Unet/{temperature|salinity}/...`
 
 ## 模型思路
 
@@ -72,9 +74,15 @@ ocean-subsurface-recon/
 ├── utils/                        # physics / loss / metrics / viz
 ├── outputs/
 │   ├── 2dto2d/
+│   │   └── Du_Unet/
+│   │       ├── temperature/
+│   │       └── salinity/
 │   └── 2dto3d/
 └── checkpoints/
     ├── 2dto2d/
+    │   └── Du_Unet/
+    │       ├── temperature/
+    │       └── salinity/
     └── 2dto3d/
 ```
 
@@ -91,10 +99,11 @@ pip install -r requirements.txt
 ```bash
 # 2dto2d: Du_Unet（一次训练一个变量的25层）
 python train.py --method Du_Unet --target-var temperature \
-  --start-date 2021-01-01 --end-date 2023-12-31 --data-dir ./data/raw
-  # --depth-indices 9 可选，第9个深度，不是9m
+  --start-date 2002-01-01 --end-date 2023-12-31 --data-dir ./data/raw
+
+# --depth-indices 9 可选，第9个深度，不是9m
 python train.py --method Du_Unet --target-var salinity \
-  --start-date 2021-01-01 --end-date 2023-12-31 --data-dir ./data/raw
+  --start-date 2002-01-01 --end-date 2023-12-31 --data-dir ./data/raw
 
 # 2dto3d: ocean_transformer
 python train.py --method ocean_transformer --data-dir ./data/raw
@@ -104,8 +113,12 @@ python train.py --method ocean_transformer --data-dir ./data/raw
 
 ```bash
 # 2dto2d: Du_Unet（逐层加载checkpoint并拼装）
-python test.py --method Du_Unet --target-var temperature --select-day 2023-06-15 --target-level 10 \
-  --start-date 2021-01-01 --end-date 2023-12-31 \
+python test.py --method Du_Unet --target-var temperature --select-day 2023-03-12 --target-level 10 \
+  --start-date 2002-01-01 --end-date 2023-12-31 \
+  --data-dir ./data/raw --checkpoint-dir ./checkpoints/2dto2d/Du_Unet
+
+python test.py --method Du_Unet --target-var salinity --select-day 2023-03-12 --target-level 10 \
+  --start-date 2002-01-01 --end-date 2023-12-31 \
   --data-dir ./data/raw --checkpoint-dir ./checkpoints/2dto2d/Du_Unet
 
 # 2dto3d: 2dvar
@@ -125,13 +138,21 @@ python test.py --method modas --select-day 2023-06-15 --target-level 10 \
 1. 指定层 2D 图：`plot_level_map`
 2. 3D 误差剖面图：`plot_3d_metric_profile`
 
-统一输出文件（位于 `outputs/{paradigm}/{method}/`）：
+统一输出文件（位于 `outputs/{paradigm}/{method}/`；Du_Unet 位于 `outputs/2dto2d/Du_Unet/{target_var}/`）：
 
 - `pred_{method}_{date}.npy`
 - `grid_metrics_{method}_{date}.npz`
 - `map_*_lvl{level}_{method}_{date}.png`
 - `profile_{metric}_{method}_{date}.png`
 - `summary_{method}_{date}.json`
+
+Du_Unet 会在变量目录内保留变量名，例如：
+
+- `pred_Du_Unet_temperature_20230615.npy`
+- `grid_metrics_Du_Unet_salinity_20230615.npz`
+- `map_panel_temperature_lvl10_Du_Unet_20230615.png`
+- `map_mae_salinity_lvl10_Du_Unet_20230615.png`
+- `summary_Du_Unet_temperature_20230615.json`
 
 `summary` 中包含：
 

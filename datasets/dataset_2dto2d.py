@@ -44,6 +44,7 @@ class Dataset2Dto2D(Dataset):
         sst: (1,160,160)
         ssh_sss: (2,64,64)
         target: (25,64,64)
+        target_mask: (25,64,64)
     """
     
     def __init__(
@@ -84,7 +85,14 @@ class Dataset2Dto2D(Dataset):
         )
         if len(self.fit_indices) == 0:
             self.fit_indices = list(range(self.sst.shape[0]))
-        self.sst, self.ssh, self.sss, self.target, self.norm_stats = clean_and_normalize_2dto2d(
+        (
+            self.sst,
+            self.ssh,
+            self.sss,
+            self.target,
+            self.target_mask,
+            self.norm_stats,
+        ) = clean_and_normalize_2dto2d(
             self.sst,
             self.ssh,
             self.sss,
@@ -119,6 +127,7 @@ class Dataset2Dto2D(Dataset):
             "sst": torch.tensor(self.sst[idx], dtype=torch.float32).unsqueeze(0),
             "ssh_sss": torch.tensor(ssh_sss, dtype=torch.float32),
             "target": target,
+            "target_mask": torch.tensor(self.target_mask[idx], dtype=torch.float32),
         }
     
     def get_data_info(self):

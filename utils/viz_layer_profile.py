@@ -10,6 +10,21 @@ plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 
+def _nan_gaussian_filter(data, sigma):
+    """Smooth finite values without letting NaNs contaminate the full field."""
+    finite = np.isfinite(data)
+    if not np.any(finite):
+        return np.full_like(data, np.nan, dtype=np.float32)
+    filled = np.where(finite, data, 0.0)
+    weights = finite.astype(np.float32)
+    smoothed = gaussian_filter(filled, sigma=sigma)
+    smoothed_weights = gaussian_filter(weights, sigma=sigma)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = smoothed / smoothed_weights
+    out[smoothed_weights <= 1e-6] = np.nan
+    return out
+
+
 def plot_3d_metric_profile(npz_path, metric_name="rmse", output_img_path=None,
                            lon_range=(110, 118), lat_range=(10, 18),
                            z_max=300, smooth_sigma=1.2, cbar_label=None):
@@ -41,7 +56,7 @@ def plot_3d_metric_profile(npz_path, metric_name="rmse", output_img_path=None,
         metric_data = np.squeeze(metric_data, axis=0)
     D, H, W = metric_data.shape
 
-    metric_smoothed = gaussian_filter(
+    metric_smoothed = _nan_gaussian_filter(
         metric_data, sigma=(smooth_sigma, smooth_sigma, smooth_sigma)
     )
 
@@ -52,8 +67,19 @@ def plot_3d_metric_profile(npz_path, metric_name="rmse", output_img_path=None,
     x_idx_list = [0, W // 2, W - 1]
     lon_pos_list = lon[x_idx_list]
 
-    norm = Normalize(vmin=metric_smoothed.min(), vmax=metric_smoothed.max())
-    cmap_obj = cm.jet
+    finite_metric = metric_smoothed[np.isfinite(metric_smoothed)]
+    if finite_metric.size:
+        vmin = float(np.nanmin(finite_metric))
+        vmax = float(np.nanmax(finite_metric))
+        if vmin == vmax:
+            pad = abs(vmin) * 0.05 if vmin else 1.0
+            vmin -= pad
+            vmax += pad
+    else:
+        vmin, vmax = 0.0, 1.0
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    cmap_obj = plt.get_cmap("jet").copy()
+    cmap_obj.set_bad((0, 0, 0, 0))
 
     fig = plt.figure(figsize=(16, 9), dpi=150)
     ax = fig.add_subplot(projection='3d')
@@ -63,7 +89,7 @@ def plot_3d_metric_profile(npz_path, metric_name="rmse", output_img_path=None,
         profile = metric_smoothed[:, :, x_idx]
         Y, Z = np.meshgrid(lat, z)
         X = np.full_like(Y, lon_pos_list[idx])
-        face_colors = cmap_obj(norm(profile))
+        face_colors = cmap_obj(norm(np.ma.masked_invalid(profile)))
         ax.plot_surface(
             X, Y, Z, rstride=2, cstride=2,
             facecolors=face_colors, shade=False,
@@ -93,7 +119,7 @@ def plot_3d_metric_profile(npz_path, metric_name="rmse", output_img_path=None,
             metric_key.lower(), metric_key.upper().replace("^2", "²")
         )
     mappable = cm.ScalarMappable(norm=norm, cmap=cmap_obj)
-    mappable.set_array(metric_smoothed)
+    mappable.set_array(np.ma.masked_invalid(metric_smoothed))
     cbar = fig.colorbar(mappable, ax=ax, shrink=0.7, pad=0.1)
     cbar.set_label(cbar_label, fontsize=10)
     cbar.ax.tick_params(labelsize=8)
