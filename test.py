@@ -33,7 +33,6 @@ from config import (
     TWODTO3D_DEPTH_LEVELS,
     get_checkpoint_dir,
     get_output_dir,
-    get_variable_output_dir,
 )
 from datasets.date_utils import date_to_index
 from datasets.climatology_normalizer import MonthlyClimatologyLayerStdNormalizer
@@ -593,8 +592,8 @@ def main():
     else:
         paradigm = PARADIGM_2DTO3D
     if method == "du_unet":
-        out_dir = get_variable_output_dir(
-            paradigm, args.method, args.target_var, base_dir=args.output_dir
+        out_dir = get_output_dir(
+            paradigm, args.method, base_dir=args.output_dir, target_var=args.target_var
         )
     else:
         out_dir = get_output_dir(paradigm, args.method, base_dir=args.output_dir)

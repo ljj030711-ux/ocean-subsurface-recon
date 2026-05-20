@@ -52,8 +52,6 @@ from config import (
     SEED,
     get_checkpoint_dir,
     get_output_dir,
-    get_variable_checkpoint_dir,
-    get_variable_output_dir,
 )
 from datasets.dataset_2dto2d import Dataset2Dto2D
 from datasets.dataset_2dto3d import DummyTwoDto3DDataset
@@ -264,7 +262,7 @@ def train_one_model(
 
 
 def parse_depth_indices(depth_indices_arg):
-    # 如果没穿，训练该变量的全部 25 个深度层
+    # 如果没传，训练该变量的全部 25 个深度层
     if not depth_indices_arg:
         return list(range(len(DEPTH_LEVELS_25M)))
     out = []
@@ -317,11 +315,11 @@ def main():
     np.random.seed(args.seed)
 
     if method == "du_unet":
-        out_dir = get_variable_output_dir(
-            paradigm, method_dir, args.target_var, base_dir=args.output_dir
+        out_dir = get_output_dir(
+            paradigm, method_dir, base_dir=args.output_dir, target_var=args.target_var
         )
-        ckpt_dir = get_variable_checkpoint_dir(
-            paradigm, method_dir, args.target_var, base_dir=args.checkpoint_dir
+        ckpt_dir = get_checkpoint_dir(
+            paradigm, method_dir, base_dir=args.checkpoint_dir, target_var=args.target_var
         )
     else:
         out_dir = get_output_dir(paradigm, method_dir, base_dir=args.output_dir)

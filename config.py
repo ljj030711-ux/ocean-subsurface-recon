@@ -54,13 +54,19 @@ DEPTH_LEVELS_26M = [
 # Du_Unet 使用 5-300m 共 25 层，每层、每个变量训练一个独立 2D->2D 模型。
 DEPTH_LEVELS_25M = DEPTH_LEVELS_26M[1:]
 
-# 结果保存路径拼接
-def get_output_dir(paradigm, method, base_dir=OUTPUTS_ROOT):
-    return f"{base_dir}/{paradigm}/{method}"
+# 结果保存路径拼接；target_var 用于 Du_Unet 的温度/盐度分目录。
+def get_output_dir(paradigm, method, base_dir=OUTPUTS_ROOT, target_var=None):
+    path = f"{base_dir}/{paradigm}/{method}"
+    if target_var:
+        path = f"{path}/{target_var}"
+    return path
 
 
-def get_checkpoint_dir(paradigm, method, base_dir=CHECKPOINTS_ROOT):
-    return f"{base_dir}/{paradigm}/{method}"
+def get_checkpoint_dir(paradigm, method, base_dir=CHECKPOINTS_ROOT, target_var=None):
+    path = f"{base_dir}/{paradigm}/{method}"
+    if target_var:
+        path = f"{path}/{target_var}"
+    return path
 
 
 # ==================== 数据文件管理 ====================
@@ -85,7 +91,6 @@ DU_UNET_BATCH_SIZE = 32
 DU_UNET_LR = 1e-3
 DU_UNET_WEIGHT_DECAY = 1e-5
 DU_UNET_PATIENCE = 10
-DU_UNET_LAMBDA_SMOOTH = 0
 
 DU_UNET_CKPT_NAME_TEMPLATE = "Du_Unet_{target_var}_depth{depth_m}m_best.pth"
 DU_UNET_HISTORY_NAME_TEMPLATE = "training_history_Du_Unet_{target_var}_depth{depth_m}m.npz"

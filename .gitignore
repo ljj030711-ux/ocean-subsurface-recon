@@ -1,3 +1,4 @@
+# ide运行文件
 .DS_Store
 **/.DS_Store
 .conda/
@@ -10,9 +11,9 @@ __pycache__/
 checkpoints/
 outputs/
 
-
 # 原始栅格/体数据（体积常超过 GitHub 单文件 100MB 限制；本地路径见 README）
-data/raw/*.npy
+data/
 
-# 根据项目生成的报告和文档
+# 其他临时文件和目录
 reports/
+scripts/
