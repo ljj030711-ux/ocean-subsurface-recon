@@ -23,6 +23,7 @@
 - 训练：按深度列表循环，目标为单层 `(B,1,H,W)`。
 - 推理：逐深度加载模型并拼装为 `(1,25,64,64)`，再统一评估与绘图。
 - 评估口径：`test.py` 中会将标准化输出反标准化回温度或盐度物理量后再评估。
+- 单位处理：SST 若检测为 Kelvin，会在 2dto2d 前处理中自动减去 273.15 转为 Celsius，与温度标签单位对齐。
 
 ### 2) 2dvar（2dto3d）
 
@@ -153,6 +154,13 @@ python test.py --method Du_Unet --target-var salinity --select-day 2023-03-12 --
   --start-date 2002-01-01 --end-date 2023-12-31 \
   --data-dir ./data/raw --checkpoint-dir ./checkpoints/2dto2d/Du_Unet
 
+# 2dto2d: Du_Unet（2023 全年测试集整体评估）
+python test.py --method Du_Unet --target-var temperature \
+  --eval-start 2023-01-01 --eval-end 2023-12-31 \
+  --eval-batch-size 32 \
+  --start-date 2002-01-01 --end-date 2023-12-31 \
+  --data-dir ./data/raw --checkpoint-dir ./checkpoints/2dto2d/Du_Unet
+
 # 2dto3d: 2dvar
 python test.py --method 2dvar --select-day 2023-06-15 --target-level 10 \
   --sla-sss-path ./data/raw/sla_sss_2019-01-01_2023-12-31_10_18_110_118.npy
@@ -166,7 +174,10 @@ python test.py --method modas --select-day 2023-06-15 --target-level 10 \
 | 参数 | 含义 |
 | --- | --- |
 | `--method` | 推理/评估方法，支持 `Du_Unet` / `du_unet`、`ocean_transformer`、`2dvar`、`modas`。 |
-| `--select-day` | 预测日期，格式 `YYYY-MM-DD`。 |
+| `--select-day` | 单日案例预测日期，格式 `YYYY-MM-DD`；与 `--eval-start` 二选一。 |
+| `--eval-start` | 时间段整体评估起始日期，目前仅支持 Du_Unet。 |
+| `--eval-end` | 时间段整体评估结束日期，使用 `--eval-start` 时必须提供。 |
+| `--eval-batch-size` | 时间段推理 batch size，默认 4，不影响指标口径。 |
 | `--target-level` | 可视化深度层索引，不是米数；Du_Unet 中 `10` 表示 55m。 |
 | `--output-dir` | 推理产物输出根目录，默认 `./outputs`。 |
 | `--checkpoint` | 单模型权重路径，主要用于 `ocean_transformer`。 |
@@ -204,7 +215,21 @@ Du_Unet 会在变量目录内保留变量名，例如：
 - `map_panel_temperature_lvl10_Du_Unet_20230615.png`
 - `summary_Du_Unet_temperature_20230615.json`
 
-`summary` 中包含：
+Du_Unet 时间段模式输出四个文件，不保存完整预测，也不生成指定深度三栏图或三维剖面图：
+
+- `evaluation_metrics_Du_Unet_temperature_20230101_20231231.npz`
+- `summary_Du_Unet_temperature_20230101_20231231.json`
+- `metrics_by_depth_Du_Unet_temperature_20230101_20231231.png`
+- `metrics_by_day_Du_Unet_temperature_20230101_20231231.png`
+
+时间段模式在反标准化后的物理量空间计算 `MAE/RMSE/R²/Correlation`，并排除 `target_mask=0` 的位置：
+
+- 整体指标合并所有有效 `T×D×H×W` 点。
+- 逐深度指标每层合并有效 `T×H×W` 点。
+- 逐日指标每天合并有效 `D×H×W` 点。
+- 整体 RMSE 由全部有效点的平方误差总体均值开方，不是每日 RMSE 的平均。
+
+单日 `summary` 中包含：
 
 - `metric_units`：`mse/rmse/mae/r2/correlation` 对应单位说明
 - `variables`：按变量保存 `mse/rmse/mae/r2/correlation`

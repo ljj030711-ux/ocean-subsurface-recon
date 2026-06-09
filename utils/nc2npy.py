@@ -1,3 +1,7 @@
+"""
+nc转npy数据处理
+查看nc，npy，npz文件结构、维度、变量、属性、数据范围与样例内容
+"""
 import xarray as xr
 import numpy as np
 import pandas as pd

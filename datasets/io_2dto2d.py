@@ -14,11 +14,41 @@ from datasets.climatology_normalizer import MonthlyClimatologyLayerStdNormalizer
 from utils.data_quality import report_missing_values, sanitize_with_value
 
 
+SST_KELVIN_THRESHOLD = 100.0
+KELVIN_TO_CELSIUS = 273.15
+
+
 def _load_npy(data_dir, filename, label):
     path = os.path.join(data_dir, filename)
     if not os.path.exists(path):
         raise FileNotFoundError(f"未找到 {label} 文件：{path}")
     return np.load(path, mmap_mode="r")
+
+
+def _finite_sample(array):
+    arr = np.asarray(array)
+    if arr.ndim == 3:
+        t_step = max(arr.shape[0] // 32, 1)
+        return np.asarray(arr[::t_step, ::8, ::8])
+    return arr
+
+
+def _ensure_sst_celsius(sst):
+    sample = _finite_sample(sst)
+    finite = sample[np.isfinite(sample)]
+    if finite.size == 0:
+        return np.asarray(sst, dtype=np.float32), "unknown_no_finite_values"
+
+    median = float(np.nanmedian(finite))
+    if median > SST_KELVIN_THRESHOLD:
+        print(
+            f"SST 单位检测：median={median:.3f}，疑似 Kelvin，已转换为 Celsius。"
+        )
+        return (
+            np.asarray(sst, dtype=np.float32) - np.float32(KELVIN_TO_CELSIUS),
+            "kelvin_to_celsius",
+        )
+    return np.asarray(sst, dtype=np.float32), "already_celsius"
 
 
 def load_2dto2d_raw(data_dir, target_var):
@@ -71,6 +101,8 @@ def clean_and_normalize_2dto2d(
     start_date=None,
 ):
     """缺失值处理与可选月气候态距平归一化，并返回统计量。"""
+    sst, sst_unit_conversion = _ensure_sst_celsius(sst)
+
     report_missing_values("2dto2d.sst", sst, start_date=start_date)
     report_missing_values("2dto2d.ssh", ssh, start_date=start_date)
     report_missing_values("2dto2d.sss", sss, start_date=start_date)
@@ -94,6 +126,8 @@ def clean_and_normalize_2dto2d(
         )
         stats = {
             "normalization": "monthly_climatology_layer_std",
+            "sst_unit": "degree_C",
+            "sst_unit_conversion": sst_unit_conversion,
             "sst": sst_norm.to_stats(),
             "ssh": ssh_norm.to_stats(),
             "sss": sss_norm.to_stats(),
@@ -108,7 +142,11 @@ def clean_and_normalize_2dto2d(
             stats,
         )
 
-    stats = {"normalization": "none"}
+    stats = {
+        "normalization": "none",
+        "sst_unit": "degree_C",
+        "sst_unit_conversion": sst_unit_conversion,
+    }
     sst = sanitize_with_value(sst, fill_value=0.0)
     ssh = sanitize_with_value(ssh, fill_value=0.0)
     sss = sanitize_with_value(sss, fill_value=0.0)

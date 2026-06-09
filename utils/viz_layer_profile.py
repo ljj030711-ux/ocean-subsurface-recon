@@ -1,4 +1,4 @@
-"""三维经纬-深度剖面图可视化（迁移自 utils/draw.py plot_3d_metric_no_overlap）"""
+"""三维经纬-深度剖面图可视化"""
 
 import numpy as np
 import matplotlib.pyplot as plt

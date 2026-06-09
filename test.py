@@ -8,6 +8,7 @@ import warnings
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Subset
 from models.inversion_2dvar import inversion_2dvar
 from models.inversion_modas import inversion_modas
 
@@ -34,12 +35,12 @@ from config import (
     get_checkpoint_dir,
     get_output_dir,
 )
-from datasets.date_utils import date_to_index
+from datasets.date_utils import date_to_index, generate_date_list
 from datasets.climatology_normalizer import MonthlyClimatologyLayerStdNormalizer
 from datasets.non_dl_preprocess import get_dataset_split, load_and_validate, load_sla_sss
 from utils.metrics import (
     compute_grid_metrics, extract_level_map, save_grid_metrics,
-    scalar_metrics,
+    RegressionMetricAccumulator, scalar_metrics,
 )
 from utils.viz_layer_2d import plot_level_map
 from utils.viz_layer_profile import plot_3d_metric_profile
@@ -89,6 +90,21 @@ def profile_filename(metric_name, method, date_str, target_var=None):
 def summary_filename(method, date_str, target_var=None):
     m, d = _tag(method, date_str, target_var=target_var)
     return f"summary_{m}_{d}.json"
+
+
+def evaluation_metrics_filename(method, date_str, target_var=None):
+    m, d = _tag(method, date_str, target_var=target_var)
+    return f"evaluation_metrics_{m}_{d}.npz"
+
+
+def depth_metrics_plot_filename(method, date_str, target_var=None):
+    m, d = _tag(method, date_str, target_var=target_var)
+    return f"metrics_by_depth_{m}_{d}.png"
+
+
+def daily_metrics_plot_filename(method, date_str, target_var=None):
+    m, d = _tag(method, date_str, target_var=target_var)
+    return f"metrics_by_day_{m}_{d}.png"
 
 
 # ==================== Non-DL 预测 (2DVar / MODAS) ====================
@@ -196,7 +212,6 @@ def predict_2dto3d(args):
 
 def predict_2dto2d(args):
     """Du_Unet 逐层推理并拼装 25 层结果。"""
-    from train import build_model
     device = _get_device()
 
     from datasets.dataset_2dto2d import Dataset2Dto2D
@@ -213,29 +228,9 @@ def predict_2dto2d(args):
     sst = sample["sst"].unsqueeze(0).to(device)
     ssh_sss = sample["ssh_sss"].unsqueeze(0).to(device)
 
-    ckpt_dirs = _du_unet_checkpoint_dirs(args)
+    models = _load_du_unet_models(args, device, require_all=False)
     pred_list = []
-    for depth_m in DEPTH_LEVELS_25M:
-        ckpt_name = DU_UNET_CKPT_NAME_TEMPLATE.format(
-            target_var=args.target_var, depth_m=depth_m
-        )
-        ckpt_path = next(
-            (
-                os.path.join(candidate_dir, ckpt_name)
-                for candidate_dir in ckpt_dirs
-                if os.path.exists(os.path.join(candidate_dir, ckpt_name))
-            ),
-            os.path.join(ckpt_dirs[0], ckpt_name),
-        )
-        model = build_model("du_unet", out_channels=1).to(device)
-        if os.path.exists(ckpt_path):
-            model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
-        else:
-            print(
-                f"[警告] 未找到 {args.target_var} 深度 {depth_m}m checkpoint；"
-                f"已查找：{', '.join(os.path.join(d, ckpt_name) for d in ckpt_dirs)}，将使用随机权重"
-            )
-        model.eval()
+    for model in models:
         with torch.no_grad():
             pred_layer = model(sst, ssh_sss).cpu().numpy()
         pred_list.append(pred_layer)
@@ -304,6 +299,39 @@ def _du_unet_checkpoint_dirs(args):
         if path and path not in ordered:
             ordered.append(path)
     return ordered
+
+
+def _load_du_unet_models(args, device, require_all):
+    """一次加载 Du_Unet 的全部深度模型。"""
+    from train import build_model
+
+    ckpt_dirs = _du_unet_checkpoint_dirs(args)
+    models = []
+    for depth_m in DEPTH_LEVELS_25M:
+        ckpt_name = DU_UNET_CKPT_NAME_TEMPLATE.format(
+            target_var=args.target_var, depth_m=depth_m
+        )
+        searched_paths = [os.path.join(path, ckpt_name) for path in ckpt_dirs]
+        ckpt_path = next((path for path in searched_paths if os.path.exists(path)), None)
+        if ckpt_path is None and require_all:
+            raise FileNotFoundError(
+                f"缺少 {args.target_var} 深度 {depth_m}m checkpoint；"
+                f"已查找：{', '.join(searched_paths)}"
+            )
+
+        model = build_model("du_unet", out_channels=1).to(device)
+        if ckpt_path is not None:
+            model.load_state_dict(
+                torch.load(ckpt_path, map_location=device, weights_only=True)
+            )
+        else:
+            print(
+                f"[警告] 未找到 {args.target_var} 深度 {depth_m}m checkpoint；"
+                f"已查找：{', '.join(searched_paths)}，将使用随机权重"
+            )
+        model.eval()
+        models.append(model)
+    return models
 
 
 def _depth_label_2dto2d(level_idx):
@@ -398,6 +426,265 @@ def plot_prediction_truth_error_panel(
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"预测-真值-误差三联图已保存至：{output_path}")
+
+
+PERIOD_METRIC_NAMES = ("mae", "rmse", "r2", "correlation")
+
+
+def _period_metric_units(target_var):
+    unit = "degC" if target_var == "temperature" else "psu"
+    return {
+        "mae": unit,
+        "rmse": unit,
+        "r2": "dimensionless",
+        "correlation": "dimensionless",
+    }
+
+
+def _finite_json_value(value):
+    value = float(value)
+    return value if np.isfinite(value) else None
+
+
+def _period_metrics_to_json(metrics):
+    result = {
+        name: _finite_json_value(metrics[name])
+        for name in PERIOD_METRIC_NAMES
+    }
+    result["valid_count"] = int(np.asarray(metrics["valid_count"]).item())
+    return result
+
+
+def _grouped_metrics_to_records(metrics, labels, label_name, extra_values=None):
+    records = []
+    for index, label in enumerate(labels):
+        record = {label_name: label}
+        if extra_values:
+            record.update({name: values[index] for name, values in extra_values.items()})
+        for metric_name in PERIOD_METRIC_NAMES:
+            record[metric_name] = _finite_json_value(
+                np.asarray(metrics[metric_name])[index]
+            )
+        record["valid_count"] = int(np.asarray(metrics["valid_count"])[index])
+        records.append(record)
+    return records
+
+
+def _plot_period_metrics(
+    x,
+    metrics,
+    xlabel,
+    title,
+    output_path,
+    date_labels=None,
+):
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), dpi=150)
+    titles = {
+        "mae": "MAE",
+        "rmse": "RMSE",
+        "r2": "R²",
+        "correlation": "Correlation",
+    }
+    for ax, metric_name in zip(axes.flat, PERIOD_METRIC_NAMES):
+        ax.plot(x, metrics[metric_name], linewidth=1.5)
+        ax.set_title(titles[metric_name])
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(titles[metric_name])
+        ax.grid(True, alpha=0.3)
+        if date_labels is not None:
+            tick_step = max(len(x) // 8, 1)
+            tick_indices = np.arange(0, len(x), tick_step)
+            ax.set_xticks(tick_indices)
+            ax.set_xticklabels(
+                [date_labels[index] for index in tick_indices],
+                rotation=35,
+                ha="right",
+            )
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"时间段指标图已保存至：{output_path}")
+
+
+def evaluate_2dto2d_period(args, out_dir):
+    """在日期闭区间上评估 Du_Unet 的整体、逐深度和逐日指标。"""
+    from datasets.dataset_2dto2d import Dataset2Dto2D
+
+    dataset = Dataset2Dto2D(
+        args.data_dir,
+        normalize=True,
+        target_var=args.target_var,
+        start_date=args.start_date,
+        end_date=args.end_date,
+    )
+    start_idx = date_to_index(args.eval_start, dataset.start_date, dataset.end_date)
+    end_idx = date_to_index(args.eval_end, dataset.start_date, dataset.end_date)
+    if end_idx < start_idx:
+        raise ValueError(
+            f"eval-end 不能早于 eval-start：{args.eval_end} < {args.eval_start}"
+        )
+
+    eval_indices = list(range(start_idx, end_idx + 1))
+    eval_dates = generate_date_list(args.eval_start, args.eval_end)
+    loader = DataLoader(
+        Subset(dataset, eval_indices),
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+    )
+
+    device = _get_device()
+    models = _load_du_unet_models(args, device, require_all=True)
+    norm_stats = dataset.get_norm_stats()
+    target_norm = MonthlyClimatologyLayerStdNormalizer.from_stats(
+        norm_stats["target"]
+    )
+
+    overall_acc = RegressionMetricAccumulator()
+    depth_acc = RegressionMetricAccumulator()
+    daily_records = []
+    offset = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            sst = batch["sst"].to(device)
+            ssh_sss = batch["ssh_sss"].to(device)
+            pred_norm = torch.cat(
+                [model(sst, ssh_sss) for model in models],
+                dim=1,
+            ).cpu().numpy()
+            true_norm = batch["target"].numpy()
+            target_mask = batch["target_mask"].numpy()
+
+            batch_size = pred_norm.shape[0]
+            batch_indices = eval_indices[offset:offset + batch_size]
+            months = dataset.months[batch_indices]
+            y_pred = target_norm.inverse_transform(pred_norm, months)
+            y_true = target_norm.inverse_transform(true_norm, months)
+
+            overall_acc.update(y_true, y_pred, mask=target_mask, axis=None)
+            depth_acc.update(
+                y_true,
+                y_pred,
+                mask=target_mask,
+                axis=(0, 2, 3),
+            )
+
+            for local_index in range(batch_size):
+                daily = scalar_metrics(
+                    y_true[local_index],
+                    y_pred[local_index],
+                    mask=target_mask[local_index],
+                )
+                valid = (
+                    target_mask[local_index].astype(bool)
+                    & np.isfinite(y_true[local_index])
+                    & np.isfinite(y_pred[local_index])
+                )
+                daily_records.append(
+                    {
+                        "date": eval_dates[offset + local_index],
+                        **{
+                            name: _finite_json_value(daily[name])
+                            for name in PERIOD_METRIC_NAMES
+                        },
+                        "valid_count": int(np.count_nonzero(valid)),
+                    }
+                )
+
+            offset += batch_size
+            print(f"评估进度：{offset}/{len(eval_indices)} 天")
+
+    overall_metrics = overall_acc.compute()
+    depth_metrics = depth_acc.compute()
+    daily_metrics = {
+        name: np.asarray([record[name] for record in daily_records], dtype=np.float64)
+        for name in PERIOD_METRIC_NAMES
+    }
+    daily_metrics["valid_count"] = np.asarray(
+        [record["valid_count"] for record in daily_records],
+        dtype=np.int64,
+    )
+
+    period_tag = f"{args.eval_start}_{args.eval_end}"
+    evaluation_name = evaluation_metrics_filename(
+        args.method,
+        period_tag,
+        target_var=args.target_var,
+    )
+    payload = {
+        "dates": np.asarray(eval_dates),
+        "depth_m": np.asarray(DEPTH_LEVELS_25M, dtype=np.int32),
+        "overall_valid_count": overall_metrics["valid_count"],
+        "by_depth_valid_count": depth_metrics["valid_count"],
+        "by_day_valid_count": daily_metrics["valid_count"],
+    }
+    for metric_name in PERIOD_METRIC_NAMES:
+        payload[f"overall_{metric_name}"] = overall_metrics[metric_name]
+        payload[f"by_depth_{metric_name}"] = depth_metrics[metric_name]
+        payload[f"by_day_{metric_name}"] = daily_metrics[metric_name]
+    np.savez(os.path.join(out_dir, evaluation_name), **payload)
+
+    depth_records = _grouped_metrics_to_records(
+        depth_metrics,
+        list(range(len(DEPTH_LEVELS_25M))),
+        "depth_index",
+        extra_values={"depth_m": DEPTH_LEVELS_25M},
+    )
+    summary = {
+        "mode": "period",
+        "method": args.method,
+        "target_var": args.target_var,
+        "eval_start": args.eval_start,
+        "eval_end": args.eval_end,
+        "num_days": len(eval_dates),
+        "metric_units": _period_metric_units(args.target_var),
+        "variables": {
+            args.target_var: {
+                "overall": _period_metrics_to_json(overall_metrics),
+                "by_depth": depth_records,
+                "by_day": daily_records,
+            }
+        },
+    }
+    summary_name = summary_filename(
+        args.method,
+        period_tag,
+        target_var=args.target_var,
+    )
+    with open(os.path.join(out_dir, summary_name), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    depth_plot_name = depth_metrics_plot_filename(
+        args.method,
+        period_tag,
+        target_var=args.target_var,
+    )
+    _plot_period_metrics(
+        np.asarray(DEPTH_LEVELS_25M),
+        depth_metrics,
+        "Depth / m",
+        f"{args.method} {args.target_var} metrics by depth",
+        os.path.join(out_dir, depth_plot_name),
+    )
+
+    daily_plot_name = daily_metrics_plot_filename(
+        args.method,
+        period_tag,
+        target_var=args.target_var,
+    )
+    _plot_period_metrics(
+        np.arange(len(eval_dates)),
+        daily_metrics,
+        "Date",
+        f"{args.method} {args.target_var} metrics by day",
+        os.path.join(out_dir, daily_plot_name),
+        date_labels=eval_dates,
+    )
+
+    print(f"时间段指标: {evaluation_name}")
+    print(f"时间段汇总: {summary_name}")
 
 
 def save_outputs(args, y_pred, y_true, out_dir, mask=None):
@@ -553,7 +840,19 @@ def save_outputs(args, y_pred, y_true, out_dir, mask=None):
 def parse_args():
     p = argparse.ArgumentParser(description="统一预测评估入口")
     p.add_argument("--method", required=True)
-    p.add_argument("--select-day", required=True, help="预测日期 YYYY-MM-DD")
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--select-day", help="单日预测日期 YYYY-MM-DD")
+    mode.add_argument("--eval-start", help="时间段评估起始日期 YYYY-MM-DD")
+    p.add_argument(
+        "--eval-end",
+        help="时间段评估结束日期 YYYY-MM-DD；使用 --eval-start 时必须提供",
+    )
+    p.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=4,
+        help="时间段评估推理 batch size，仅 Du_Unet 使用",
+    )
     p.add_argument("--target-level", type=int, default=INFER_DEFAULT_TARGET_LEVEL,
                    help="可视化目标深度层索引")
     p.add_argument("--output-dir", default=OUTPUTS_ROOT)
@@ -581,6 +880,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.eval_start and not args.eval_end:
+        raise ValueError("使用 --eval-start 时必须同时提供 --eval-end")
+    if args.eval_end and not args.eval_start:
+        raise ValueError("使用 --eval-end 时必须同时提供 --eval-start")
+    if args.eval_batch_size <= 0:
+        raise ValueError("--eval-batch-size 必须大于 0")
+
     method = args.method.strip().lower()
     if method == "du-unet":
         method = "du_unet"
@@ -598,6 +904,19 @@ def main():
     else:
         out_dir = get_output_dir(paradigm, args.method, base_dir=args.output_dir)
     os.makedirs(out_dir, exist_ok=True)
+
+    if args.eval_start:
+        if method != "du_unet":
+            raise ValueError("时间段整体评估目前仅支持 Du_Unet")
+        print("=" * 60)
+        print(
+            f"时间段评估：paradigm={paradigm}, method={args.method}, "
+            f"period=[{args.eval_start}, {args.eval_end}]"
+        )
+        print("=" * 60)
+        evaluate_2dto2d_period(args, out_dir)
+        print("\n时间段评估完成。")
+        return
 
     print("=" * 60)
     print(f"预测评估：paradigm={paradigm}, method={args.method}, day={args.select_day}, "
