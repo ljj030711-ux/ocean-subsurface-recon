@@ -12,7 +12,9 @@ checkpoints/
 outputs/
 
 # 原始栅格/体数据（体积常超过 GitHub 单文件 100MB 限制；本地路径见 README）
-data/
+data/*
+!data/download_ostia_sst.py
+!data/download_global_phy_reanalysis.py
 
 # 其他临时文件和目录
 reports/

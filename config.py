@@ -4,7 +4,7 @@
 
 # ==================== 全局路径与基础配置 ====================
 
-DATA_DIR = "./data/raw"
+DATA_DIR = "./data/raw_small_size"
 OUTPUTS_ROOT = "./outputs"
 CHECKPOINTS_ROOT = "./checkpoints"
 
