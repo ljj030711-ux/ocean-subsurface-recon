@@ -5,13 +5,18 @@ generates or reads normalized T0 cache shards, then trains a single HVCARefiner
 with the same masked RMSE loss family used by the first-stage Du_Unet.
 
 Example:
-    python train_hvca_refiner.py \
-      --t0-cache-dir outputs/t0_cache_train \
-      --val-cache-dir outputs/t0_cache_val \
-      --base-checkpoint-dir checkpoints/2dto2d/Du_Unet \
-      --target-var temperature \
-      --epochs 50 --batch-size 4 --dim 64 \
-      --save-dir outputs/hvca_refiner
+    python -u eval_hvca_refiner.py \
+        --data-dir /root/autodl-tmp/.autodl/raw \
+        --checkpoint outputs/2dto2d/Du_Unet/Refined/hvca_refiner/best.pt \
+        --t0-cache-dir outputs/2dto2d/Du_Unet/Refined/t0_cache_test \
+        --base-checkpoint-dir checkpoints/2dto2d/Du_Unet \
+        --target-var temperature \
+        --eval-start 2023-01-01 \
+        --eval-end 2023-12-31 \
+        --batch-size 16 \
+        --column-chunk-size 8192 \
+        --num-workers 0 \
+        --save-dir outputs/2dto2d/Du_Unet/Refined/hvca_eval
 """
 
 import argparse
@@ -414,7 +419,7 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4, help="cache DataLoader worker 数")
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--shard-cache-size", type=int, default=4, help="每个 worker 内缓存的 shard 数")
-    parser.add_argument("--save-dir", default="outputs/hvca_refiner")
+    parser.add_argument("--save-dir", default="outputs/hvca_train")
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--max-samples", type=int, default=None)

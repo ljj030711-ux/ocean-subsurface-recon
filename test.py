@@ -42,7 +42,11 @@ from utils.metrics import (
     compute_grid_metrics, extract_level_map, save_grid_metrics,
     RegressionMetricAccumulator, scalar_metrics,
 )
-from utils.viz_layer_2d import plot_level_map
+from utils.viz_layer_2d import (
+    metric_cbar_label,
+    plot_level_map,
+    plot_prediction_truth_error_panel,
+)
 from utils.viz_layer_profile import plot_3d_metric_profile
 from utils.physics import compute_eke, compute_grad_ssh
 
@@ -334,98 +338,14 @@ def _load_du_unet_models(args, device, require_all):
     return models
 
 
-def _depth_label_2dto2d(level_idx):
-    if 0 <= level_idx < len(DEPTH_LEVELS_25M):
-        return f"Level-{level_idx} {DEPTH_LEVELS_25M[level_idx]}m"
-    return f"Level-{level_idx}"
-
-
-def _field_cmap_and_label(target_var):
-    if target_var == "temperature":
-        return "RdYlBu_r", "Temperature (°C)", "Absolute error (°C)"
-    if target_var == "salinity":
-        return "viridis", "Salinity (psu)", "Absolute error (psu)"
-    return "viridis", "Value", "Absolute error"
-
-
 def _metric_cbar_label(metric_name, target_var):
-    unit = {
-        "temperature": "°C",
-        "salinity": "psu",
-    }.get(target_var, "physical unit")
-    metric = metric_name.upper()
-    if metric_name.lower() == "mse":
-        return f"{metric} ({unit}²)"
-    return f"{metric} ({unit})"
-
-
-def _finite_vmin_vmax(*arrays):
-    vals = []
-    for array in arrays:
-        finite = np.asarray(array)[np.isfinite(array)]
-        if finite.size:
-            vals.append(finite)
-    if not vals:
-        return 0.0, 1.0
-    merged = np.concatenate(vals)
-    vmin = float(np.nanmin(merged))
-    vmax = float(np.nanmax(merged))
-    if vmin == vmax:
-        pad = abs(vmin) * 0.05 if vmin else 1.0
-        return vmin - pad, vmax + pad
-    return vmin, vmax
+    return metric_cbar_label(metric_name, target_var)
 
 
 def _apply_mask(array, mask):
     if mask is None:
         return array
     return np.where(mask.astype(bool), array, np.nan)
-
-
-def plot_prediction_truth_error_panel(
-    pred_2d,
-    true_2d,
-    error_2d,
-    target_var,
-    level,
-    day,
-    method,
-    output_path,
-):
-    """绘制指定层的预测、真值和绝对误差三联图。"""
-    cmap, value_label, error_label = _field_cmap_and_label(target_var)
-    value_vmin, value_vmax = _finite_vmin_vmax(pred_2d, true_2d)
-    err_vmin, err_vmax = _finite_vmin_vmax(error_2d)
-    extent = [LON_RANGE[0], LON_RANGE[1], LAT_RANGE[0], LAT_RANGE[1]]
-    level_label = _depth_label_2dto2d(level)
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), dpi=150)
-    panels = [
-        ("Prediction", pred_2d, cmap, value_label, value_vmin, value_vmax),
-        ("Truth", true_2d, cmap, value_label, value_vmin, value_vmax),
-        ("Absolute Error", error_2d, "magma", error_label, err_vmin, err_vmax),
-    ]
-    for ax, (title, data, panel_cmap, cbar_label, vmin, vmax) in zip(axes, panels):
-        im = ax.imshow(
-            data,
-            cmap=panel_cmap,
-            aspect="auto",
-            origin="lower",
-            extent=extent,
-            vmin=vmin,
-            vmax=vmax,
-        )
-        ax.set_title(title)
-        ax.set_xlabel("Longitude / °E")
-        ax.set_ylabel("Latitude / °N")
-        cbar = fig.colorbar(im, ax=ax)
-        cbar.set_label(cbar_label)
-
-    fig.suptitle(f"{method} {target_var} {day} {level_label}")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"预测-真值-误差三联图已保存至：{output_path}")
 
 
 PERIOD_METRIC_NAMES = ("mae", "rmse", "r2", "correlation")
@@ -806,6 +726,9 @@ def save_outputs(args, y_pred, y_true, out_dir, mask=None):
                         day,
                         method,
                         panel_path,
+                        lon_range=LON_RANGE,
+                        lat_range=LAT_RANGE,
+                        depth_values=DEPTH_LEVELS_25M,
                     )
                 else:
                     plot_level_map(

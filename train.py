@@ -288,7 +288,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--data-dir", default=DATA_DIR)
     parser.add_argument("--output-dir", default=OUTPUTS_ROOT)
-    parser.add_argument("--checkpoint-dir", default=CHECKPOINTS_ROOT)
+    parser.add_argument("--checkpoint -dir", default=CHECKPOINTS_ROOT)
     parser.add_argument("--dummy", action="store_true", help="2dto3d(ocean_transformer) 使用合成数据")
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--seed", type=int, default=SEED)

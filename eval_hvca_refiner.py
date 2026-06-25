@@ -3,6 +3,17 @@
 Outputs are aligned with the existing Du_Unet period-evaluation artifacts:
 evaluation_metrics_*.npz, summary_*.json, metrics_by_depth_*.png, and
 metrics_by_day_*.png. Each plot compares baseline_T0 and HVCA_refined.
+
+Example:
+    python eval_hvca_refiner.py \
+        --checkpoint outputs/2dto2d/Du_Unet/Refined/hvca_refiner/best.pt \
+        --t0-cache-dir outputs/2dto2d/Du_Unet/Refined/t0_cache_test \
+        --target-var temperature \
+        --eval-start 2023-01-01 \
+        --eval-end 2023-12-31 \
+        --spatial-panels \
+        --target-levels 0,4,9,17,24 \
+        --data-dir /root/autodl-tmp/.autodl/raw
 """
 
 import argparse
@@ -21,6 +32,8 @@ from config import (
     CHECKPOINTS_ROOT,
     DATA_DIR,
     DATA_START_DATE,
+    LAT_RANGE,
+    LON_RANGE,
     OUTPUTS_ROOT,
     PARADIGM_2DTO2D,
     TEST_END_DATE,
@@ -41,9 +54,11 @@ from train_hvca_refiner import (
     resolve_depth_indices,
 )
 from utils.metrics import RegressionMetricAccumulator, scalar_metrics
+from utils.viz_layer_2d import plot_hvca_refiner_panel
 
 
 PERIOD_METRIC_NAMES = ("mae", "rmse", "r2", "correlation")
+DEFAULT_PANEL_LEVELS = "0,4,9,17,24"
 
 
 def finite_json_value(value):
@@ -68,6 +83,190 @@ def grouped_metrics_to_records(metrics, labels, label_name, extra_values=None):
         record["valid_count"] = int(np.asarray(metrics["valid_count"])[i])
         records.append(record)
     return records
+
+
+def parse_index_list(value, name):
+    if value is None:
+        return []
+    indices = []
+    for item in str(value).split(","):
+        text = item.strip()
+        if not text:
+            continue
+        try:
+            indices.append(int(text))
+        except ValueError as exc:
+            raise ValueError(f"{name} 必须是逗号分隔的整数索引: {value}") from exc
+    return indices
+
+
+def parse_panel_days(value):
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def validate_target_levels(levels, depth_values):
+    if not levels:
+        raise ValueError("--target-levels 不能为空")
+    max_index = len(depth_values) - 1
+    invalid = [level for level in levels if level < 0 or level > max_index]
+    if invalid:
+        raise ValueError(
+            f"--target-levels 超出当前 HVCA 深度范围 [0,{max_index}]: {invalid}"
+        )
+    ordered = []
+    for level in levels:
+        if level not in ordered:
+            ordered.append(level)
+    return ordered
+
+
+def select_representative_days(baseline_records, refined_records):
+    if len(baseline_records) != len(refined_records):
+        raise ValueError("baseline/refined daily record 数量不一致")
+
+    candidates = []
+    for base, refined in zip(baseline_records, refined_records):
+        if base["date"] != refined["date"]:
+            raise ValueError(
+                f"baseline/refined 日期不一致: {base['date']} vs {refined['date']}"
+            )
+        base_rmse = base.get("rmse")
+        refined_rmse = refined.get("rmse")
+        if base_rmse is None or refined_rmse is None:
+            continue
+        delta = float(refined_rmse) - float(base_rmse)
+        if not np.isfinite(delta):
+            continue
+        candidates.append(
+            {
+                "date": base["date"],
+                "baseline_rmse": float(base_rmse),
+                "refined_rmse": float(refined_rmse),
+                "rmse_delta": delta,
+            }
+        )
+
+    if not candidates:
+        return []
+
+    ordered = sorted(candidates, key=lambda item: item["rmse_delta"])
+    selected = [
+        ("best_improved", ordered[0]),
+        ("median_change", ordered[len(ordered) // 2]),
+        ("worst_degraded", ordered[-1]),
+    ]
+
+    records = []
+    for role, item in selected:
+        record = {"role": role, **item}
+        records.append(record)
+    return records
+
+
+def resolve_panel_day_records(args, eval_dates, baseline_records, refined_records):
+    eval_date_set = set(eval_dates)
+    explicit_days = parse_panel_days(args.panel_days)
+    if explicit_days:
+        missing = [day for day in explicit_days if day not in eval_date_set]
+        if missing:
+            raise ValueError(
+                f"--panel-days 中日期不在评估区间或 cache 中: {missing}"
+            )
+        return [
+            {
+                "role": "manual",
+                "date": day,
+                "baseline_rmse": None,
+                "refined_rmse": None,
+                "rmse_delta": None,
+            }
+            for day in explicit_days
+        ]
+
+    return select_representative_days(baseline_records, refined_records)
+
+
+@torch.no_grad()
+def render_spatial_panels(
+    args,
+    model,
+    loader,
+    depth_tensor,
+    target_stats,
+    depth_indices,
+    depth_values,
+    target_levels,
+    panel_day_records,
+    device,
+    use_amp,
+):
+    if not panel_day_records:
+        print("[spatial-panels] 没有可绘制的代表日期，跳过二维解释图")
+        return []
+
+    panel_days = {record["date"] for record in panel_day_records}
+    rendered = []
+    model.eval()
+
+    for batch in loader:
+        sample_ids = list(batch["sample_id"])
+        if not any(sample_id in panel_days for sample_id in sample_ids):
+            continue
+
+        T0_norm_t = batch["T0"].to(device)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            refined_norm_t = model(T0_norm_t, depth_tensor)
+
+        T0_norm = batch["T0"].numpy()
+        refined_norm = refined_norm_t.cpu().numpy()
+        true_norm = batch["T_true"].numpy()
+        mask = batch["target_mask"].numpy()
+        months = batch["months"].numpy()
+
+        y_base = inverse_target_subset(T0_norm, months, target_stats, depth_indices)
+        y_refined = inverse_target_subset(refined_norm, months, target_stats, depth_indices)
+        y_true = inverse_target_subset(true_norm, months, target_stats, depth_indices)
+
+        for i, sample_id in enumerate(sample_ids):
+            if sample_id not in panel_days:
+                continue
+            for level in target_levels:
+                valid = mask[i, level].astype(bool)
+                baseline_2d = np.where(valid, y_base[i, level], np.nan)
+                refined_2d = np.where(valid, y_refined[i, level], np.nan)
+                true_2d = np.where(valid, y_true[i, level], np.nan)
+                date_tag = sample_id.replace("-", "")
+                filename = (
+                    f"map_hvca_panel_{args.target_var}_lvl{level}_{date_tag}.png"
+                )
+                output_path = os.path.join(args.save_dir, filename)
+                plot_hvca_refiner_panel(
+                    baseline_2d,
+                    refined_2d,
+                    true_2d,
+                    args.target_var,
+                    level,
+                    sample_id,
+                    output_path,
+                    lon_range=LON_RANGE,
+                    lat_range=LAT_RANGE,
+                    depth_values=depth_values,
+                )
+                rendered.append(
+                    {
+                        "date": sample_id,
+                        "depth_index": int(level),
+                        "depth_m": float(depth_values[level]),
+                        "file": filename,
+                    }
+                )
+
+    missing = sorted(panel_days - {item["date"] for item in rendered})
+    if missing:
+        raise RuntimeError(f"以下 panel 日期未成功绘制: {missing}")
+    return rendered
 
 
 def inverse_target_subset(array, months, target_stats, depth_indices):
@@ -168,6 +367,12 @@ def evaluate(args):
     depth_values = [int(float(d)) for d in depth_values]
     depth_indices = resolve_depth_indices(depth_values)
     depth_tensor = torch.as_tensor(depth_values, dtype=torch.float32, device=device)
+    target_levels = []
+    if args.spatial_panels:
+        target_levels = validate_target_levels(
+            parse_index_list(args.target_levels, "--target-levels"),
+            depth_values,
+        )
 
     ensure_eval_cache(args, depth_values, depth_indices, device)
 
@@ -341,6 +546,29 @@ def evaluate(args):
 
     np.savez(os.path.join(args.save_dir, metrics_name), **payload)
 
+    spatial_panel_records = []
+    rendered_spatial_panels = []
+    if args.spatial_panels:
+        spatial_panel_records = resolve_panel_day_records(
+            args,
+            eval_dates,
+            baseline_daily_records,
+            refined_daily_records,
+        )
+        rendered_spatial_panels = render_spatial_panels(
+            args,
+            model,
+            loader,
+            depth_tensor,
+            target_stats,
+            depth_indices,
+            depth_values,
+            target_levels,
+            spatial_panel_records,
+            device,
+            use_amp,
+        )
+
     baseline_depth_records = grouped_metrics_to_records(
         baseline_depth_metrics,
         list(range(len(depth_values))),
@@ -390,6 +618,17 @@ def evaluate(args):
             ),
             "baseline_gradz_rmse": finite_json_value(payload["baseline_gradz_rmse"]),
             "refined_gradz_rmse": finite_json_value(payload["refined_gradz_rmse"]),
+        },
+        "spatial_panels": {
+            "enabled": bool(args.spatial_panels),
+            "target_levels": target_levels,
+            "panel_days": spatial_panel_records,
+            "selection_metric": (
+                "refined_rmse - baseline_rmse"
+                if args.spatial_panels and not args.panel_days
+                else "manual panel-days" if args.spatial_panels else None
+            ),
+            "files": rendered_spatial_panels,
         },
     }
     with open(os.path.join(args.save_dir, summary_name), "w", encoding="utf-8") as f:
@@ -453,6 +692,21 @@ def parse_args():
     parser.add_argument("--save-dir", default=os.path.join(OUTPUTS_ROOT, "hvca_eval"))
     parser.add_argument("--device", default=None)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--spatial-panels",
+        action="store_true",
+        help="输出 T0/HVCA/truth/error/delta 的二维解释面板",
+    )
+    parser.add_argument(
+        "--target-levels",
+        default=DEFAULT_PANEL_LEVELS,
+        help="--spatial-panels 使用的逗号分隔深度层索引",
+    )
+    parser.add_argument(
+        "--panel-days",
+        default=None,
+        help="可选逗号分隔日期 YYYY-MM-DD；不传则自动选择 best/median/worst",
+    )
     return parser.parse_args()
 
 
