@@ -1,23 +1,4 @@
-"""Train HVCARefiner as a second-stage residual post-processor.
-
-This script keeps the existing layer-wise Du_Unet checkpoints frozen. It first
-generates or reads normalized T0 cache shards, then trains a single HVCARefiner
-with the same masked RMSE loss family used by the first-stage Du_Unet.
-
-Example:
-    python -u eval_hvca_refiner.py \
-        --data-dir /root/autodl-tmp/.autodl/raw \
-        --checkpoint outputs/2dto2d/Du_Unet/Refined/hvca_refiner/best.pt \
-        --t0-cache-dir outputs/2dto2d/Du_Unet/Refined/t0_cache_test \
-        --base-checkpoint-dir checkpoints/2dto2d/Du_Unet \
-        --target-var temperature \
-        --eval-start 2023-01-01 \
-        --eval-end 2023-12-31 \
-        --batch-size 16 \
-        --column-chunk-size 8192 \
-        --num-workers 0 \
-        --save-dir outputs/2dto2d/Du_Unet/Refined/hvca_eval
-"""
+"""训练基于 Du_Unet 初猜场的 HVCARefiner 二阶段残差修正模型。"""
 
 import argparse
 import bisect
@@ -36,6 +17,7 @@ from config import (
     DATA_START_DATE,
     DEPTH_LEVELS_25M,
     DU_UNET_CKPT_NAME_TEMPLATE,
+    OUTPUTS_ROOT,
     PARADIGM_2DTO2D,
     SEED,
     get_checkpoint_dir,
@@ -45,6 +27,11 @@ from datasets.date_utils import generate_date_list
 from models.du_unet import Du_Unet
 from models.hvca_refiner import HVCARefiner
 from utils.losses import masked_rmse_loss
+from utils.run_config import (
+    count_model_parameters,
+    model_config_path,
+    print_and_save_run_config,
+)
 
 
 def get_device(name=None):
@@ -104,6 +91,30 @@ def cache_shards(cache_dir):
 
 def cache_ready(cache_dir):
     return len(cache_shards(cache_dir)) > 0
+
+
+def default_hvca_output_dir():
+    return os.path.join(OUTPUTS_ROOT, PARADIGM_2DTO2D, "HVCARefiner")
+
+
+def save_loss_curve(train_losses, val_losses, output_path):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+    ax.plot(train_losses, label="Train Loss")
+    ax.plot(val_losses, label="Val Loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Masked RMSE Loss")
+    ax.set_title("HVCARefiner Training & Validation Loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"HVCA loss 曲线已保存至: {output_path}")
 
 
 def save_cache_metadata(cache_dir, payload):
@@ -379,6 +390,7 @@ def save_checkpoint(path, model, optimizer, args, depth_values, best_val, epoch)
                 "dropout": args.dropout,
                 "column_chunk_size": args.column_chunk_size,
             },
+            "parameter_count": count_model_parameters(model),
             "depth_values": list(map(float, depth_values)),
             "target_var": args.target_var,
             "best_val": float(best_val),
@@ -419,7 +431,7 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4, help="cache DataLoader worker 数")
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--shard-cache-size", type=int, default=4, help="每个 worker 内缓存的 shard 数")
-    parser.add_argument("--save-dir", default="outputs/hvca_train")
+    parser.add_argument("--save-dir", default=default_hvca_output_dir())
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -449,7 +461,6 @@ def main():
     print(f"val cache: {args.val_cache_dir}")
     print(f"Du_Unet checkpoint dir: {args.base_checkpoint_dir}")
     print("=" * 60)
-
     prepare_train_val_cache(args, depth_values, depth_indices, device)
 
     train_ds = HvcaCacheDataset(args.t0_cache_dir, shard_cache_size=args.shard_cache_size)
@@ -475,11 +486,89 @@ def main():
         dropout=args.dropout,
         column_chunk_size=args.column_chunk_size,
     ).to(device)
+    scheduler_factor = 0.5
+    scheduler_patience = 5
+    training_strategy = {
+        "epoch": {
+            "planned": args.epochs,
+            "indexing": "1_based",
+        },
+        "early_stopping": {
+            "enabled": False,
+            "monitor": "val_loss",
+            "mode": "min",
+            "patience": None,
+        },
+        "optimizer": {
+            "name": "AdamW",
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+        },
+        "scheduler": {
+            "name": "ReduceLROnPlateau",
+            "mode": "min",
+            "factor": scheduler_factor,
+            "patience": scheduler_patience,
+            "monitor": "val_loss",
+            "step_on": "epoch_end",
+        },
+        "warmup": {
+            "enabled": False,
+            "epochs": 0,
+        },
+    }
+    print_and_save_run_config(
+        "HVCARefiner 训练超参数",
+        {
+            "stage": "train",
+            "model": "HVCARefiner",
+            "paradigm": PARADIGM_2DTO2D,
+            "target_var": args.target_var,
+            "device": device,
+            "seed": args.seed,
+            "data": {
+                "data_dir": args.data_dir,
+                "start_date": args.start_date,
+                "end_date": args.end_date,
+                "max_samples": args.max_samples,
+            },
+            "hyperparameters": {
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "learning_rate": args.lr,
+                "weight_decay": args.weight_decay,
+                "cache_shard_size": args.cache_shard_size,
+                "num_workers": args.num_workers,
+                "prefetch_factor": args.prefetch_factor,
+                "shard_cache_size": args.shard_cache_size,
+                "depths": depth_values,
+                "depth_indices": depth_indices,
+                "use_amp": use_amp,
+            },
+            "training_strategy": training_strategy,
+            "model_config": {
+                "dim": args.dim,
+                "num_heads": args.num_heads,
+                "num_layers": args.num_layers,
+                "dropout": args.dropout,
+                "column_chunk_size": args.column_chunk_size,
+            },
+            "parameter_count": count_model_parameters(model),
+            "paths": {
+                "save_dir": args.save_dir,
+                "t0_cache_dir": args.t0_cache_dir,
+                "val_cache_dir": args.val_cache_dir,
+                "base_checkpoint_dir": args.base_checkpoint_dir,
+            },
+        },
+        model_config_path(OUTPUTS_ROOT, "HVCARefiner", "train"),
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
+        optimizer, mode="min", factor=scheduler_factor, patience=scheduler_patience
     )
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -510,6 +599,11 @@ def main():
         os.path.join(args.save_dir, "training_history_HVCARefiner.npz"),
         train_loss=np.asarray(history["train_loss"], dtype=np.float32),
         val_loss=np.asarray(history["val_loss"], dtype=np.float32),
+    )
+    save_loss_curve(
+        history["train_loss"],
+        history["val_loss"],
+        os.path.join(args.save_dir, "loss_HVCARefiner.png"),
     )
     print(f"\n训练完成。最佳验证 RMSE loss: {best_val:.6f}")
     print(f"最佳权重: {best_path}")

@@ -1,20 +1,4 @@
-"""Evaluate HVCARefiner against the frozen Du_Unet baseline T0.
-
-Outputs are aligned with the existing Du_Unet period-evaluation artifacts:
-evaluation_metrics_*.npz, summary_*.json, metrics_by_depth_*.png, and
-metrics_by_day_*.png. Each plot compares baseline_T0 and HVCA_refined.
-
-Example:
-    python eval_hvca_refiner.py \
-        --checkpoint outputs/2dto2d/Du_Unet/Refined/hvca_refiner/best.pt \
-        --t0-cache-dir outputs/2dto2d/Du_Unet/Refined/t0_cache_test \
-        --target-var temperature \
-        --eval-start 2023-01-01 \
-        --eval-end 2023-12-31 \
-        --spatial-panels \
-        --target-levels 0,4,9,17,24 \
-        --data-dir /root/autodl-tmp/.autodl/raw
-"""
+"""测试 HVCARefiner，并与冻结 Du_Unet 生成的 T0 初猜场进行指标对比。"""
 
 import argparse
 import json
@@ -54,11 +38,59 @@ from train_hvca_refiner import (
     resolve_depth_indices,
 )
 from utils.metrics import RegressionMetricAccumulator, scalar_metrics
+from utils.run_config import (
+    count_model_parameters,
+    load_run_config,
+    model_config_path,
+    print_and_save_run_config,
+)
 from utils.viz_layer_2d import plot_hvca_refiner_panel
+from utils.viz_layer_profile import plot_hvca_refiner_section_panel
 
 
 PERIOD_METRIC_NAMES = ("mae", "rmse", "r2", "correlation")
 DEFAULT_PANEL_LEVELS = "0,4,9,17,24"
+
+
+def default_hvca_output_dir():
+    return os.path.join(OUTPUTS_ROOT, PARADIGM_2DTO2D, "HVCARefiner")
+
+
+def load_training_strategy_reference(train_config_path):
+    train_config = load_run_config(train_config_path)
+    if train_config and train_config.get("training_strategy"):
+        strategy = {
+            "source": "train_config",
+            "config_path": train_config_path,
+        }
+        strategy.update(train_config["training_strategy"])
+        return strategy
+    return {
+        "source": "not_available_in_test",
+        "config_path": train_config_path,
+        "epoch": {
+            "planned": None,
+            "indexing": None,
+        },
+        "early_stopping": {
+            "enabled": None,
+            "monitor": None,
+            "mode": None,
+            "patience": None,
+        },
+        "optimizer": {
+            "name": None,
+            "lr": None,
+            "weight_decay": None,
+        },
+        "scheduler": {
+            "name": None,
+        },
+        "warmup": {
+            "enabled": None,
+            "epochs": None,
+        },
+    }
 
 
 def finite_json_value(value):
@@ -188,6 +220,19 @@ def resolve_panel_day_records(args, eval_dates, baseline_records, refined_record
     return select_representative_days(baseline_records, refined_records)
 
 
+def resolve_section_index(value, size):
+    text = str(value).strip().lower()
+    if text in {"middle", "mid", "center", "centre"}:
+        return size // 2
+    try:
+        index = int(text)
+    except ValueError as exc:
+        raise ValueError(f"--section-index 必须是整数或 middle，实际: {value}") from exc
+    if index < 0 or index >= size:
+        raise ValueError(f"--section-index 超出范围 [0,{size - 1}]: {index}")
+    return index
+
+
 @torch.no_grad()
 def render_spatial_panels(
     args,
@@ -266,6 +311,95 @@ def render_spatial_panels(
     missing = sorted(panel_days - {item["date"] for item in rendered})
     if missing:
         raise RuntimeError(f"以下 panel 日期未成功绘制: {missing}")
+    return rendered
+
+
+@torch.no_grad()
+def render_section_panels(
+    args,
+    model,
+    loader,
+    depth_tensor,
+    target_stats,
+    depth_indices,
+    depth_values,
+    panel_day_records,
+    device,
+    use_amp,
+):
+    if not panel_day_records:
+        print("[section-panels] 没有可绘制的代表日期，跳过垂向剖面图")
+        return []
+
+    panel_days = {record["date"] for record in panel_day_records}
+    rendered = []
+    model.eval()
+    section_axis = args.section_axis
+    section_width = max(int(args.section_width), 1)
+
+    for batch in loader:
+        sample_ids = list(batch["sample_id"])
+        if not any(sample_id in panel_days for sample_id in sample_ids):
+            continue
+
+        T0_norm_t = batch["T0"].to(device)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            refined_norm_t = model(T0_norm_t, depth_tensor)
+
+        T0_norm = batch["T0"].numpy()
+        refined_norm = refined_norm_t.cpu().numpy()
+        true_norm = batch["T_true"].numpy()
+        mask = batch["target_mask"].numpy()
+        months = batch["months"].numpy()
+
+        y_base = inverse_target_subset(T0_norm, months, target_stats, depth_indices)
+        y_refined = inverse_target_subset(refined_norm, months, target_stats, depth_indices)
+        y_true = inverse_target_subset(true_norm, months, target_stats, depth_indices)
+
+        _, h, w = y_base.shape[1:]
+        section_size = h if section_axis == "lat" else w
+        section_index = resolve_section_index(args.section_index, section_size)
+
+        for i, sample_id in enumerate(sample_ids):
+            if sample_id not in panel_days:
+                continue
+            valid = mask[i].astype(bool)
+            baseline_3d = np.where(valid, y_base[i], np.nan)
+            refined_3d = np.where(valid, y_refined[i], np.nan)
+            true_3d = np.where(valid, y_true[i], np.nan)
+            date_tag = sample_id.replace("-", "")
+            filename = (
+                f"section_hvca_panel_{args.target_var}_"
+                f"{section_axis}{section_index}_{date_tag}.png"
+            )
+            output_path = os.path.join(args.save_dir, filename)
+            plot_hvca_refiner_section_panel(
+                baseline_3d,
+                refined_3d,
+                true_3d,
+                args.target_var,
+                section_axis,
+                section_index,
+                section_width,
+                sample_id,
+                output_path,
+                depth_values=depth_values,
+                lon_range=LON_RANGE,
+                lat_range=LAT_RANGE,
+            )
+            rendered.append(
+                {
+                    "date": sample_id,
+                    "section_axis": section_axis,
+                    "section_index": int(section_index),
+                    "section_width": int(section_width),
+                    "file": filename,
+                }
+            )
+
+    missing = sorted(panel_days - {item["date"] for item in rendered})
+    if missing:
+        raise RuntimeError(f"以下 section panel 日期未成功绘制: {missing}")
     return rendered
 
 
@@ -373,18 +507,6 @@ def evaluate(args):
             parse_index_list(args.target_levels, "--target-levels"),
             depth_values,
         )
-
-    ensure_eval_cache(args, depth_values, depth_indices, device)
-
-    dataset = Dataset2Dto2D(
-        args.data_dir,
-        normalize=True,
-        target_var=args.target_var,
-        start_date=args.start_date,
-        end_date=args.end_date,
-    )
-    target_stats = dataset.get_norm_stats()["target"]
-
     model_config = ckpt.get(
         "model_config",
         {
@@ -398,6 +520,70 @@ def evaluate(args):
     model = HVCARefiner(**model_config).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
+    train_config_path = model_config_path(OUTPUTS_ROOT, "HVCARefiner", "train")
+    training_strategy = load_training_strategy_reference(train_config_path)
+    if isinstance(training_strategy.get("epoch"), dict):
+        training_strategy["epoch"]["checkpoint_epoch"] = ckpt.get("epoch")
+    training_strategy["checkpoint_best_val"] = ckpt.get("best_val")
+    print_and_save_run_config(
+        "HVCARefiner 测试超参数",
+        {
+            "stage": "test",
+            "single": False,
+            "model": "HVCARefiner",
+            "paradigm": PARADIGM_2DTO2D,
+            "target_var": args.target_var,
+            "device": device,
+            "data": {
+                "data_dir": args.data_dir,
+                "start_date": args.start_date,
+                "end_date": args.end_date,
+                "eval_start": args.eval_start,
+                "eval_end": args.eval_end,
+                "max_samples": args.max_samples,
+            },
+            "hyperparameters": {
+                "batch_size": args.batch_size,
+                "cache_shard_size": args.cache_shard_size,
+                "num_workers": args.num_workers,
+                "prefetch_factor": args.prefetch_factor,
+                "shard_cache_size": args.shard_cache_size,
+                "depths": depth_values,
+                "depth_indices": depth_indices,
+                "thermocline_min": args.thermocline_min,
+                "thermocline_max": args.thermocline_max,
+                "spatial_panels": args.spatial_panels,
+                "target_levels": target_levels,
+                "panel_days": args.panel_days,
+                "section_panels": args.section_panels,
+                "section_axis": args.section_axis,
+                "section_index": args.section_index,
+                "section_width": args.section_width,
+            },
+            "model_config": model_config,
+            "training_strategy": training_strategy,
+            "parameter_count": count_model_parameters(model),
+            "paths": {
+                "save_dir": args.save_dir,
+                "checkpoint": args.checkpoint,
+                "t0_cache_dir": args.t0_cache_dir,
+                "base_checkpoint_dir": args.base_checkpoint_dir,
+                "train_config": train_config_path,
+            },
+        },
+        model_config_path(OUTPUTS_ROOT, "HVCARefiner", "test"),
+    )
+
+    ensure_eval_cache(args, depth_values, depth_indices, device)
+
+    dataset = Dataset2Dto2D(
+        args.data_dir,
+        normalize=True,
+        target_var=args.target_var,
+        start_date=args.start_date,
+        end_date=args.end_date,
+    )
+    target_stats = dataset.get_norm_stats()["target"]
 
     loader = DataLoader(
         HvcaCacheDataset(args.t0_cache_dir, shard_cache_size=args.shard_cache_size),
@@ -546,15 +732,17 @@ def evaluate(args):
 
     np.savez(os.path.join(args.save_dir, metrics_name), **payload)
 
-    spatial_panel_records = []
+    panel_day_records = []
     rendered_spatial_panels = []
-    if args.spatial_panels:
-        spatial_panel_records = resolve_panel_day_records(
+    rendered_section_panels = []
+    if args.spatial_panels or args.section_panels:
+        panel_day_records = resolve_panel_day_records(
             args,
             eval_dates,
             baseline_daily_records,
             refined_daily_records,
         )
+    if args.spatial_panels:
         rendered_spatial_panels = render_spatial_panels(
             args,
             model,
@@ -564,7 +752,20 @@ def evaluate(args):
             depth_indices,
             depth_values,
             target_levels,
-            spatial_panel_records,
+            panel_day_records,
+            device,
+            use_amp,
+        )
+    if args.section_panels:
+        rendered_section_panels = render_section_panels(
+            args,
+            model,
+            loader,
+            depth_tensor,
+            target_stats,
+            depth_indices,
+            depth_values,
+            panel_day_records,
             device,
             use_amp,
         )
@@ -622,13 +823,26 @@ def evaluate(args):
         "spatial_panels": {
             "enabled": bool(args.spatial_panels),
             "target_levels": target_levels,
-            "panel_days": spatial_panel_records,
+            "panel_days": panel_day_records if args.spatial_panels else [],
             "selection_metric": (
                 "refined_rmse - baseline_rmse"
                 if args.spatial_panels and not args.panel_days
                 else "manual panel-days" if args.spatial_panels else None
             ),
             "files": rendered_spatial_panels,
+        },
+        "section_panels": {
+            "enabled": bool(args.section_panels),
+            "section_axis": args.section_axis if args.section_panels else None,
+            "section_index": args.section_index if args.section_panels else None,
+            "section_width": args.section_width if args.section_panels else None,
+            "panel_days": panel_day_records if args.section_panels else [],
+            "selection_metric": (
+                "refined_rmse - baseline_rmse"
+                if args.section_panels and not args.panel_days
+                else "manual panel-days" if args.section_panels else None
+            ),
+            "files": rendered_section_panels,
         },
     }
     with open(os.path.join(args.save_dir, summary_name), "w", encoding="utf-8") as f:
@@ -661,7 +875,7 @@ def parse_args():
     default_ckpt_dir = get_checkpoint_dir(
         PARADIGM_2DTO2D, "Du_Unet", base_dir=CHECKPOINTS_ROOT
     )
-    parser = argparse.ArgumentParser(description="Evaluate HVCARefiner")
+    parser = argparse.ArgumentParser(description="Test HVCARefiner")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--t0-cache-dir", required=True)
     parser.add_argument("--base-checkpoint-dir", default=default_ckpt_dir)
@@ -689,7 +903,7 @@ def parse_args():
     parser.add_argument("--shard-cache-size", type=int, default=4, help="每个 worker 内缓存的 shard 数")
     parser.add_argument("--thermocline-min", type=float, default=50.0)
     parser.add_argument("--thermocline-max", type=float, default=200.0)
-    parser.add_argument("--save-dir", default=os.path.join(OUTPUTS_ROOT, "hvca_eval"))
+    parser.add_argument("--save-dir", default=default_hvca_output_dir())
     parser.add_argument("--device", default=None)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument(
@@ -707,6 +921,28 @@ def parse_args():
         default=None,
         help="可选逗号分隔日期 YYYY-MM-DD；不传则自动选择 best/median/worst",
     )
+    parser.add_argument(
+        "--section-panels",
+        action="store_true",
+        help="输出 T0/HVCA/truth/error/delta 的垂向剖面六子图",
+    )
+    parser.add_argument(
+        "--section-axis",
+        choices=["lat", "lon"],
+        default="lat",
+        help="垂向剖面固定的水平轴；lat 表示固定纬度画 depth-longitude",
+    )
+    parser.add_argument(
+        "--section-index",
+        default="middle",
+        help="垂向剖面固定轴索引，整数或 middle",
+    )
+    parser.add_argument(
+        "--section-width",
+        type=int,
+        default=1,
+        help="剖面固定轴方向平均的格点宽度，默认 1 表示不做带平均",
+    )
     return parser.parse_args()
 
 
@@ -714,6 +950,8 @@ def main():
     args = parse_args()
     if args.batch_size <= 0 or args.cache_shard_size <= 0:
         raise ValueError("--batch-size 和 --cache-shard-size 必须大于 0")
+    if args.section_width <= 0:
+        raise ValueError("--section-width 必须大于 0")
     evaluate(args)
 
 

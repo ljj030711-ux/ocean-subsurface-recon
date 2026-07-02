@@ -1,93 +1,35 @@
-# Eddy Inversion
+# Ocean Subsurface Recon
 
-海洋反演项目：由海表场（SST/SSH/SSS）重建水下多深度温度或盐度结构，统一支持变分、统计与深度学习方法。
+本项目用海表场重建水下多深度温度或盐度结构，当前包含 `Du_Unet`、`HVCARefiner`、`ocean_transformer`、`2dvar` 和 `modas` 五类方法。
 
-## 建模范式
+## 总览
 
-- `2dto2d`：每个变量、每个深度训练一个独立模型（当前：`Du_Unet`）。
-- `2dto3d`：单模型一次输出所有深度（当前：`2dvar`、`modas`、`ocean_transformer`）。
+### 建模范式
 
-输出目录统一为：
+- `2dto2d`：逐变量、逐深度建模。当前主模型是 `Du_Unet`，二阶段修正模型是 `HVCARefiner`。
+- `2dto3d`：单次输出多个深度。当前包括 `ocean_transformer`、`2dvar`、`modas`。
 
-- `outputs/{paradigm}/{method}/...`
-- `checkpoints/{paradigm}/{method}/...`
-- Du_Unet 按变量额外分目录：`outputs/2dto2d/Du_Unet/{temperature|salinity}/...`
-- Du_Unet 权重按变量额外分目录：`checkpoints/2dto2d/Du_Unet/{temperature|salinity}/...`
+### 目录规则
 
-## 模型思路
+- 训练/测试结果根目录：`outputs/{paradigm}/{method}/`
+- checkpoint 根目录：`checkpoints/{paradigm}/{method}/`
+- Du_Unet 输出：`outputs/2dto2d/Du_Unet/{temperature|salinity}/`
+- Du_Unet 权重：`checkpoints/2dto2d/Du_Unet/{temperature|salinity}/`
+- HVCARefiner 输出与权重：`outputs/2dto2d/HVCARefiner/`
+- OceanTransformer 输出：`outputs/2dto3d/ocean_transformer/`
+- 2DVar 输出：`outputs/2dto3d/2dvar/`
+- MODAS 输出：`outputs/2dto3d/modas/`
 
-### 1) Du_Unet（2dto2d）
+### 运行日志和配置快照
 
-- 思路：SST 高分辨率分支处理 `(B,1,160,160)`，SSH+SSS 低分辨率分支处理 `(B,2,64,64)`，融合后输出单层 `(B,1,64,64)`。
-- 训练：一次选择 `temperature` 或 `salinity`，循环 5-300m 共 25 层；两类变量分别训练后共 50 个 checkpoint。
-- 训练：按深度列表循环，目标为单层 `(B,1,H,W)`。
-- 推理：逐深度加载模型并拼装为 `(1,25,64,64)`，再统一评估与绘图。
-- 评估口径：`test.py` 中会将标准化输出反标准化回温度或盐度物理量后再评估。
-- 单位处理：SST 若检测为 Kelvin，会在 2dto2d 前处理中自动减去 273.15 转为 Celsius，与温度标签单位对齐。
+Du_Unet 和 HVCARefiner 的 train/test 入口会在运行前打印最终超参数，并保存 JSON 配置快照：
 
-### 2) 2dvar（2dto3d）
+- `outputs/2dto2d/Du_Unet/Du_Unet_train_config.json`
+- `outputs/2dto2d/Du_Unet/Du_Unet_test_config.json`
+- `outputs/2dto2d/HVCARefiner/HVCARefiner_train_config.json`
+- `outputs/2dto2d/HVCARefiner/HVCARefiner_test_config.json`
 
-- 思路：变分反演，构造背景项与观测项代价函数，L-BFGS-B 迭代求解。
-- 输出：`(1,D,H,W)`，默认 D=26（由 `--c-depth` 控制）。
-
-### 3) modas（2dto3d）
-
-- 思路：逐像素逐深度线性统计回归，在训练时段拟合系数，目标日预测整层场。
-- 输出：`(1,D,H,W)`，D 由真值数据深度维决定（当前 26）。
-
-### 4) ocean_transformer（2dto3d）
-
-- 思路：CNN 提取海表空间特征 + 空间 Transformer + 深度 Transformer。
-- 输出：`(B,D,H,W,2)`，最后一维是 `(temperature, salinity)`。
-- 损失：`PhysicsLoss = MSE + 静力学平衡约束 + 层结稳定约束`。
-
-## 项目整体架构
-
-```mermaid
-flowchart LR
-  raw[raw_npy_data] --> ds[dataset_io_and_dataset]
-  ds --> train[train.py]
-  ds --> test[test.py]
-  train --> ckpt[checkpoints_by_paradigm]
-  ckpt --> test
-  test --> eval[metrics_and_summary]
-  eval --> map2d[plot_level_map]
-  eval --> profile3d[plot_3d_metric_profile]
-```
-
-
-
-## 目录结构
-
-```text
-ocean-subsurface-recon/
-├── config.py                     # 统一配置：范式、超参数、路径、常量
-├── train.py                      # 训练入口（2dto2d/2dto3d）
-├── test.py                       # 推理评估入口（2dto2d/2dto3d）
-├── models/                       # 各模型/算法实现
-├── datasets/                     # Dataset + 数据读入/前处理工具
-│   ├── io_2dto2d.py
-│   ├── io_2dto3d.py
-│   ├── non_dl_preprocess.py
-│   ├── date_utils.py
-│   ├── dataset_2dto2d.py
-│   └── dataset_2dto3d.py
-├── utils/                        # physics / loss / metrics / viz
-├── outputs/
-│   ├── 2dto2d/
-│   │   └── Du_Unet/
-│   │       ├── temperature/
-│   │       └── salinity/
-│   └── 2dto3d/
-└── checkpoints/
-    ├── 2dto2d/
-    │   └── Du_Unet/
-    │       ├── temperature/
-    │       └── salinity/
-    └── 2dto3d/
-```
-
-## 快速开始
+配置快照会记录命令行、时间、数据范围、batch size、学习率、深度、模型结构、模型参数量、checkpoint/cache/output 路径等信息。同一模型同一 stage 的后一次运行会覆盖同名配置快照。测试配置统一使用 `test` 命名；Du_Unet 单日测试会在 JSON 中记录 `single: true`，时间段测试记录 `single: false`。
 
 ### 安装
 
@@ -95,153 +37,434 @@ ocean-subsurface-recon/
 pip install -r requirements.txt
 ```
 
-## 训练 `train.py`
+### 深度索引
+
+Du_Unet 和 HVCARefiner 使用 `DEPTH_LEVELS_25M`，从 5m 开始：
+
+```text
+0=5m, 1=10m, 2=15m, ..., 9=50m, 10=55m, ..., 24=300m
+```
+
+`--depth-indices` 是索引，`--depths` 是实际米数。
+
+## Du_Unet
+
+Du_Unet 是第一阶段 `2dto2d` 模型：每个目标变量、每个深度单独训练一个二维模型，推理时逐层加载并拼接为完整 25 层剖面。
+
+### train：逐变量逐深度训练
+
+输入命令：
 
 ```bash
-# 2dto2d: Du_Unet（一次训练一个变量的25层）
-python train.py --method Du_Unet --target-var temperature \
-  --start-date 2002-01-01 --end-date 2023-12-31 \
-  --data-dir ./data/raw
-
-# 可选：只训练指定深度索引，索引不是米数；9 表示 50m。
 python train.py --method Du_Unet --target-var temperature \
   --start-date 2002-01-01 --end-date 2023-12-31 \
   --data-dir ./data/raw \
-  --depth-indices 9
-
-python train.py --method Du_Unet --target-var salinity \
-  --start-date 2002-01-01 --end-date 2023-12-31 \
-  --data-dir ./data/raw
-
-# 2dto3d: ocean_transformer
-python train.py --method ocean_transformer --data-dir ./data/raw
+  --output-dir ./outputs \
+  --checkpoint-dir ./checkpoints \
+  --epochs 20 \
+  --batch-size 32 \
+  --lr 1e-3 \
+  --patience 10 \
+  --seed 42
 ```
 
-## 参数说明
+只训练指定深度索引用于调试：
+
+```bash
+python train.py --method Du_Unet --target-var salinity \
+  --start-date 2002-01-01 --end-date 2023-12-31 \
+  --data-dir ./data/raw \
+  --depth-indices 9,10
+```
+
+参数说明：
 
 | 参数 | 含义 |
 | --- | --- |
-| `--method` | 训练方法，当前支持 `Du_Unet` / `du_unet` 和 `ocean_transformer`。 |
-| `--target-var` | Du_Unet 目标变量，`temperature` 或 `salinity`。 |
-| `--start-date` | Du_Unet 数据起始日期，默认使用 `config.py` 中的 `DATA_START_DATE`。 |
-| `--end-date` | Du_Unet 数据结束日期，不传时使用数据文件可覆盖的结束日期。 |
-| `--epochs` | 覆盖默认训练轮数；不传时使用对应模型的配置值。 |
-| `--batch-size` | 覆盖默认 batch size。 |
-| `--lr` | 覆盖默认学习率。 |
-| `--data-dir` | 原始数据目录。 |
-| `--output-dir` | 训练历史和 loss 曲线输出根目录，默认 `./outputs`。 |
-| `--checkpoint-dir` | checkpoint 输出根目录，默认 `./checkpoints`。 |
-| `--dummy` | 仅用于 `ocean_transformer` 的合成数据调试。 |
-| `--patience` | 早停 patience；不传时使用配置值。 |
+| `--method` | 固定为 `Du_Unet` 或 `du_unet`。 |
+| `--target-var` | 训练目标变量，`temperature` 或 `salinity`。 |
+| `--start-date` / `--end-date` | 数据日期范围；会影响数据切分和归一化统计。 |
+| `--data-dir` | 原始 `.npy` 数据目录。 |
+| `--output-dir` | 输出根目录，默认 `./outputs`。 |
+| `--checkpoint-dir` | 权重根目录，默认 `./checkpoints`。 |
+| `--epochs` | 训练轮数；不传时使用 `DU_UNET_EPOCHS`。 |
+| `--batch-size` | batch size；不传时使用 `DU_UNET_BATCH_SIZE`。 |
+| `--lr` | 学习率；不传时使用 `DU_UNET_LR`。 |
+| `--patience` | early stopping patience；不传时使用 `DU_UNET_PATIENCE`。 |
 | `--seed` | 随机种子。 |
-| `--depth-indices` | Du_Unet 调试参数，指定训练哪些深度层索引，逗号分隔；不传时训练当前变量全部 25 层。 |
+| `--depth-indices` | 可选，逗号分隔深度索引；不传则训练当前变量全部 25 层。 |
 
-`--depth-indices` 是深度层索引，不是米数。Du_Unet 的索引从 5m 开始：
+输出文件：
 
-```text
-0=5m, 1=10m, 2=15m, ..., 9=50m, 10=55m
-```
+| 路径 | 内容 |
+| --- | --- |
+| `outputs/2dto2d/Du_Unet/Du_Unet_train_config.json` | 本次 Du_Unet 训练配置快照。 |
+| `outputs/2dto2d/Du_Unet/{target_var}/training_history_Du_Unet_{target_var}_depth{depth_m}m.npz` | 每个深度的 train/val loss 数组。 |
+| `outputs/2dto2d/Du_Unet/{target_var}/loss_Du_Unet_{target_var}_depth{depth_m}m.png` | 每个深度的 loss 曲线。 |
+| `checkpoints/2dto2d/Du_Unet/{target_var}/Du_Unet_{target_var}_depth{depth_m}m_best.pth` | 每个深度的最佳权重。 |
 
-### 推理`test.py`
+### test：单日预测和可视化
+
+输入命令：
 
 ```bash
-# 2dto2d: Du_Unet（逐层加载checkpoint并拼装）
-python test.py --method Du_Unet --target-var temperature --select-day 2023-03-12 --target-level 10 \
+python test.py --method Du_Unet --target-var temperature \
+  --select-day 2023-03-12 \
+  --target-level 10 \
   --start-date 2002-01-01 --end-date 2023-12-31 \
-  --data-dir ./data/raw --checkpoint-dir ./checkpoints/2dto2d/Du_Unet
+  --data-dir ./data/raw \
+  --checkpoint-dir ./checkpoints/2dto2d/Du_Unet \
+  --output-dir ./outputs
+```
 
-python test.py --method Du_Unet --target-var salinity --select-day 2023-03-12 --target-level 10 \
-  --start-date 2002-01-01 --end-date 2023-12-31 \
-  --data-dir ./data/raw --checkpoint-dir ./checkpoints/2dto2d/Du_Unet
+参数说明：
 
-# 2dto2d: Du_Unet（2023 全年测试集整体评估）
+| 参数 | 含义 |
+| --- | --- |
+| `--method` | 固定为 `Du_Unet` 或 `du_unet`。 |
+| `--target-var` | 测试变量，`temperature` 或 `salinity`。 |
+| `--select-day` | 单日预测日期，格式 `YYYY-MM-DD`。 |
+| `--target-level` | 二维可视化深度索引，不影响完整 25 层输出。 |
+| `--start-date` / `--end-date` | 必须与训练 checkpoint 对应的数据范围保持一致。 |
+| `--data-dir` | 原始数据目录。 |
+| `--checkpoint-dir` | Du_Unet 多深度 checkpoint 目录；可传到 `Du_Unet` 根目录，代码会自动查找变量子目录。 |
+| `--output-dir` | 输出根目录，默认 `./outputs`。 |
+
+输出文件位于 `outputs/2dto2d/Du_Unet/{target_var}/`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `../Du_Unet_test_config.json` | 本次 Du_Unet 单日测试配置快照，位于 `outputs/2dto2d/Du_Unet/`，包含 `single: true`。 |
+| `pred_Du_Unet_{target_var}_{YYYYMMDD}.npy` | 反标准化后的完整 25 层预测场。 |
+| `grid_metrics_Du_Unet_{target_var}_{YYYYMMDD}.npz` | 网格 MAE/RMSE 等指标。 |
+| `map_panel_{target_var}_lvl{level}_Du_Unet_{YYYYMMDD}.png` | 指定层预测、真值、误差三联图。 |
+| `summary_Du_Unet_{target_var}_{YYYYMMDD}.json` | 单日汇总指标和单位说明。 |
+
+### test/eval：时间段整体评估
+
+输入命令：
+
+```bash
 python test.py --method Du_Unet --target-var temperature \
   --eval-start 2023-01-01 --eval-end 2023-12-31 \
   --eval-batch-size 32 \
   --start-date 2002-01-01 --end-date 2023-12-31 \
-  --data-dir ./data/raw --checkpoint-dir ./checkpoints/2dto2d/Du_Unet
-
-# 2dto3d: 2dvar
-python test.py --method 2dvar --select-day 2023-06-15 --target-level 10 \
-  --sla-sss-path ./data/raw/sla_sss_2019-01-01_2023-12-31_10_18_110_118.npy
-
-# 2dto3d: modas
-python test.py --method modas --select-day 2023-06-15 --target-level 10 \
-  --sla-sss-path ./data/raw/sla_sss_2019-01-01_2023-12-31_10_18_110_118.npy \
-  --sws-true-path ./data/raw/sws_2019-01-01_2023-12-31_10_18_110_118_0-300.npy
+  --data-dir ./data/raw \
+  --checkpoint-dir ./checkpoints/2dto2d/Du_Unet \
+  --output-dir ./outputs
 ```
+
+参数说明：
 
 | 参数 | 含义 |
 | --- | --- |
-| `--method` | 推理/评估方法，支持 `Du_Unet` / `du_unet`、`ocean_transformer`、`2dvar`、`modas`。 |
-| `--select-day` | 单日案例预测日期，格式 `YYYY-MM-DD`；与 `--eval-start` 二选一。 |
-| `--eval-start` | 时间段整体评估起始日期，目前仅支持 Du_Unet。 |
-| `--eval-end` | 时间段整体评估结束日期，使用 `--eval-start` 时必须提供。 |
-| `--eval-batch-size` | 时间段推理 batch size，默认 4，不影响指标口径。 |
-| `--target-level` | 可视化深度层索引，不是米数；Du_Unet 中 `10` 表示 55m。 |
-| `--output-dir` | 推理产物输出根目录，默认 `./outputs`。 |
-| `--checkpoint` | 单模型权重路径，主要用于 `ocean_transformer`。 |
-| `--checkpoint-dir` | Du_Unet 多深度 checkpoint 目录；可传 `./checkpoints/2dto2d/Du_Unet`，代码会兼容查找 `{target_var}` 子目录。 |
-| `--data-dir` | 深度学习方法的数据目录。 |
-| `--target-var` | Du_Unet 预测目标变量，`temperature` 或 `salinity`。 |
-| `--start-date` | Du_Unet 数据起始日期，应与训练 checkpoint 的数据范围一致。 |
-| `--end-date` | Du_Unet 数据结束日期，应与训练 checkpoint 的数据范围一致。 |
-| `--dummy` | 使用 2dto3d 合成数据调试。 |
-| `--sla-sss-path` | 2DVar/MODAS 的 SLA/SSS 输入文件路径。 |
-| `--sws-true-path` | MODAS 必需的真值文件路径；2DVar 可传入用于评估。 |
+| `--eval-start` / `--eval-end` | 闭区间评估日期；目前时间段模式仅支持 Du_Unet。 |
+| `--eval-batch-size` | 时间段推理 batch size。 |
+| 其他参数 | 与单日预测一致。 |
+
+输出文件位于 `outputs/2dto2d/Du_Unet/{target_var}/`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `../Du_Unet_test_config.json` | 本次 Du_Unet 时间段测试配置快照，包含 `single: false`。 |
+| `evaluation_metrics_Du_Unet_{target_var}_{YYYYMMDD}_{YYYYMMDD}.npz` | overall/by-depth/by-day 指标数组。 |
+| `summary_Du_Unet_{target_var}_{YYYYMMDD}_{YYYYMMDD}.json` | 时间段汇总指标。 |
+| `metrics_by_depth_Du_Unet_{target_var}_{YYYYMMDD}_{YYYYMMDD}.png` | 逐深度指标曲线。 |
+| `metrics_by_day_Du_Unet_{target_var}_{YYYYMMDD}_{YYYYMMDD}.png` | 逐日指标曲线。 |
+
+## HVCARefiner
+
+HVCARefiner 是 Du_Unet 之后的二阶段残差修正模型。它冻结 Du_Unet，先生成或读取 `T0` cache，再训练一个全深度 refiner。
+
+### train：二阶段残差修正训练
+
+输入命令：
+
+```bash
+python -u train_hvca_refiner.py \
+  --target-var temperature \
+  --data-dir ./data/raw \
+  --start-date 2002-01-01 --end-date 2023-12-31 \
+  --base-checkpoint-dir ./checkpoints/2dto2d/Du_Unet \
+  --t0-cache-dir outputs/2dto2d/HVCARefiner/t0_cache_train \
+  --val-cache-dir outputs/2dto2d/HVCARefiner/t0_cache_val \
+  --save-dir outputs/2dto2d/HVCARefiner \
+  --epochs 50 \
+  --batch-size 4 \
+  --lr 1e-4 \
+  --weight-decay 1e-4 \
+  --dim 64 \
+  --num-heads 4 \
+  --num-layers 2 \
+  --dropout 0.1 \
+  --column-chunk-size 8192 \
+  --num-workers 0 \
+  --seed 42
+```
+
+参数说明：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--target-var` | 修正变量，`temperature` 或 `salinity`，需与 Du_Unet checkpoint 对应。 |
+| `--data-dir` | 原始数据目录。 |
+| `--start-date` / `--end-date` | 数据日期范围。 |
+| `--base-checkpoint-dir` | 第一阶段 Du_Unet checkpoint 根目录。 |
+| `--t0-cache-dir` | 训练集 T0 cache 目录；不存在时会生成。 |
+| `--val-cache-dir` | 验证集 T0 cache 目录；不存在时会生成。 |
+| `--depths` | 可选，逗号分隔深度米数；不传使用全部 `DEPTH_LEVELS_25M`。 |
+| `--epochs` | 训练轮数。 |
+| `--batch-size` | cache dataset batch size。 |
+| `--cache-shard-size` | 生成 T0 cache 时每个 shard 的样本数。 |
+| `--lr` / `--weight-decay` | AdamW 优化器参数。 |
+| `--dim` / `--num-heads` / `--num-layers` / `--dropout` | HVCARefiner 模型结构参数。 |
+| `--column-chunk-size` | attention 分块列数，用于控制显存。 |
+| `--num-workers` / `--prefetch-factor` / `--shard-cache-size` | cache DataLoader 读取参数。 |
+| `--save-dir` | HVCA 输出目录，默认 `outputs/2dto2d/HVCARefiner`。 |
+| `--device` | 可选，指定 `cuda`、`cpu` 等；不传自动选择。 |
+| `--seed` | 随机种子。 |
+| `--max-samples` | 可选，截断训练样本数用于调试。 |
+
+输出文件：
+
+| 路径 | 内容 |
+| --- | --- |
+| `outputs/2dto2d/HVCARefiner/HVCARefiner_train_config.json` | 本次 HVCA 训练配置快照。 |
+| `outputs/2dto2d/HVCARefiner/best.pt` | 最佳 HVCARefiner checkpoint。 |
+| `outputs/2dto2d/HVCARefiner/training_history_HVCARefiner.npz` | train/val loss 数组。 |
+| `outputs/2dto2d/HVCARefiner/loss_HVCARefiner.png` | loss 曲线。 |
+| `outputs/2dto2d/HVCARefiner/t0_cache_train/` | 训练 T0 cache shard 和 metadata。 |
+| `outputs/2dto2d/HVCARefiner/t0_cache_val/` | 验证 T0 cache shard 和 metadata。 |
+
+### test/eval：时间段评估和空间解释图
+
+输入命令：
+
+```bash
+python test_hvca_refiner.py \
+  --target-var temperature \
+  --data-dir ./data/raw \
+  --start-date 2002-01-01 --end-date 2023-12-31 \
+  --eval-start 2023-01-01 --eval-end 2023-12-31 \
+  --checkpoint outputs/2dto2d/HVCARefiner/best.pt \
+  --t0-cache-dir outputs/2dto2d/HVCARefiner/t0_cache_test \
+  --base-checkpoint-dir ./checkpoints/2dto2d/Du_Unet \
+  --save-dir outputs/2dto2d/HVCARefiner \
+  --batch-size 4 \
+  --column-chunk-size 8192 \
+  --num-workers 0 \
+  --spatial-panels \
+  --target-levels 0,4,9,17,24
+```
+
+参数说明：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--checkpoint` | 已训练的 HVCARefiner checkpoint，通常是 `best.pt`。 |
+| `--t0-cache-dir` | 测试集 T0 cache 目录；不存在时会生成。 |
+| `--base-checkpoint-dir` | 第一阶段 Du_Unet checkpoint 根目录。 |
+| `--target-var` | 评估变量，需与 checkpoint 对应。 |
+| `--eval-start` / `--eval-end` | 闭区间评估日期。 |
+| `--depths` | 仅旧 checkpoint 缺少 `depth_values` 时使用。 |
+| `--batch-size` | cache 推理 batch size。 |
+| `--cache-shard-size` | 生成测试 T0 cache 时每个 shard 的样本数。 |
+| `--dim` / `--num-heads` / `--num-layers` / `--dropout` | 仅旧 checkpoint 缺少 `model_config` 时使用。 |
+| `--column-chunk-size` | 仅旧 checkpoint 缺少 `model_config` 时使用。 |
+| `--thermocline-min` / `--thermocline-max` | 温跃层 RMSE 统计深度范围。 |
+| `--spatial-panels` | 开启 T0/HVCA/truth/error/delta 二维解释面板输出。 |
+| `--target-levels` | 空间解释面板使用的深度层索引。 |
+| `--panel-days` | 可选，指定面板日期；不传则自动选择 best/median/worst。 |
+| `--section-panels` | 开启 T0/HVCA/truth/error/delta 垂向剖面六子图。 |
+| `--section-axis` | 剖面固定轴，`lat` 表示固定纬度画 depth-longitude，`lon` 表示固定经度画 depth-latitude。 |
+| `--section-index` | 剖面固定轴索引，整数或 `middle`。 |
+| `--section-width` | 固定轴方向平均格点宽度，默认 1 表示不做带平均。 |
+| `--save-dir` | 输出目录，默认 `outputs/2dto2d/HVCARefiner`。 |
+| `--device` / `--max-samples` | 设备指定和调试截断。 |
+
+输出文件：
+
+| 路径 | 内容 |
+| --- | --- |
+| `outputs/2dto2d/HVCARefiner/HVCARefiner_test_config.json` | 本次 HVCA 测试配置快照，包含 `single: false`。 |
+| `outputs/2dto2d/HVCARefiner/evaluation_metrics_HVCARefiner_{target_var}_{YYYY-MM-DD}_{YYYY-MM-DD}.npz` | baseline_T0 和 HVCA_refined 的 overall/by-depth/by-day 指标。 |
+| `outputs/2dto2d/HVCARefiner/summary_HVCARefiner_{target_var}_{YYYY-MM-DD}_{YYYY-MM-DD}.json` | 汇总指标、温跃层指标、垂向梯度指标和面板记录。 |
+| `outputs/2dto2d/HVCARefiner/metrics_by_depth_HVCARefiner_{target_var}_{YYYY-MM-DD}_{YYYY-MM-DD}.png` | baseline/refined 逐深度对比曲线。 |
+| `outputs/2dto2d/HVCARefiner/metrics_by_day_HVCARefiner_{target_var}_{YYYY-MM-DD}_{YYYY-MM-DD}.png` | baseline/refined 逐日对比曲线。 |
+| `outputs/2dto2d/HVCARefiner/map_hvca_panel_*` | 开启 `--spatial-panels` 时生成的二维解释面板。 |
+| `outputs/2dto2d/HVCARefiner/section_hvca_panel_*` | 开启 `--section-panels` 时生成的垂向剖面解释面板。 |
+| `outputs/2dto2d/HVCARefiner/t0_cache_test/` | 测试 T0 cache shard 和 metadata。 |
+
+## OceanTransformer
+
+OceanTransformer 是 `2dto3d` 深度学习模型，单模型直接输出多深度温盐场。
+
+### train：端到端 2dto3d 训练
+
+输入命令：
+
+```bash
+python train.py --method ocean_transformer \
+  --data-dir ./data/raw \
+  --output-dir ./outputs \
+  --checkpoint-dir ./checkpoints \
+  --epochs 50 \
+  --batch-size 4 \
+  --lr 1e-4 \
+  --patience 10 \
+  --seed 42
+```
+
+合成数据调试：
+
+```bash
+python train.py --method ocean_transformer --dummy
+```
+
+参数说明：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--method` | 固定为 `ocean_transformer`。 |
+| `--data-dir` | 原始数据目录。 |
+| `--output-dir` | 输出根目录。 |
+| `--checkpoint-dir` | checkpoint 根目录。 |
+| `--epochs` / `--batch-size` / `--lr` / `--patience` | 覆盖 `TWODTO3D_*` 默认训练超参数。 |
+| `--dummy` | 使用合成数据调试，不读真实数据。 |
+| `--seed` | 随机种子。 |
+
+输出文件：
+
+| 路径 | 内容 |
+| --- | --- |
+| `outputs/2dto3d/ocean_transformer/training_history_ocean_transformer.npz` | train/val loss 数组。 |
+| `outputs/2dto3d/ocean_transformer/loss_ocean_transformer.png` | loss 曲线。 |
+| `checkpoints/2dto3d/ocean_transformer/ocean_transformer_best.pth` | 最佳 checkpoint。 |
+
+### test：单日预测和可视化
+
+输入命令：
+
+```bash
+python test.py --method ocean_transformer \
+  --select-day 2023-06-15 \
+  --target-level 5 \
+  --data-dir ./data/raw \
+  --checkpoint ./checkpoints/2dto3d/ocean_transformer/ocean_transformer_best.pth \
+  --output-dir ./outputs
+```
+
+参数说明：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--method` | 固定为 `ocean_transformer`。 |
+| `--select-day` | 单日预测日期。 |
+| `--target-level` | 可视化深度层索引。 |
+| `--data-dir` | 原始数据目录。 |
+| `--checkpoint` | 模型权重路径；不传或不存在时会使用随机初始化模型。 |
+| `--dummy` | 使用合成测试数据。 |
+| `--output-dir` | 输出根目录。 |
+
+输出文件位于 `outputs/2dto3d/ocean_transformer/`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `pred_ocean_transformer_{YYYYMMDD}.npy` | 预测温盐场，形状为 `(1,D,H,W,2)`。 |
+| `map_temp_lvl{level}_ocean_transformer_{YYYYMMDD}.png` | 指定层温度预测图。 |
+| `map_salt_lvl{level}_ocean_transformer_{YYYYMMDD}.png` | 指定层盐度预测图。 |
+| `grid_metrics_ocean_transformer_{YYYYMMDD}.npz` | 网格 MAE/RMSE。 |
+| `map_mae_lvl{level}_ocean_transformer_{YYYYMMDD}.png` | 指定层 MAE 图。 |
+| `summary_ocean_transformer_{YYYYMMDD}.json` | 温度、盐度汇总指标。 |
+
+## 2DVar
+
+2DVar 是非深度学习变分反演方法，没有独立训练脚本，只通过 `test.py` 做单日反演。
+
+### test：单日变分反演
+
+输入命令：
+
+```bash
+python test.py --method 2dvar \
+  --select-day 2023-06-15 \
+  --target-level 10 \
+  --sla-sss-path ./data/raw/sla_sss_2019-01-01_2023-12-31_10_18_110_118.npy \
+  --sws-true-path ./data/raw/sws_2019-01-01_2023-12-31_10_18_110_118_0-300.npy \
+  --c-depth 26 \
+  --output-dir ./outputs
+```
+
+参数说明：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--method` | 固定为 `2dvar`。 |
+| `--select-day` | 单日反演日期。 |
+| `--target-level` | 可视化深度层索引。 |
+| `--sla-sss-path` | SLA/SSS 输入文件路径。 |
+| `--sws-true-path` | 可选真值文件；提供后会计算指标和误差图。 |
 | `--c-depth` | 2DVar 输出深度层数，默认 26。 |
+| `--output-dir` | 输出根目录。 |
 
-服务器数据目录如果不是 `./data/raw`，可把 `--data-dir` 替换为实际路径，例如 `/root/autodl-tmp/.autodl/data/raw`。Du_Unet 推理时的 `--start-date/--end-date` 应与对应 checkpoint 训练时使用的数据范围一致，否则标准化和反标准化统计量会不一致。
+输出文件位于 `outputs/2dto3d/2dvar/`：
 
-## 统一可视化产物
+| 文件 | 内容 |
+| --- | --- |
+| `pred_2dvar_{YYYYMMDD}.npy` | 单日反演结果。 |
+| `map_temperature_lvl{level}_2dvar_{YYYYMMDD}.png` | 指定层预测图。 |
+| `summary_2dvar_{YYYYMMDD}.json` | 单日汇总；未提供真值时指标为空。 |
+| `grid_metrics_2dvar_{YYYYMMDD}.npz` | 提供真值时生成的网格指标。 |
+| `map_mae_lvl{level}_2dvar_{YYYYMMDD}.png` | 提供真值时生成的指定层 MAE 图。 |
 
-所有方法都会保存预测数组、网格指标和 summary。可视化产物按方法略有不同：
+## MODAS
 
-- Du_Unet：指定层预测-真值-绝对误差三联图 `map_panel_*`，以及 3D 误差剖面图 `plot_3d_metric_profile`。
-- 2dto3d / Non-DL 方法：指定层 2D 图 `plot_level_map`，以及 3D 误差剖面图 `plot_3d_metric_profile`。
+MODAS 是统计回归反演方法，没有独立训练脚本；`test.py` 会在运行时用固定训练切片拟合回归系数，然后预测目标日。
 
-统一输出文件（位于 `outputs/{paradigm}/{method}/`；Du_Unet 位于 `outputs/2dto2d/Du_Unet/{target_var}/`）：
+### test：单日统计反演
 
-- `pred_{method}_{date}.npy`
-- `grid_metrics_{method}_{date}.npz`
-- `map_*_lvl{level}_{method}_{date}.png`
-- `profile_{metric}_{method}_{date}.png`
-- `summary_{method}_{date}.json`
+输入命令：
 
-Du_Unet 会在变量目录内保留变量名，例如：
+```bash
+python test.py --method modas \
+  --select-day 2023-06-15 \
+  --target-level 10 \
+  --sla-sss-path ./data/raw/sla_sss_2019-01-01_2023-12-31_10_18_110_118.npy \
+  --sws-true-path ./data/raw/sws_2019-01-01_2023-12-31_10_18_110_118_0-300.npy \
+  --output-dir ./outputs
+```
 
-- `pred_Du_Unet_temperature_20230615.npy`
-- `grid_metrics_Du_Unet_salinity_20230615.npz`
-- `map_panel_temperature_lvl10_Du_Unet_20230615.png`
-- `summary_Du_Unet_temperature_20230615.json`
+参数说明：
 
-Du_Unet 时间段模式输出四个文件，不保存完整预测，也不生成指定深度三栏图或三维剖面图：
+| 参数 | 含义 |
+| --- | --- |
+| `--method` | 固定为 `modas`。 |
+| `--select-day` | 单日预测日期。 |
+| `--target-level` | 可视化深度层索引。 |
+| `--sla-sss-path` | SLA/SSS 输入文件路径。 |
+| `--sws-true-path` | 必需，既用于拟合统计关系，也用于评估。 |
+| `--output-dir` | 输出根目录。 |
 
-- `evaluation_metrics_Du_Unet_temperature_20230101_20231231.npz`
-- `summary_Du_Unet_temperature_20230101_20231231.json`
-- `metrics_by_depth_Du_Unet_temperature_20230101_20231231.png`
-- `metrics_by_day_Du_Unet_temperature_20230101_20231231.png`
+输出文件位于 `outputs/2dto3d/modas/`：
 
-时间段模式在反标准化后的物理量空间计算 `MAE/RMSE/R²/Correlation`，并排除 `target_mask=0` 的位置：
+| 文件 | 内容 |
+| --- | --- |
+| `pred_modas_{YYYYMMDD}.npy` | 单日预测结果。 |
+| `map_temperature_lvl{level}_modas_{YYYYMMDD}.png` | 指定层预测图。 |
+| `grid_metrics_modas_{YYYYMMDD}.npz` | 网格指标。 |
+| `map_mae_lvl{level}_modas_{YYYYMMDD}.png` | 指定层 MAE 图。 |
+| `summary_modas_{YYYYMMDD}.json` | 单日汇总指标。 |
 
-- 整体指标合并所有有效 `T×D×H×W` 点。
-- 逐深度指标每层合并有效 `T×H×W` 点。
-- 逐日指标每天合并有效 `D×H×W` 点。
-- 整体 RMSE 由全部有效点的平方误差总体均值开方，不是每日 RMSE 的平均。
+## 指标口径
 
-单日 `summary` 中包含：
+- 深度学习模型会在评估前反标准化回原始物理单位。
+- Du_Unet 和 HVCARefiner 的指标会排除 `target_mask=0` 的无效区域。
+- 时间段评估包含 overall、by-depth、by-day 三类统计。
+- overall RMSE 是所有有效点平方误差总体均值开方，不是每日 RMSE 的平均。
 
-- `metric_units`：`mse/rmse/mae/r2/correlation` 对应单位说明
-- `variables`：按变量保存 `mse/rmse/mae/r2/correlation`
+## 常用配置位置
 
-所有模型的预测产物、图和指标均使用原始物理单位。深度学习模型会在训练/推理输入侧使用训练期拟合的月气候态距平和分层标准差归一化，并在评估前反归一化；MODAS 和 2DVar 保持原始单位流程。
-
-Du_Unet 的训练 loss、summary 指标、二维误差图和三维误差剖面图只统计 `target_mask=1` 的有效标签区域。`grid_metrics_*.npz` 中无效区域写为 `NaN`，避免缺失标签区域被当作真实误差。
-
-## 配置索引（config.py）
-
-- 范式与方法：`PARADIGM_2DTO2D_METHODS`、`PARADIGM_2DTO3D_METHODS`
-- 深度列表：`DEPTH_LEVELS_25M`（Du_Unet）、`DEPTH_LEVELS_26M`（旧 2dto3d/Non-DL）
-- Du_Unet 训练：`DU_UNET_*`
-- ocean_transformer 训练：`TWODTO3D_*`
-- 推理可视化：`INFER_*`
+- 路径和日期：`config.py` 中的 `DATA_DIR`、`OUTPUTS_ROOT`、`CHECKPOINTS_ROOT`、`DATA_START_DATE`、`TEST_START_DATE`。
+- Du_Unet 超参数：`DU_UNET_*`。
+- OceanTransformer 超参数：`TWODTO3D_*`。
+- 深度列表：`DEPTH_LEVELS_25M`、`DEPTH_LEVELS_26M`。

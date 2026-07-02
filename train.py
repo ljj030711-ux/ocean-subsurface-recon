@@ -1,4 +1,4 @@
-"""统一训练入口（2dto2d / 2dto3d）。"""
+"""统一训练入口，支持 Du_Unet 逐层训练并兼容 ocean_transformer。"""
 
 import argparse
 import os
@@ -60,6 +60,11 @@ from models.ocean_transformer import OceanTransformer
 from utils.losses import masked_rmse_loss
 from utils.physics import compute_eke, compute_grad_ssh
 from utils.physics_loss import PhysicsLoss
+from utils.run_config import (
+    count_model_parameters,
+    model_config_path,
+    print_and_save_run_config,
+)
 
 TRAINABLE_METHODS = {"du_unet", "ocean_transformer"}
 
@@ -288,10 +293,12 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--data-dir", default=DATA_DIR)
     parser.add_argument("--output-dir", default=OUTPUTS_ROOT)
-    parser.add_argument("--checkpoint -dir", default=CHECKPOINTS_ROOT)
+    parser.add_argument("--checkpoint-dir", default=CHECKPOINTS_ROOT)
     parser.add_argument("--dummy", action="store_true", help="2dto3d(ocean_transformer) 使用合成数据")
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--quality-report", action="store_true",
+                        help="2dto2d(Du_Unet) 加载数据时生成缺失率质检图")
     parser.add_argument(
         "--depth-indices",
         default=None,
@@ -381,6 +388,7 @@ def main():
         target_var=args.target_var,
         start_date=args.start_date,
         end_date=args.end_date,
+        quality_report=args.quality_report,
     )
     train_idx, val_idx, _ = get_year_split_indices(len(dataset), dataset.start_date)
     if len(train_idx) == 0 or len(val_idx) == 0:
@@ -395,9 +403,84 @@ def main():
         batch_size = args.batch_size or DU_UNET_BATCH_SIZE
         lr = args.lr or DU_UNET_LR
         patience = args.patience or DU_UNET_PATIENCE
+        param_stats = count_model_parameters(build_model("du_unet", out_channels=1))
+        scheduler_step_size = max(epochs // 3, 1)
+        training_strategy = {
+            "epoch": {
+                "planned": epochs,
+                "indexing": "1_based",
+            },
+            "early_stopping": {
+                "enabled": True,
+                "monitor": "val_loss",
+                "mode": "min",
+                "patience": patience,
+            },
+            "optimizer": {
+                "name": "Adam",
+                "lr": lr,
+                "weight_decay": DU_UNET_WEIGHT_DECAY,
+            },
+            "scheduler": {
+                "name": "StepLR",
+                "step_size": scheduler_step_size,
+                "gamma": 0.5,
+                "step_on": "epoch",
+            },
+            "warmup": {
+                "enabled": False,
+                "epochs": 0,
+            },
+        }
 
         train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size, shuffle=False)
+        print_and_save_run_config(
+            "Du_Unet 训练超参数",
+            {
+                "stage": "train",
+                "model": "Du_Unet",
+                "method": method,
+                "paradigm": paradigm,
+                "target_var": args.target_var,
+                "device": device,
+                "seed": args.seed,
+                "data": {
+                    "data_dir": args.data_dir,
+                    "start_date": dataset.start_date,
+                    "end_date": dataset.end_date,
+                    "train_samples": len(train_idx),
+                    "val_samples": len(val_idx),
+                },
+                "hyperparameters": {
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "lr": lr,
+                    "learning_rate": lr,
+                    "weight_decay": DU_UNET_WEIGHT_DECAY,
+                    "patience": patience,
+                    "depth_indices": depth_indices,
+                    "depth_m": [DEPTH_LEVELS_25M[i] for i in depth_indices],
+                },
+                "training_strategy": training_strategy,
+                "model_config": {
+                    "out_channels": 1,
+                },
+                "parameter_count": {
+                    "per_depth_model": param_stats,
+                    "num_depth_models": len(depth_indices),
+                    "total_if_all_depth_models_loaded": {
+                        name: value * len(depth_indices)
+                        for name, value in param_stats.items()
+                    },
+                },
+                "paths": {
+                    "output_dir": out_dir,
+                    "checkpoint_dir": ckpt_dir,
+                },
+            },
+            model_config_path(args.output_dir, "Du_Unet", "train"),
+        )
 
         for depth_idx in depth_indices:
             depth_m = DEPTH_LEVELS_25M[depth_idx]
@@ -408,7 +491,7 @@ def main():
             model = build_model("du_unet", out_channels=1).to(device)
             optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=DU_UNET_WEIGHT_DECAY)
             scheduler = torch.optim.lr_scheduler.StepLR(
-                optimizer, step_size=max(epochs // 3, 1), gamma=0.5
+                optimizer, step_size=scheduler_step_size, gamma=0.5
             )
             ckpt_name = DU_UNET_CKPT_NAME_TEMPLATE.format(
                 target_var=args.target_var, depth_m=depth_m

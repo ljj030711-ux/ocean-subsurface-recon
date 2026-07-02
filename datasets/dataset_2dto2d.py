@@ -54,6 +54,7 @@ class Dataset2Dto2D(Dataset):
         target_var="temperature",
         start_date=None,
         end_date=None,
+        quality_report=False,
     ):
         """
         初始化数据集
@@ -64,6 +65,7 @@ class Dataset2Dto2D(Dataset):
             target_var: temperature 或 salinity
             start_date: 可选数据起始日期
             end_date: 可选数据结束日期
+            quality_report: 是否生成缺失率质检统计图
         """
         self.data_dir = data_dir
         self.normalize = normalize
@@ -101,6 +103,7 @@ class Dataset2Dto2D(Dataset):
             months=self.months,
             fit_indices=self.fit_indices,
             start_date=self.start_date,
+            quality_report=quality_report,
         )
         
         # 数据统计

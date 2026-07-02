@@ -1,4 +1,4 @@
-"""统一预测评估入口（2dto2d / 2dto3d）。"""
+"""统一测试入口，支持 Du_Unet 单日预测、时间段评估和 2dto3d/Non-DL 方法。"""
 
 import argparse
 import json
@@ -22,8 +22,6 @@ from config import (
     DY,
     DU_UNET_CKPT_NAME_TEMPLATE,
     INFER_DEFAULT_TARGET_LEVEL,
-    INFER_PROFILE_METRIC,
-    INFER_PROFILE_ZMAX,
     TRAIN_END_DATE, VAL_START_DATE, VAL_END_DATE,
     TEST_START_DATE, TEST_END_DATE,
     LON_RANGE, LAT_RANGE, DEPTH_MAX, OUTPUTS_ROOT,
@@ -43,12 +41,16 @@ from utils.metrics import (
     RegressionMetricAccumulator, scalar_metrics,
 )
 from utils.viz_layer_2d import (
-    metric_cbar_label,
     plot_level_map,
     plot_prediction_truth_error_panel,
 )
-from utils.viz_layer_profile import plot_3d_metric_profile
 from utils.physics import compute_eke, compute_grad_ssh
+from utils.run_config import (
+    count_model_parameters,
+    load_run_config,
+    model_config_path,
+    print_and_save_run_config,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -61,6 +63,42 @@ ALL_METHODS = sorted(DL_2DTO2D_METHODS | DL_2DTO3D_METHODS | NON_DL_METHODS)
 
 
 # ==================== 命名工具 ====================
+
+def load_training_strategy_reference(train_config_path):
+    train_config = load_run_config(train_config_path)
+    if train_config and train_config.get("training_strategy"):
+        strategy = {
+            "source": "train_config",
+            "config_path": train_config_path,
+        }
+        strategy.update(train_config["training_strategy"])
+        return strategy
+    return {
+        "source": "not_available_in_test",
+        "config_path": train_config_path,
+        "epoch": {
+            "planned": None,
+            "indexing": None,
+        },
+        "early_stopping": {
+            "enabled": None,
+            "monitor": None,
+            "mode": None,
+            "patience": None,
+        },
+        "optimizer": {
+            "name": None,
+            "lr": None,
+            "weight_decay": None,
+        },
+        "scheduler": {
+            "name": None,
+        },
+        "warmup": {
+            "enabled": None,
+            "epochs": None,
+        },
+    }
 
 def _tag(method, date_str, target_var=None):
     d = date_str.replace("-", "")
@@ -84,11 +122,6 @@ def map_filename(var, level, method, date_str, target_var=None):
     if target_var and var != target_var:
         return f"map_{var}_{target_var}_lvl{level}_{m}_{d}.png"
     return f"map_{var}_lvl{level}_{m}_{d}.png"
-
-
-def profile_filename(metric_name, method, date_str, target_var=None):
-    m, d = _tag(method, date_str, target_var=target_var)
-    return f"profile_{metric_name}_{m}_{d}.png"
 
 
 def summary_filename(method, date_str, target_var=None):
@@ -219,18 +252,70 @@ def predict_2dto2d(args):
     device = _get_device()
 
     from datasets.dataset_2dto2d import Dataset2Dto2D
+    from train import build_model
     dataset = Dataset2Dto2D(
         args.data_dir,
         normalize=True,
         target_var=args.target_var,
         start_date=args.start_date,
         end_date=args.end_date,
+        quality_report=args.quality_report,
     )
     t = date_to_index(args.select_day, dataset.start_date, dataset.end_date)
     sample = dataset[t]
     norm_stats = dataset.get_norm_stats()
     sst = sample["sst"].unsqueeze(0).to(device)
     ssh_sss = sample["ssh_sss"].unsqueeze(0).to(device)
+    param_stats = count_model_parameters(build_model("du_unet", out_channels=1))
+    train_config_path = model_config_path(args.output_dir, "Du_Unet", "train")
+    print_and_save_run_config(
+        "Du_Unet 单日测试超参数",
+        {
+            "stage": "test",
+            "mode": "single_day",
+            "single": True,
+            "model": "Du_Unet",
+            "method": args.method,
+            "paradigm": PARADIGM_2DTO2D,
+            "target_var": args.target_var,
+            "device": device,
+            "data": {
+                "data_dir": args.data_dir,
+                "start_date": dataset.start_date,
+                "end_date": dataset.end_date,
+                "select_day": args.select_day,
+                "sample_index": t,
+            },
+            "hyperparameters": {
+                "target_level": args.target_level,
+                "depth_m": DEPTH_LEVELS_25M,
+            },
+            "model_config": {
+                "out_channels": 1,
+            },
+            "training_strategy": load_training_strategy_reference(train_config_path),
+            "parameter_count": {
+                "per_depth_model": param_stats,
+                "num_depth_models": len(DEPTH_LEVELS_25M),
+                "total_if_all_depth_models_loaded": {
+                    name: value * len(DEPTH_LEVELS_25M)
+                    for name, value in param_stats.items()
+                },
+            },
+            "paths": {
+                "output_dir": get_output_dir(
+                    PARADIGM_2DTO2D,
+                    "Du_Unet",
+                    base_dir=args.output_dir,
+                    target_var=args.target_var,
+                ),
+                "checkpoint": args.checkpoint,
+                "checkpoint_dir_candidates": _du_unet_checkpoint_dirs(args),
+                "train_config": train_config_path,
+            },
+        },
+        model_config_path(args.output_dir, "Du_Unet", "test"),
+    )
 
     models = _load_du_unet_models(args, device, require_all=False)
     pred_list = []
@@ -338,10 +423,6 @@ def _load_du_unet_models(args, device, require_all):
     return models
 
 
-def _metric_cbar_label(metric_name, target_var):
-    return metric_cbar_label(metric_name, target_var)
-
-
 def _apply_mask(array, mask):
     if mask is None:
         return array
@@ -431,6 +512,7 @@ def _plot_period_metrics(
 def evaluate_2dto2d_period(args, out_dir):
     """在日期闭区间上评估 Du_Unet 的整体、逐深度和逐日指标。"""
     from datasets.dataset_2dto2d import Dataset2Dto2D
+    from train import build_model
 
     dataset = Dataset2Dto2D(
         args.data_dir,
@@ -438,6 +520,7 @@ def evaluate_2dto2d_period(args, out_dir):
         target_var=args.target_var,
         start_date=args.start_date,
         end_date=args.end_date,
+        quality_report=args.quality_report,
     )
     start_idx = date_to_index(args.eval_start, dataset.start_date, dataset.end_date)
     end_idx = date_to_index(args.eval_end, dataset.start_date, dataset.end_date)
@@ -455,6 +538,52 @@ def evaluate_2dto2d_period(args, out_dir):
     )
 
     device = _get_device()
+    param_stats = count_model_parameters(build_model("du_unet", out_channels=1))
+    train_config_path = model_config_path(args.output_dir, "Du_Unet", "train")
+    print_and_save_run_config(
+        "Du_Unet 时间段测试超参数",
+        {
+            "stage": "test",
+            "mode": "period",
+            "single": False,
+            "model": "Du_Unet",
+            "method": args.method,
+            "paradigm": PARADIGM_2DTO2D,
+            "target_var": args.target_var,
+            "device": device,
+            "data": {
+                "data_dir": args.data_dir,
+                "start_date": dataset.start_date,
+                "end_date": dataset.end_date,
+                "eval_start": args.eval_start,
+                "eval_end": args.eval_end,
+                "eval_samples": len(eval_indices),
+            },
+            "hyperparameters": {
+                "eval_batch_size": args.eval_batch_size,
+                "depth_m": DEPTH_LEVELS_25M,
+            },
+            "model_config": {
+                "out_channels": 1,
+            },
+            "training_strategy": load_training_strategy_reference(train_config_path),
+            "parameter_count": {
+                "per_depth_model": param_stats,
+                "num_depth_models": len(DEPTH_LEVELS_25M),
+                "total_if_all_depth_models_loaded": {
+                    name: value * len(DEPTH_LEVELS_25M)
+                    for name, value in param_stats.items()
+                },
+            },
+            "paths": {
+                "output_dir": out_dir,
+                "checkpoint": args.checkpoint,
+                "checkpoint_dir_candidates": _du_unet_checkpoint_dirs(args),
+                "train_config": train_config_path,
+            },
+        },
+        model_config_path(args.output_dir, "Du_Unet", "test"),
+    )
     models = _load_du_unet_models(args, device, require_all=True)
     norm_stats = dataset.get_norm_stats()
     target_norm = MonthlyClimatologyLayerStdNormalizer.from_stats(
@@ -688,12 +817,6 @@ def save_outputs(args, y_pred, y_true, out_dir, mask=None):
                 lon_range=LON_RANGE, lat_range=LAT_RANGE,
                 cmap="RdYlBu_r", cbar_label="MAE")
 
-            profile_path = os.path.join(out_dir, profile_filename("rmse", method, day))
-            plot_3d_metric_profile(
-                npz_path, metric_name=INFER_PROFILE_METRIC,
-                output_img_path=profile_path,
-                lon_range=LON_RANGE, lat_range=LAT_RANGE,
-                z_max=INFER_PROFILE_ZMAX)
         else:
             grid = compute_grid_metrics(y_true, y_pred, mask=mask)
             metrics_name = metrics_filename(method, day, target_var=output_target_var)
@@ -741,15 +864,6 @@ def save_outputs(args, y_pred, y_true, out_dir, mask=None):
                         lon_range=LON_RANGE, lat_range=LAT_RANGE,
                         cmap="RdYlBu_r", cbar_label="MAE")
 
-                profile_path = os.path.join(
-                    out_dir, profile_filename("rmse", method, day, target_var=output_target_var))
-                plot_3d_metric_profile(
-                    npz_path, metric_name=INFER_PROFILE_METRIC,
-                    output_img_path=profile_path,
-                    lon_range=LON_RANGE, lat_range=LAT_RANGE,
-                    z_max=INFER_PROFILE_ZMAX,
-                    cbar_label=_metric_cbar_label(INFER_PROFILE_METRIC, output_target_var))
-
     # ----- 4. summary.json -----
     summary_name = summary_filename(method, day, target_var=output_target_var)
     summary_path = os.path.join(out_dir, summary_name)
@@ -792,6 +906,8 @@ def parse_args():
                       help="Du_Unet 使用的数据结束日期 YYYY-MM-DD，默认使用配置中的结束日期")
     g_dl.add_argument("--dummy", action="store_true",
                       help="使用合成数据 (2dto3d)")
+    g_dl.add_argument("--quality-report", action="store_true",
+                      help="Du_Unet 加载数据时生成缺失率质检图")
 
     g_ndl = p.add_argument_group("Non-DL 方法参数")
     g_ndl.add_argument("--sla-sss-path", default=None)

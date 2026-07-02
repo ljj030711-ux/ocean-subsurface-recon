@@ -18,4 +18,5 @@ data/*
 
 # 其他临时文件和目录
 reports/
-scripts/
+scripts/*
+!scripts/upload_nc_to_autodl_fs.sh

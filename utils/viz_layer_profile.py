@@ -1,139 +1,144 @@
-"""三维经纬-深度剖面图可视化"""
+"""HVCARefiner 垂向剖面六子图可视化。"""
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import cm
-from matplotlib.colors import Normalize
-from scipy.ndimage import gaussian_filter
+from matplotlib.colors import TwoSlopeNorm
 
-plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False
+from utils.viz_layer_2d import (
+    field_cmap_and_label,
+    finite_symmetric_limit,
+    finite_vmin_vmax,
+)
 
-
-def _nan_gaussian_filter(data, sigma):
-    """Smooth finite values without letting NaNs contaminate the full field."""
-    finite = np.isfinite(data)
-    if not np.any(finite):
-        return np.full_like(data, np.nan, dtype=np.float32)
-    filled = np.where(finite, data, 0.0)
-    weights = finite.astype(np.float32)
-    smoothed = gaussian_filter(filled, sigma=sigma)
-    smoothed_weights = gaussian_filter(weights, sigma=sigma)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        out = smoothed / smoothed_weights
-    out[smoothed_weights <= 1e-6] = np.nan
-    return out
+plt.rcParams["font.sans-serif"] = ["Arial Unicode MS", "SimHei", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
 
 
-def plot_3d_metric_profile(npz_path, metric_name="rmse", output_img_path=None,
-                           lon_range=(110, 118), lat_range=(10, 18),
-                           z_max=300, smooth_sigma=1.2, cbar_label=None):
-    """
-    三维经纬-深度剖面图（3 条经度剖面）。
+def _section_bounds(index, width, size):
+    width = max(int(width), 1)
+    half = width // 2
+    start = max(index - half, 0)
+    end = min(start + width, size)
+    start = max(end - width, 0)
+    return start, end
 
-    Args:
-        npz_path: grid_metrics npz 文件路径（键名需含 metric_name）
-        metric_name: 指标名（rmse / mae / mse）
-        output_img_path: 保存路径，None 则 show
-        lon_range: 经度范围 (min, max)
-        lat_range: 纬度范围 (min, max)
-        z_max: 最大深度（m）
-        smooth_sigma: 高斯平滑 sigma
-    """
-    npz_data = np.load(npz_path)
-    available_keys = sorted(npz_data.files)
 
-    candidates = [
-        metric_name, metric_name.lower(), metric_name.upper(),
-        metric_name.replace("2", "^2"), metric_name.replace("^2", "2"),
-    ]
-    metric_key = next((c for c in candidates if c in available_keys), None)
-    if metric_key is None:
-        raise ValueError(f"未找到指标 '{metric_name}'，可用: {available_keys}")
+def _axis_coords(axis, lat_range, lon_range, h, w):
+    if axis == "lat":
+        return np.linspace(lon_range[0], lon_range[1], w), "Longitude / °E"
+    if axis == "lon":
+        return np.linspace(lat_range[0], lat_range[1], h), "Latitude / °N"
+    raise ValueError(f"section_axis 必须是 lat 或 lon，实际: {axis}")
 
-    metric_data = npz_data[metric_key]
-    if metric_data.ndim == 4:
-        metric_data = np.squeeze(metric_data, axis=0)
-    D, H, W = metric_data.shape
 
-    metric_smoothed = _nan_gaussian_filter(
-        metric_data, sigma=(smooth_sigma, smooth_sigma, smooth_sigma)
+def _extract_section(field_3d, axis, index, width):
+    arr = np.asarray(field_3d, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"field_3d 需要 (D,H,W)，实际: {arr.shape}")
+    _, h, w = arr.shape
+    if axis == "lat":
+        start, end = _section_bounds(index, width, h)
+        return np.nanmean(arr[:, start:end, :], axis=1), start, end
+    if axis == "lon":
+        start, end = _section_bounds(index, width, w)
+        return np.nanmean(arr[:, :, start:end], axis=2), start, end
+    raise ValueError(f"section_axis 必须是 lat 或 lon，实际: {axis}")
+
+
+def plot_hvca_refiner_section_panel(
+    baseline_3d,
+    refined_3d,
+    true_3d,
+    target_var,
+    section_axis,
+    section_index,
+    section_width,
+    day,
+    output_path,
+    depth_values,
+    lon_range=(110, 118),
+    lat_range=(10, 18),
+):
+    """绘制 HVCARefiner 的 T0/refined/truth/error/delta 垂向剖面面板。"""
+    baseline_3d = np.asarray(baseline_3d, dtype=np.float32)
+    refined_3d = np.asarray(refined_3d, dtype=np.float32)
+    true_3d = np.asarray(true_3d, dtype=np.float32)
+    if baseline_3d.shape != refined_3d.shape or baseline_3d.shape != true_3d.shape:
+        raise ValueError(
+            f"baseline/refined/true 形状不一致: "
+            f"{baseline_3d.shape}, {refined_3d.shape}, {true_3d.shape}"
+        )
+    if baseline_3d.ndim != 3:
+        raise ValueError(f"输入场需要 (D,H,W)，实际: {baseline_3d.shape}")
+
+    d, h, w = baseline_3d.shape
+    depth = np.asarray(depth_values, dtype=np.float32)
+    if depth.size != d:
+        raise ValueError(f"depth_values 长度 {depth.size} 与 D={d} 不一致")
+
+    baseline_sec, start, end = _extract_section(
+        baseline_3d, section_axis, section_index, section_width
     )
+    refined_sec, _, _ = _extract_section(
+        refined_3d, section_axis, section_index, section_width
+    )
+    true_sec, _, _ = _extract_section(
+        true_3d, section_axis, section_index, section_width
+    )
+    baseline_err = np.abs(baseline_sec - true_sec)
+    refined_err = np.abs(refined_sec - true_sec)
+    delta = refined_sec - baseline_sec
 
-    lon = np.linspace(lon_range[0], lon_range[1], W)
-    lat = np.linspace(lat_range[0], lat_range[1], H)
-    z = np.linspace(0, z_max, D)
-
-    x_idx_list = [0, W // 2, W - 1]
-    lon_pos_list = lon[x_idx_list]
-
-    finite_metric = metric_smoothed[np.isfinite(metric_smoothed)]
-    if finite_metric.size:
-        vmin = float(np.nanmin(finite_metric))
-        vmax = float(np.nanmax(finite_metric))
-        if vmin == vmax:
-            pad = abs(vmin) * 0.05 if vmin else 1.0
-            vmin -= pad
-            vmax += pad
+    x_coords, x_label = _axis_coords(section_axis, lat_range, lon_range, h, w)
+    section_center = (start + end - 1) / 2
+    if section_axis == "lat":
+        section_coord = np.interp(section_center, np.arange(h), np.linspace(lat_range[0], lat_range[1], h))
+        section_label = f"lat idx {start}:{end} (~{section_coord:.2f}°N)"
     else:
-        vmin, vmax = 0.0, 1.0
-    norm = Normalize(vmin=vmin, vmax=vmax)
-    cmap_obj = plt.get_cmap("jet").copy()
-    cmap_obj.set_bad((0, 0, 0, 0))
+        section_coord = np.interp(section_center, np.arange(w), np.linspace(lon_range[0], lon_range[1], w))
+        section_label = f"lon idx {start}:{end} (~{section_coord:.2f}°E)"
 
-    fig = plt.figure(figsize=(16, 9), dpi=150)
-    ax = fig.add_subplot(projection='3d')
+    cmap, value_label, error_label = field_cmap_and_label(target_var)
+    value_vmin, value_vmax = finite_vmin_vmax(baseline_sec, refined_sec, true_sec)
+    err_vmin, err_vmax = finite_vmin_vmax(
+        baseline_err, refined_err, default=(0.0, 1.0)
+    )
+    err_vmin = max(err_vmin, 0.0)
+    delta_limit = finite_symmetric_limit(delta)
+    delta_norm = TwoSlopeNorm(vmin=-delta_limit, vcenter=0.0, vmax=delta_limit)
 
-    edge_colors = ['white', 'lightgray', 'dimgray']
-    for idx, x_idx in enumerate(x_idx_list):
-        profile = metric_smoothed[:, :, x_idx]
-        Y, Z = np.meshgrid(lat, z)
-        X = np.full_like(Y, lon_pos_list[idx])
-        face_colors = cmap_obj(norm(np.ma.masked_invalid(profile)))
-        ax.plot_surface(
-            X, Y, Z, rstride=2, cstride=2,
-            facecolors=face_colors, shade=False,
-            alpha=0.98, linewidth=0.3,
-            edgecolor=edge_colors[idx], antialiased=True,
+    extent = [float(x_coords[0]), float(x_coords[-1]), float(depth[-1]), float(depth[0])]
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), dpi=150)
+    panels = [
+        ("Baseline T0", baseline_sec, cmap, value_label, value_vmin, value_vmax, None),
+        ("HVCA Refined", refined_sec, cmap, value_label, value_vmin, value_vmax, None),
+        ("Truth", true_sec, cmap, value_label, value_vmin, value_vmax, None),
+        ("|T0 - Truth|", baseline_err, "magma", error_label, err_vmin, err_vmax, None),
+        ("|HVCA - Truth|", refined_err, "magma", error_label, err_vmin, err_vmax, None),
+        ("Delta = HVCA - T0", delta, "RdBu_r", value_label, None, None, delta_norm),
+    ]
+    for ax, (title, data, panel_cmap, cbar_label, vmin, vmax, norm) in zip(
+        axes.flat, panels
+    ):
+        im = ax.imshow(
+            data,
+            cmap=panel_cmap,
+            aspect="auto",
+            origin="upper",
+            extent=extent,
+            vmin=vmin,
+            vmax=vmax,
+            norm=norm,
         )
+        ax.set_title(title)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Depth / m")
+        ax.set_ylim(float(depth[-1]), float(depth[0]))
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.set_label(cbar_label)
 
-    ax.set_box_aspect([4, 4, 1])
-    ax.set_xlabel('Longitude / °E', fontsize=9, labelpad=10)
-    ax.set_ylabel('Latitude / °N', fontsize=9, labelpad=10)
-    ax.set_zlabel('Depth / m', fontsize=9, labelpad=8)
-
-    ax.set_xlim(lon.min(), lon.max())
-    ax.set_ylim(lat.min(), lat.max())
-    ax.set_zlim(z_max, 0)
-
-    ax.set_xticks(np.linspace(lon_range[0], lon_range[1], 5))
-    ax.set_yticks(np.linspace(lat_range[0], lat_range[1], 5))
-    ax.set_zticks(np.linspace(0, z_max, 7))
-    ax.view_init(elev=15, azim=-60)
-
-    if cbar_label is None:
-        metric_label_map = {
-            "rmse": "RMSE (psu)", "mae": "MAE (psu)", "mse": "MSE (psu²)",
-        }
-        cbar_label = metric_label_map.get(
-            metric_key.lower(), metric_key.upper().replace("^2", "²")
-        )
-    mappable = cm.ScalarMappable(norm=norm, cmap=cmap_obj)
-    mappable.set_array(np.ma.masked_invalid(metric_smoothed))
-    cbar = fig.colorbar(mappable, ax=ax, shrink=0.7, pad=0.1)
-    cbar.set_label(cbar_label, fontsize=10)
-    cbar.ax.tick_params(labelsize=8)
-
-    ax.xaxis.pane.set_edgecolor('lightgray')
-    ax.yaxis.pane.set_edgecolor('lightgray')
-    ax.zaxis.pane.set_edgecolor('lightgray')
-    ax.grid(False)
-    ax.set_facecolor('white')
-
+    fig.suptitle(f"HVCARefiner {target_var} section {day} | {section_label}")
     plt.tight_layout()
-    if output_img_path is not None:
-        plt.savefig(output_img_path, dpi=150, bbox_inches='tight', facecolor='white')
-        print(f"三维剖面图已保存至：{output_img_path}")
-    else:
-        plt.show()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
+    print(f"HVCA 垂向剖面解释图已保存至：{output_path}")
