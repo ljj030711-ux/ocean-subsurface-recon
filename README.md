@@ -26,10 +26,10 @@ Du_Unet 和 HVCARefiner 的 train/test 入口会在运行前打印最终超参�
 
 - `outputs/2dto2d/Du_Unet/Du_Unet_train_config.json`
 - `outputs/2dto2d/Du_Unet/Du_Unet_test_config.json`
-- `outputs/2dto2d/HVCARefiner/HVCARefiner_train_config.json`
-- `outputs/2dto2d/HVCARefiner/HVCARefiner_test_config.json`
+- HVCARefiner 训练配置：`<train --save-dir>/HVCARefiner_train_config.json`
+- HVCARefiner 测试配置：`<test --save-dir>/HVCARefiner_test_config.json`
 
-配置快照会记录命令行、时间、数据范围、batch size、学习率、深度、模型结构、模型参数量、checkpoint/cache/output 路径等信息。同一模型同一 stage 的后一次运行会覆盖同名配置快照。测试配置统一使用 `test` 命名；Du_Unet 单日测试会在 JSON 中记录 `single: true`，时间段测试记录 `single: false`。
+配置快照会记录命令行、时间、数据范围、batch size、学习率、深度、模型结构、模型参数量、checkpoint/cache/output 路径等信息。HVCARefiner 配置快照跟随本次运行的 `--save-dir` 保存，便于区分多组 refiner 实验。测试配置统一使用 `test` 命名；Du_Unet 单日测试会在 JSON 中记录 `single: true`，时间段测试记录 `single: false`。
 
 ### 安装
 
@@ -229,12 +229,12 @@ python -u train_hvca_refiner.py \
 
 | 路径 | 内容 |
 | --- | --- |
-| `outputs/2dto2d/HVCARefiner/HVCARefiner_train_config.json` | 本次 HVCA 训练配置快照。 |
-| `outputs/2dto2d/HVCARefiner/best.pt` | 最佳 HVCARefiner checkpoint。 |
-| `outputs/2dto2d/HVCARefiner/training_history_HVCARefiner.npz` | train/val loss 数组。 |
-| `outputs/2dto2d/HVCARefiner/loss_HVCARefiner.png` | loss 曲线。 |
-| `outputs/2dto2d/HVCARefiner/t0_cache_train/` | 训练 T0 cache shard 和 metadata。 |
-| `outputs/2dto2d/HVCARefiner/t0_cache_val/` | 验证 T0 cache shard 和 metadata。 |
+| `<save-dir>/HVCARefiner_train_config.json` | 本次 HVCA 训练配置快照。 |
+| `<save-dir>/best.pt` | 最佳 HVCARefiner checkpoint。 |
+| `<save-dir>/training_history_HVCARefiner.npz` | train/val loss 数组。 |
+| `<save-dir>/loss_HVCARefiner.png` | loss 曲线。 |
+| `<t0-cache-dir>/` | 训练 T0 cache shard 和 metadata。 |
+| `<val-cache-dir>/` | 验证 T0 cache shard 和 metadata。 |
 
 ### test/eval：时间段评估和空间解释图
 
@@ -286,7 +286,7 @@ python test_hvca_refiner.py \
 
 | 路径 | 内容 |
 | --- | --- |
-| `outputs/2dto2d/HVCARefiner/HVCARefiner_test_config.json` | 本次 HVCA 测试配置快照，包含 `single: false`。 |
+| `<save-dir>/HVCARefiner_test_config.json` | 本次 HVCA 测试配置快照，包含 `single: false`。 |
 | `outputs/2dto2d/HVCARefiner/evaluation_metrics_HVCARefiner_{target_var}_{YYYY-MM-DD}_{YYYY-MM-DD}.npz` | baseline_T0 和 HVCA_refined 的 overall/by-depth/by-day 指标。 |
 | `outputs/2dto2d/HVCARefiner/summary_HVCARefiner_{target_var}_{YYYY-MM-DD}_{YYYY-MM-DD}.json` | 汇总指标、温跃层指标、垂向梯度指标和面板记录。 |
 | `outputs/2dto2d/HVCARefiner/metrics_by_depth_HVCARefiner_{target_var}_{YYYY-MM-DD}_{YYYY-MM-DD}.png` | baseline/refined 逐深度对比曲线。 |
