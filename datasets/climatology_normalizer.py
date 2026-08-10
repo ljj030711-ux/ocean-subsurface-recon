@@ -82,6 +82,121 @@ class MonthlyClimatologyLayerStdNormalizer:
         self.layer_std = layer_std
         return self
 
+    def fit_streaming(self, array, months, fit_indices=None, chunk_size=32, label=None):
+        """分块拟合月气候态和标准差，避免把大数组一次性展开到内存。"""
+        months = self._validate_months(months, array.shape[0])
+        self.input_ndim = len(array.shape)
+        if self.input_ndim not in (3, 4):
+            raise ValueError(f"仅支持 3D/4D 数据，实际 ndim={self.input_ndim}")
+
+        if fit_indices is None:
+            fit_indices = np.arange(array.shape[0])
+        fit_indices = np.asarray(fit_indices, dtype=np.int64)
+        if fit_indices.size == 0:
+            raise ValueError("fit_indices 不能为空，无法拟合归一化统计量")
+
+        chunk_size = max(int(chunk_size), 1)
+        spatial_shape = tuple(array.shape[1:])
+        sum_by_month = np.zeros((12,) + spatial_shape, dtype=np.float64)
+        count_by_month = np.zeros((12,) + spatial_shape, dtype=np.float32)
+        total_sum = np.zeros(spatial_shape, dtype=np.float64)
+        total_count = np.zeros(spatial_shape, dtype=np.float32)
+
+        tag = f" {label}" if label else ""
+        total = int(fit_indices.size)
+        print(f"[normalization]{tag} fit climatology streaming: samples={total}, chunk={chunk_size}")
+        for start in range(0, total, chunk_size):
+            idx = fit_indices[start : start + chunk_size]
+            data = np.asarray(array[idx], dtype=np.float32)
+            month_chunk = months[idx]
+            valid = np.isfinite(data)
+            data_valid = np.where(valid, data, 0.0)
+            total_sum += data_valid.sum(axis=0, dtype=np.float64)
+            total_count += valid.sum(axis=0, dtype=np.float32)
+            for month in range(1, 13):
+                selector = month_chunk == month
+                if not np.any(selector):
+                    continue
+                data_m = data_valid[selector]
+                valid_m = valid[selector]
+                sum_by_month[month - 1] += data_m.sum(axis=0, dtype=np.float64)
+                count_by_month[month - 1] += valid_m.sum(axis=0, dtype=np.float32)
+            if start == 0 or start + chunk_size >= total or ((start // chunk_size + 1) % 20 == 0):
+                print(f"[normalization]{tag} climatology: {min(start + chunk_size, total)}/{total}")
+
+        fallback = np.divide(
+            total_sum,
+            total_count,
+            out=np.zeros_like(total_sum, dtype=np.float64),
+            where=total_count > 0,
+        )
+        climatology = np.divide(
+            sum_by_month,
+            count_by_month,
+            out=np.full_like(sum_by_month, np.nan, dtype=np.float64),
+            where=count_by_month > 0,
+        )
+        missing_months = ~np.isfinite(climatology)
+        climatology = np.where(missing_months, fallback[np.newaxis, ...], climatology)
+        climatology = np.nan_to_num(
+            climatology, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32)
+
+        if self.input_ndim == 3:
+            anomaly_sum = 0.0
+            anomaly_sumsq = 0.0
+            anomaly_count = 0.0
+        else:
+            depth_count = int(array.shape[1])
+            anomaly_sum = np.zeros(depth_count, dtype=np.float64)
+            anomaly_sumsq = np.zeros(depth_count, dtype=np.float64)
+            anomaly_count = np.zeros(depth_count, dtype=np.float64)
+
+        print(f"[normalization]{tag} fit std streaming: samples={total}, chunk={chunk_size}")
+        for start in range(0, total, chunk_size):
+            idx = fit_indices[start : start + chunk_size]
+            data = np.asarray(array[idx], dtype=np.float32)
+            month_chunk = months[idx]
+            valid = np.isfinite(data)
+            anomalies = data - climatology[month_chunk - 1]
+            anomalies = np.where(valid, anomalies, 0.0)
+            if self.input_ndim == 3:
+                anomaly_sum += float(anomalies.sum(dtype=np.float64))
+                anomaly_sumsq += float((anomalies * anomalies).sum(dtype=np.float64))
+                anomaly_count += float(valid.sum(dtype=np.float64))
+            else:
+                anomaly_sum += anomalies.sum(axis=(0, 2, 3), dtype=np.float64)
+                anomaly_sumsq += (anomalies * anomalies).sum(
+                    axis=(0, 2, 3), dtype=np.float64
+                )
+                anomaly_count += valid.sum(axis=(0, 2, 3), dtype=np.float64)
+            if start == 0 or start + chunk_size >= total or ((start // chunk_size + 1) % 20 == 0):
+                print(f"[normalization]{tag} std: {min(start + chunk_size, total)}/{total}")
+
+        mean = np.divide(
+            anomaly_sum,
+            anomaly_count,
+            out=np.zeros_like(np.asarray(anomaly_sum), dtype=np.float64),
+            where=np.asarray(anomaly_count) > 0,
+        )
+        second = np.divide(
+            anomaly_sumsq,
+            anomaly_count,
+            out=np.zeros_like(np.asarray(anomaly_sumsq), dtype=np.float64),
+            where=np.asarray(anomaly_count) > 0,
+        )
+        variance = np.maximum(second - mean * mean, 0.0)
+        layer_std = np.sqrt(variance).astype(np.float32)
+        if self.input_ndim == 3:
+            layer_std = np.asarray([float(layer_std)], dtype=np.float32)
+        layer_std = np.where(
+            np.isfinite(layer_std) & (layer_std >= self.eps), layer_std, 1.0
+        ).astype(np.float32)
+
+        self.climatology = climatology
+        self.layer_std = layer_std
+        return self
+
     def transform(self, array, months):
         """执行距平归一化，并把无效值填成模型可接收的数值。"""
         self._check_fitted()

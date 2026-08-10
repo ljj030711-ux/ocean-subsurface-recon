@@ -7,7 +7,7 @@ from datetime import datetime
 import matplotlib
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -16,7 +16,7 @@ from config import (
     CHECKPOINTS_ROOT,
     DATA_DIR,
     DATA_START_DATE,
-    DEPTH_LEVELS_25M,
+    DEFAULT_DATASET_PROFILE,
     DX,
     DY,
     DU_UNET_BATCH_SIZE,
@@ -50,6 +50,8 @@ from config import (
     PARADIGM_2DTO3D,
     PARADIGM_2DTO3D_METHODS,
     SEED,
+    dataset_profile_names,
+    get_2dto2d_depth_levels,
     get_checkpoint_dir,
     get_output_dir,
 )
@@ -67,6 +69,37 @@ from utils.run_config import (
 )
 
 TRAINABLE_METHODS = {"du_unet", "ocean_transformer"}
+
+
+class DepthTargetDataset(Dataset):
+    """Expose one target depth while reusing the surface inputs and normalization."""
+
+    def __init__(self, dataset, depth_idx):
+        self.dataset = dataset
+        self.depth_idx = int(depth_idx)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        return self.dataset.get_depth_item(idx, self.depth_idx)
+
+
+def use_lazy_2dto2d_data(args):
+    return args.lazy_data or args.dataset_profile == "glorys12v1_all_size"
+
+
+def dataloader_kwargs(args, device):
+    kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": bool(args.pin_memory and device.type == "cuda"),
+    }
+    if args.num_workers > 0:
+        kwargs.update(
+            prefetch_factor=args.prefetch_factor,
+            persistent_workers=args.persistent_workers,
+        )
+    return kwargs
 
 
 def build_model(method, **kwargs):
@@ -136,11 +169,15 @@ def train_2dto2d_epoch(model, loader, optimizer, device, depth_idx=None):
     model.train()
     total, count = 0.0, 0
     for batch in loader:
-        sst = batch["sst"].to(device)
-        ssh_sss = batch["ssh_sss"].to(device)
-        target = select_target_depth(batch["target"].to(device), depth_idx=depth_idx)
-        target_mask = select_target_depth(batch["target_mask"].to(device), depth_idx=depth_idx)
-        pred = model(sst, ssh_sss)
+        sst = batch["sst"].to(device, non_blocking=True)
+        ssh_sss = batch["ssh_sss"].to(device, non_blocking=True)
+        target = select_target_depth(
+            batch["target"].to(device, non_blocking=True), depth_idx=depth_idx
+        )
+        target_mask = select_target_depth(
+            batch["target_mask"].to(device, non_blocking=True), depth_idx=depth_idx
+        )
+        pred = model(sst, ssh_sss, output_size=target.shape[-2:])
         loss = masked_rmse_loss(pred, target, target_mask)
         optimizer.zero_grad()
         loss.backward()
@@ -156,11 +193,16 @@ def validate_2dto2d(model, loader, device, depth_idx=None):
     total, count = 0.0, 0
     with torch.no_grad():
         for batch in loader:
-            sst = batch["sst"].to(device)
-            ssh_sss = batch["ssh_sss"].to(device)
-            target = select_target_depth(batch["target"].to(device), depth_idx=depth_idx)
-            target_mask = select_target_depth(batch["target_mask"].to(device), depth_idx=depth_idx)
-            loss = masked_rmse_loss(model(sst, ssh_sss), target, target_mask)
+            sst = batch["sst"].to(device, non_blocking=True)
+            ssh_sss = batch["ssh_sss"].to(device, non_blocking=True)
+            target = select_target_depth(
+                batch["target"].to(device, non_blocking=True), depth_idx=depth_idx
+            )
+            target_mask = select_target_depth(
+                batch["target_mask"].to(device, non_blocking=True), depth_idx=depth_idx
+            )
+            pred = model(sst, ssh_sss, output_size=target.shape[-2:])
+            loss = masked_rmse_loss(pred, target, target_mask)
             total += loss.item()
             count += 1
     return total / max(count, 1)
@@ -266,14 +308,14 @@ def train_one_model(
     return best_val, train_losses, val_losses
 
 
-def parse_depth_indices(depth_indices_arg):
-    # 如果没传，训练该变量的全部 25 个深度层
+def parse_depth_indices(depth_indices_arg, depth_levels):
+    # 如果没传，训练该 profile 的全部深度层。
     if not depth_indices_arg:
-        return list(range(len(DEPTH_LEVELS_25M)))
+        return list(range(len(depth_levels)))
     out = []
     for item in depth_indices_arg.split(","):
         idx = int(item.strip())
-        if idx < 0 or idx >= len(DEPTH_LEVELS_25M):
+        if idx < 0 or idx >= len(depth_levels):
             raise ValueError(f"depth index 越界: {idx}")
         out.append(idx)
     return out
@@ -290,8 +332,68 @@ def parse_args():
                         help="Du_Unet 使用的数据结束日期 YYYY-MM-DD，默认使用配置中的结束日期")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader CPU worker 数；0 表示由训练主进程读取数据",
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="每个 DataLoader worker 预取的 batch 数，仅 num-workers>0 时生效",
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action="store_true",
+        help="CUDA 训练时使用锁页内存，加快 CPU 到 GPU 的异步传输",
+    )
+    parser.add_argument(
+        "--persistent-workers",
+        action="store_true",
+        help="跨 epoch 保留 DataLoader worker，仅 num-workers>0 时生效",
+    )
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--data-dir", default=DATA_DIR)
+    parser.add_argument(
+        "--dataset-profile",
+        choices=dataset_profile_names(),
+        default=DEFAULT_DATASET_PROFILE,
+        help="2dto2d 数据集配置；旧实验用 legacy_small，新大区域用 glorys12v1_all_size",
+    )
+    parser.add_argument(
+        "--no-normalize",
+        action="store_true",
+        help="2dto2d 调试用：跳过月气候态归一化，避免 smoke test 卡在统计量拟合",
+    )
+    parser.add_argument(
+        "--lazy-data",
+        action="store_true",
+        help="2dto2d 按样本延迟清洗/归一化；glorys12v1_all_size 会自动启用",
+    )
+    parser.add_argument(
+        "--normalization-chunk-size",
+        type=int,
+        default=32,
+        help="lazy 归一化统计量拟合时的时间分块大小",
+    )
+    parser.add_argument(
+        "--normalization-stats-path",
+        default=None,
+        help="归一化统计量 .npz；默认保存到 data-dir/normalization_stats/",
+    )
+    parser.add_argument(
+        "--rebuild-normalization-stats",
+        action="store_true",
+        help="忽略已有统计文件并用训练时段重新拟合后覆盖",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="2dto2d 调试用：限制 train/val 各自最多使用多少样本",
+    )
     parser.add_argument("--output-dir", default=OUTPUTS_ROOT)
     parser.add_argument("--checkpoint-dir", default=CHECKPOINTS_ROOT)
     parser.add_argument("--dummy", action="store_true", help="2dto3d(ocean_transformer) 使用合成数据")
@@ -309,6 +411,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.num_workers < 0:
+        raise ValueError("--num-workers 不能小于 0")
+    if args.prefetch_factor <= 0:
+        raise ValueError("--prefetch-factor 必须大于 0")
+    if args.persistent_workers and args.num_workers == 0:
+        raise ValueError("--persistent-workers 要求 --num-workers 大于 0")
     method = args.method.strip().lower()
     if method in {"du-unet"}:
         method = "du_unet"
@@ -325,9 +433,16 @@ def main():
         out_dir = get_output_dir(
             paradigm, method_dir, base_dir=args.output_dir, target_var=args.target_var
         )
-        ckpt_dir = get_checkpoint_dir(
-            paradigm, method_dir, base_dir=args.checkpoint_dir, target_var=args.target_var
-        )
+        requested_ckpt_dir = os.path.normpath(args.checkpoint_dir)
+        if os.path.basename(requested_ckpt_dir) == args.target_var:
+            ckpt_dir = requested_ckpt_dir
+        else:
+            ckpt_dir = get_checkpoint_dir(
+                paradigm,
+                method_dir,
+                base_dir=args.checkpoint_dir,
+                target_var=args.target_var,
+            )
     else:
         out_dir = get_output_dir(paradigm, method_dir, base_dir=args.output_dir)
         ckpt_dir = get_checkpoint_dir(paradigm, method_dir, base_dir=args.checkpoint_dir)
@@ -359,8 +474,19 @@ def main():
             dataset = TwoDto3DDataset(args.data_dir, normalize=True)
             train_idx, val_idx, _ = get_year_split_indices(len(dataset), TWODTO3D_DATA_START_DATE)
 
-        train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size, shuffle=False)
+        loader_kwargs = dataloader_kwargs(args, device)
+        train_loader = DataLoader(
+            Subset(dataset, train_idx),
+            batch_size=batch_size,
+            shuffle=True,
+            **loader_kwargs,
+        )
+        val_loader = DataLoader(
+            Subset(dataset, val_idx),
+            batch_size=batch_size,
+            shuffle=False,
+            **loader_kwargs,
+        )
 
         model = build_model(method).to(device)
         criterion = PhysicsLoss(
@@ -384,13 +510,27 @@ def main():
 
     dataset = Dataset2Dto2D(
         args.data_dir,
-        normalize=True,
+        normalize=not args.no_normalize,
         target_var=args.target_var,
         start_date=args.start_date,
         end_date=args.end_date,
         quality_report=args.quality_report,
+        dataset_profile=args.dataset_profile,
+        lazy=use_lazy_2dto2d_data(args),
+        normalization_chunk_size=args.normalization_chunk_size,
+        normalization_stats_path=args.normalization_stats_path,
+        rebuild_normalization_stats=args.rebuild_normalization_stats,
     )
+    depth_levels = get_2dto2d_depth_levels(args.dataset_profile)
+    if len(depth_levels) != dataset.num_depths:
+        raise ValueError(
+            f"dataset_profile={args.dataset_profile} 深度层数 {len(depth_levels)} "
+            f"与 target 数据层数 {dataset.num_depths} 不一致"
+        )
     train_idx, val_idx, _ = get_year_split_indices(len(dataset), dataset.start_date)
+    if args.max_samples is not None:
+        train_idx = train_idx[: args.max_samples]
+        val_idx = val_idx[: args.max_samples]
     if len(train_idx) == 0 or len(val_idx) == 0:
         raise ValueError(
             f"当前日期范围 [{dataset.start_date}, {dataset.end_date}] 无法形成训练/验证集；"
@@ -398,7 +538,7 @@ def main():
         )
 
     if method == "du_unet":
-        depth_indices = parse_depth_indices(args.depth_indices)
+        depth_indices = parse_depth_indices(args.depth_indices, depth_levels)
         epochs = args.epochs or DU_UNET_EPOCHS
         batch_size = args.batch_size or DU_UNET_BATCH_SIZE
         lr = args.lr or DU_UNET_LR
@@ -433,8 +573,7 @@ def main():
             },
         }
 
-        train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size, shuffle=False)
+        loader_kwargs = dataloader_kwargs(args, device)
         print_and_save_run_config(
             "Du_Unet 训练超参数",
             {
@@ -447,10 +586,29 @@ def main():
                 "seed": args.seed,
                 "data": {
                     "data_dir": args.data_dir,
+                    "dataset_profile": args.dataset_profile,
                     "start_date": dataset.start_date,
                     "end_date": dataset.end_date,
                     "train_samples": len(train_idx),
                     "val_samples": len(val_idx),
+                    "shapes": dataset.get_data_info(),
+                    "normalize": not args.no_normalize,
+                    "lazy_data": use_lazy_2dto2d_data(args),
+                    "normalization_chunk_size": args.normalization_chunk_size,
+                    "num_workers": args.num_workers,
+                    "prefetch_factor": (
+                        args.prefetch_factor if args.num_workers > 0 else None
+                    ),
+                    "pin_memory": loader_kwargs["pin_memory"],
+                    "persistent_workers": (
+                        args.persistent_workers if args.num_workers > 0 else False
+                    ),
+                    "target_loading": "selected_depth_only",
+                    "normalization_stats_path": dataset.normalization_stats_path,
+                    "normalization_stats": dataset.get_normalization_reference(),
+                    "normalization_stats_loaded": dataset.normalization_stats_loaded,
+                    "rebuild_normalization_stats": args.rebuild_normalization_stats,
+                    "max_samples": args.max_samples,
                 },
                 "hyperparameters": {
                     "epochs": epochs,
@@ -460,7 +618,7 @@ def main():
                     "weight_decay": DU_UNET_WEIGHT_DECAY,
                     "patience": patience,
                     "depth_indices": depth_indices,
-                    "depth_m": [DEPTH_LEVELS_25M[i] for i in depth_indices],
+                    "depth_m": [depth_levels[i] for i in depth_indices],
                 },
                 "training_strategy": training_strategy,
                 "model_config": {
@@ -483,11 +641,24 @@ def main():
         )
 
         for depth_idx in depth_indices:
-            depth_m = DEPTH_LEVELS_25M[depth_idx]
+            depth_m = depth_levels[depth_idx]
             print("\n" + "-" * 60)
             print(f"训练变量: {args.target_var} | 深度层: idx={depth_idx}, depth={depth_m}m")
             print("-" * 60)
 
+            depth_dataset = DepthTargetDataset(dataset, depth_idx)
+            train_loader = DataLoader(
+                Subset(depth_dataset, train_idx),
+                batch_size=batch_size,
+                shuffle=True,
+                **loader_kwargs,
+            )
+            val_loader = DataLoader(
+                Subset(depth_dataset, val_idx),
+                batch_size=batch_size,
+                shuffle=False,
+                **loader_kwargs,
+            )
             model = build_model("du_unet", out_channels=1).to(device)
             optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=DU_UNET_WEIGHT_DECAY)
             scheduler = torch.optim.lr_scheduler.StepLR(
@@ -509,7 +680,7 @@ def main():
                 epochs,
                 patience,
                 ckpt_path,
-                depth_idx=depth_idx,
+                depth_idx=None,
             )
 
             hist_name = DU_UNET_HISTORY_NAME_TEMPLATE.format(

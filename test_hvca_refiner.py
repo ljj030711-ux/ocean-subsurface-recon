@@ -16,12 +16,14 @@ from config import (
     CHECKPOINTS_ROOT,
     DATA_DIR,
     DATA_START_DATE,
-    LAT_RANGE,
-    LON_RANGE,
+    DEFAULT_DATASET_PROFILE,
     OUTPUTS_ROOT,
     PARADIGM_2DTO2D,
     TEST_END_DATE,
     TEST_START_DATE,
+    dataset_profile_names,
+    get_2dto2d_depth_levels,
+    get_2dto2d_lon_lat_range,
     get_checkpoint_dir,
 )
 from datasets.dataset_2dto2d import Dataset2Dto2D
@@ -33,6 +35,7 @@ from train_hvca_refiner import (
     dataloader_kwargs,
     generate_t0_cache,
     get_device,
+    load_cache_metadata,
     load_du_unet_subset,
     parse_depths,
     resolve_depth_indices,
@@ -41,7 +44,6 @@ from utils.metrics import RegressionMetricAccumulator, scalar_metrics
 from utils.run_config import (
     count_model_parameters,
     load_run_config,
-    model_config_path,
     print_and_save_run_config,
 )
 from utils.viz_layer_2d import plot_hvca_refiner_panel
@@ -50,10 +52,40 @@ from utils.viz_layer_profile import plot_hvca_refiner_section_panel
 
 PERIOD_METRIC_NAMES = ("mae", "rmse", "r2", "correlation")
 DEFAULT_PANEL_LEVELS = "0,4,9,17,24"
+DEFAULT_SECTION_PERCENTILES = "10,25,50,75,90"
 
 
 def default_hvca_output_dir():
     return os.path.join(OUTPUTS_ROOT, PARADIGM_2DTO2D, "HVCARefiner")
+
+
+def active_lon_lat_range(args):
+    return get_2dto2d_lon_lat_range(args.dataset_profile)
+
+
+def use_lazy_2dto2d_data(args):
+    return args.lazy_data or args.dataset_profile == "glorys12v1_all_size"
+
+
+def run_config_path(save_dir, stage):
+    return os.path.join(save_dir, f"HVCARefiner_{stage}_config.json")
+
+
+def legacy_run_config_path(stage):
+    return os.path.join(
+        OUTPUTS_ROOT,
+        PARADIGM_2DTO2D,
+        "HVCARefiner",
+        f"HVCARefiner_{stage}_config.json",
+    )
+
+
+def checkpoint_train_config_path(checkpoint_path):
+    checkpoint_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+    preferred = run_config_path(checkpoint_dir, "train")
+    if os.path.exists(preferred):
+        return preferred
+    return legacy_run_config_path("train")
 
 
 def load_training_strategy_reference(train_config_path):
@@ -130,6 +162,72 @@ def parse_index_list(value, name):
         except ValueError as exc:
             raise ValueError(f"{name} 必须是逗号分隔的整数索引: {value}") from exc
     return indices
+
+
+def parse_percentile_list(value, name):
+    percentiles = []
+    for item in str(value).split(","):
+        text = item.strip()
+        if not text:
+            continue
+        try:
+            pct = float(text)
+        except ValueError as exc:
+            raise ValueError(f"{name} 包含非法百分位: {text}") from exc
+        if pct < 0.0 or pct > 100.0:
+            raise ValueError(f"{name} 百分位需位于 [0,100]，实际: {pct}")
+        percentiles.append(pct)
+    if not percentiles:
+        raise ValueError(f"{name} 不能为空")
+    return percentiles
+
+
+def percentile_indices(percentiles, size):
+    if size <= 0:
+        raise ValueError("size 必须大于 0")
+    ordered = []
+    for pct in percentiles:
+        idx = int(round((pct / 100.0) * (size - 1)))
+        idx = min(max(idx, 0), size - 1)
+        if idx not in ordered:
+            ordered.append(idx)
+    return ordered
+
+
+def build_section_specs(args, h, w):
+    if args.multi_section_panels:
+        percentiles = parse_percentile_list(
+            args.section_percentiles, "--section-percentiles"
+        )
+        specs = []
+        for axis, size in (("lat", h), ("lon", w)):
+            seen = set()
+            for pct in percentiles:
+                idx = percentile_indices([pct], size)[0]
+                if idx in seen:
+                    continue
+                seen.add(idx)
+                specs.append(
+                    {
+                        "axis": axis,
+                        "index": int(idx),
+                        "percentile": float(pct),
+                        "mode": "multi",
+                    }
+                )
+        return specs
+
+    section_axis = args.section_axis
+    section_size = h if section_axis == "lat" else w
+    section_index = resolve_section_index(args.section_index, section_size)
+    return [
+        {
+            "axis": section_axis,
+            "index": int(section_index),
+            "percentile": None,
+            "mode": "single",
+        }
+    ]
 
 
 def parse_panel_days(value):
@@ -254,6 +352,7 @@ def render_spatial_panels(
     panel_days = {record["date"] for record in panel_day_records}
     rendered = []
     model.eval()
+    lon_range, lat_range = active_lon_lat_range(args)
 
     for batch in loader:
         sample_ids = list(batch["sample_id"])
@@ -295,8 +394,8 @@ def render_spatial_panels(
                     level,
                     sample_id,
                     output_path,
-                    lon_range=LON_RANGE,
-                    lat_range=LAT_RANGE,
+                    lon_range=lon_range,
+                    lat_range=lat_range,
                     depth_values=depth_values,
                 )
                 rendered.append(
@@ -334,8 +433,8 @@ def render_section_panels(
     panel_days = {record["date"] for record in panel_day_records}
     rendered = []
     model.eval()
-    section_axis = args.section_axis
     section_width = max(int(args.section_width), 1)
+    lon_range, lat_range = active_lon_lat_range(args)
 
     for batch in loader:
         sample_ids = list(batch["sample_id"])
@@ -357,8 +456,7 @@ def render_section_panels(
         y_true = inverse_target_subset(true_norm, months, target_stats, depth_indices)
 
         _, h, w = y_base.shape[1:]
-        section_size = h if section_axis == "lat" else w
-        section_index = resolve_section_index(args.section_index, section_size)
+        section_specs = build_section_specs(args, h, w)
 
         for i, sample_id in enumerate(sample_ids):
             if sample_id not in panel_days:
@@ -368,34 +466,43 @@ def render_section_panels(
             refined_3d = np.where(valid, y_refined[i], np.nan)
             true_3d = np.where(valid, y_true[i], np.nan)
             date_tag = sample_id.replace("-", "")
-            filename = (
-                f"section_hvca_panel_{args.target_var}_"
-                f"{section_axis}{section_index}_{date_tag}.png"
-            )
-            output_path = os.path.join(args.save_dir, filename)
-            plot_hvca_refiner_section_panel(
-                baseline_3d,
-                refined_3d,
-                true_3d,
-                args.target_var,
-                section_axis,
-                section_index,
-                section_width,
-                sample_id,
-                output_path,
-                depth_values=depth_values,
-                lon_range=LON_RANGE,
-                lat_range=LAT_RANGE,
-            )
-            rendered.append(
-                {
-                    "date": sample_id,
-                    "section_axis": section_axis,
-                    "section_index": int(section_index),
-                    "section_width": int(section_width),
-                    "file": filename,
-                }
-            )
+            for spec in section_specs:
+                section_axis = spec["axis"]
+                section_index = spec["index"]
+                if spec["mode"] == "multi":
+                    pct_tag = f"p{spec['percentile']:g}".replace(".", "p")
+                    section_tag = f"{section_axis}_{pct_tag}_idx{section_index}"
+                else:
+                    section_tag = f"{section_axis}{section_index}"
+                filename = (
+                    f"section_hvca_panel_{args.target_var}_"
+                    f"{section_tag}_{date_tag}.png"
+                )
+                output_path = os.path.join(args.save_dir, filename)
+                plot_hvca_refiner_section_panel(
+                    baseline_3d,
+                    refined_3d,
+                    true_3d,
+                    args.target_var,
+                    section_axis,
+                    section_index,
+                    section_width,
+                    sample_id,
+                    output_path,
+                    depth_values=depth_values,
+                    lon_range=lon_range,
+                    lat_range=lat_range,
+                )
+                rendered.append(
+                    {
+                        "date": sample_id,
+                        "section_axis": section_axis,
+                        "section_index": int(section_index),
+                        "section_percentile": spec["percentile"],
+                        "section_width": int(section_width),
+                        "file": filename,
+                    }
+                )
 
     missing = sorted(panel_days - {item["date"] for item in rendered})
     if missing:
@@ -453,18 +560,13 @@ def compute_grad_arrays(y_true, y_pred, mask, depth_values):
     return grad_true, grad_pred, grad_mask
 
 
-def ensure_eval_cache(args, depth_values, depth_indices, device):
+def ensure_eval_cache(
+    args, dataset, depth_values, depth_indices, depth_levels, device
+):
     if cache_ready(args.t0_cache_dir):
         print(f"[cache] 发现已有 test cache，直接读取: {args.t0_cache_dir}")
         return
 
-    dataset = Dataset2Dto2D(
-        args.data_dir,
-        normalize=True,
-        target_var=args.target_var,
-        start_date=args.start_date,
-        end_date=args.end_date,
-    )
     start_idx = date_to_index(args.eval_start, dataset.start_date, dataset.end_date)
     end_idx = date_to_index(args.eval_end, dataset.start_date, dataset.end_date)
     if end_idx < start_idx:
@@ -472,7 +574,12 @@ def ensure_eval_cache(args, depth_values, depth_indices, device):
     eval_indices = list(range(start_idx, end_idx + 1))
     if args.max_samples is not None:
         eval_indices = eval_indices[: args.max_samples]
-    models = load_du_unet_subset(args, device, depth_indices)
+    if len(depth_levels) != dataset.num_depths:
+        raise ValueError(
+            f"dataset_profile={args.dataset_profile} 深度层数 {len(depth_levels)} "
+            f"与 target 数据层数 {dataset.num_depths} 不一致"
+        )
+    models = load_du_unet_subset(args, device, depth_indices, depth_levels)
     generate_t0_cache(
         cache_dir=args.t0_cache_dir,
         dataset=dataset,
@@ -497,9 +604,23 @@ def load_checkpoint(path, device):
 def evaluate(args):
     device = get_device(args.device)
     ckpt = load_checkpoint(args.checkpoint, device)
-    depth_values = ckpt.get("depth_values") or parse_depths(args.depths)
-    depth_values = [int(float(d)) for d in depth_values]
-    depth_indices = resolve_depth_indices(depth_values)
+    profile_from_ckpt = ckpt.get("dataset_profile")
+    if profile_from_ckpt and args.dataset_profile == DEFAULT_DATASET_PROFILE:
+        args.dataset_profile = profile_from_ckpt
+    checkpoint_norm_ref = ckpt.get("normalization_stats")
+    if checkpoint_norm_ref and args.normalization_stats_path is None:
+        checkpoint_stats_path = checkpoint_norm_ref.get("path")
+        if checkpoint_stats_path and os.path.exists(checkpoint_stats_path):
+            args.normalization_stats_path = checkpoint_stats_path
+        elif checkpoint_stats_path:
+            print(
+                "[normalization] checkpoint 记录的统计文件不存在，将使用 data-dir 默认路径: "
+                f"{checkpoint_stats_path}"
+            )
+    depth_levels = get_2dto2d_depth_levels(args.dataset_profile)
+    depth_values = ckpt.get("depth_values") or parse_depths(args.depths, depth_levels)
+    depth_values = [float(d) for d in depth_values]
+    depth_indices = resolve_depth_indices(depth_values, depth_levels)
     depth_tensor = torch.as_tensor(depth_values, dtype=torch.float32, device=device)
     target_levels = []
     if args.spatial_panels:
@@ -517,14 +638,46 @@ def evaluate(args):
             "column_chunk_size": args.column_chunk_size,
         },
     )
+    loss_config = ckpt.get(
+        "loss_config",
+        {
+            "primary": "masked_rmse_loss",
+            "lambda_delta_z": 0.0,
+            "delta_z": None,
+            "source": "checkpoint_without_loss_config",
+        },
+    )
     model = HVCARefiner(**model_config).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
-    train_config_path = model_config_path(OUTPUTS_ROOT, "HVCARefiner", "train")
+    train_config_path = checkpoint_train_config_path(args.checkpoint)
     training_strategy = load_training_strategy_reference(train_config_path)
     if isinstance(training_strategy.get("epoch"), dict):
         training_strategy["epoch"]["checkpoint_epoch"] = ckpt.get("epoch")
     training_strategy["checkpoint_best_val"] = ckpt.get("best_val")
+    dataset = Dataset2Dto2D(
+        args.data_dir,
+        normalize=True,
+        target_var=args.target_var,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        dataset_profile=args.dataset_profile,
+        lazy=use_lazy_2dto2d_data(args),
+        normalization_chunk_size=args.normalization_chunk_size,
+        normalization_stats_path=args.normalization_stats_path,
+        rebuild_normalization_stats=args.rebuild_normalization_stats,
+    )
+    args.normalization_stats_path = dataset.normalization_stats_path
+    actual_norm_ref = dataset.get_normalization_reference()
+    if (
+        checkpoint_norm_ref
+        and checkpoint_norm_ref.get("fingerprint")
+        and actual_norm_ref.get("fingerprint") != checkpoint_norm_ref.get("fingerprint")
+    ):
+        raise ValueError(
+            "当前归一化统计文件与 HVCA checkpoint 使用的统计量不一致；"
+            "请传入 checkpoint 对应的 --normalization-stats-path。"
+        )
     print_and_save_run_config(
         "HVCARefiner 测试超参数",
         {
@@ -536,11 +689,15 @@ def evaluate(args):
             "device": device,
             "data": {
                 "data_dir": args.data_dir,
+                "dataset_profile": args.dataset_profile,
                 "start_date": args.start_date,
                 "end_date": args.end_date,
                 "eval_start": args.eval_start,
                 "eval_end": args.eval_end,
                 "max_samples": args.max_samples,
+                "normalization_stats_path": args.normalization_stats_path,
+                "normalization_stats": actual_norm_ref,
+                "rebuild_normalization_stats": args.rebuild_normalization_stats,
             },
             "hyperparameters": {
                 "batch_size": args.batch_size,
@@ -556,11 +713,17 @@ def evaluate(args):
                 "target_levels": target_levels,
                 "panel_days": args.panel_days,
                 "section_panels": args.section_panels,
+                "multi_section_panels": args.multi_section_panels,
+                "section_axes": (
+                    ["lat", "lon"] if args.multi_section_panels else [args.section_axis]
+                ),
                 "section_axis": args.section_axis,
                 "section_index": args.section_index,
+                "section_percentiles": args.section_percentiles,
                 "section_width": args.section_width,
             },
             "model_config": model_config,
+            "loss_config": loss_config,
             "training_strategy": training_strategy,
             "parameter_count": count_model_parameters(model),
             "paths": {
@@ -571,18 +734,24 @@ def evaluate(args):
                 "train_config": train_config_path,
             },
         },
-        model_config_path(OUTPUTS_ROOT, "HVCARefiner", "test"),
+        run_config_path(args.save_dir, "test"),
     )
 
-    ensure_eval_cache(args, depth_values, depth_indices, device)
-
-    dataset = Dataset2Dto2D(
-        args.data_dir,
-        normalize=True,
-        target_var=args.target_var,
-        start_date=args.start_date,
-        end_date=args.end_date,
+    ensure_eval_cache(
+        args, dataset, depth_values, depth_indices, depth_levels, device
     )
+    cache_norm_ref = load_cache_metadata(args.t0_cache_dir).get(
+        "normalization_stats"
+    )
+    if (
+        cache_norm_ref
+        and cache_norm_ref.get("fingerprint")
+        and cache_norm_ref.get("fingerprint") != actual_norm_ref.get("fingerprint")
+    ):
+        raise ValueError(
+            "T0 cache 与当前归一化统计文件不一致；请使用匹配的 cache，"
+            "或换一个空的 --t0-cache-dir 重新生成。"
+        )
     target_stats = dataset.get_norm_stats()["target"]
 
     loader = DataLoader(
@@ -708,7 +877,7 @@ def evaluate(args):
 
     payload = {
         "dates": np.asarray(eval_dates),
-        "depth_m": np.asarray(depth_values, dtype=np.int32),
+        "depth_m": np.asarray(depth_values, dtype=np.float32),
         "baseline_overall_valid_count": baseline_overall_metrics["valid_count"],
         "baseline_by_depth_valid_count": baseline_depth_metrics["valid_count"],
         "baseline_by_day_valid_count": baseline_daily_metrics["valid_count"],
@@ -735,7 +904,8 @@ def evaluate(args):
     panel_day_records = []
     rendered_spatial_panels = []
     rendered_section_panels = []
-    if args.spatial_panels or args.section_panels:
+    section_requested = args.section_panels or args.multi_section_panels
+    if args.spatial_panels or section_requested:
         panel_day_records = resolve_panel_day_records(
             args,
             eval_dates,
@@ -756,7 +926,7 @@ def evaluate(args):
             device,
             use_amp,
         )
-    if args.section_panels:
+    if section_requested:
         rendered_section_panels = render_section_panels(
             args,
             model,
@@ -832,15 +1002,28 @@ def evaluate(args):
             "files": rendered_spatial_panels,
         },
         "section_panels": {
-            "enabled": bool(args.section_panels),
-            "section_axis": args.section_axis if args.section_panels else None,
+            "enabled": bool(section_requested),
+            "multi_section_panels": bool(args.multi_section_panels),
+            "section_axes": (
+                ["lat", "lon"]
+                if args.multi_section_panels
+                else [args.section_axis] if args.section_panels else []
+            ),
+            "section_axis": (
+                args.section_axis
+                if args.section_panels and not args.multi_section_panels
+                else None
+            ),
             "section_index": args.section_index if args.section_panels else None,
-            "section_width": args.section_width if args.section_panels else None,
-            "panel_days": panel_day_records if args.section_panels else [],
+            "section_percentiles": (
+                args.section_percentiles if args.multi_section_panels else None
+            ),
+            "section_width": args.section_width if section_requested else None,
+            "panel_days": panel_day_records if section_requested else [],
             "selection_metric": (
                 "refined_rmse - baseline_rmse"
-                if args.section_panels and not args.panel_days
-                else "manual panel-days" if args.section_panels else None
+                if section_requested and not args.panel_days
+                else "manual panel-days" if section_requested else None
             ),
             "files": rendered_section_panels,
         },
@@ -881,11 +1064,38 @@ def parse_args():
     parser.add_argument("--base-checkpoint-dir", default=default_ckpt_dir)
     parser.add_argument("--target-var", choices=["temperature", "salinity"], default="temperature")
     parser.add_argument("--data-dir", default=DATA_DIR)
+    parser.add_argument(
+        "--dataset-profile",
+        choices=dataset_profile_names(),
+        default=DEFAULT_DATASET_PROFILE,
+        help="2dto2d 数据集配置；旧实验用 legacy_small，新大区域用 glorys12v1_all_size",
+    )
     parser.add_argument("--start-date", default=DATA_START_DATE)
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--eval-start", default=TEST_START_DATE)
     parser.add_argument("--eval-end", default=TEST_END_DATE)
     parser.add_argument("--depths", default=None, help="仅用于旧 checkpoint 无 depth_values 时")
+    parser.add_argument(
+        "--lazy-data",
+        action="store_true",
+        help="按样本延迟清洗/归一化；glorys12v1_all_size 会自动启用",
+    )
+    parser.add_argument(
+        "--normalization-chunk-size",
+        type=int,
+        default=32,
+        help="lazy 归一化统计量拟合时的时间分块大小",
+    )
+    parser.add_argument(
+        "--normalization-stats-path",
+        default=None,
+        help="归一化统计量 .npz；默认读取 data-dir/normalization_stats/",
+    )
+    parser.add_argument(
+        "--rebuild-normalization-stats",
+        action="store_true",
+        help="测试前显式重算并覆盖归一化统计量",
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--cache-shard-size", type=int, default=64)
     parser.add_argument("--dim", type=int, default=64)
@@ -927,6 +1137,11 @@ def parse_args():
         help="输出 T0/HVCA/truth/error/delta 的垂向剖面六子图",
     )
     parser.add_argument(
+        "--multi-section-panels",
+        action="store_true",
+        help="按多个纬度和经度位置批量输出垂向剖面六子图",
+    )
+    parser.add_argument(
         "--section-axis",
         choices=["lat", "lon"],
         default="lat",
@@ -936,6 +1151,11 @@ def parse_args():
         "--section-index",
         default="middle",
         help="垂向剖面固定轴索引，整数或 middle",
+    )
+    parser.add_argument(
+        "--section-percentiles",
+        default=DEFAULT_SECTION_PERCENTILES,
+        help="--multi-section-panels 使用的逗号分隔位置百分位，如 10,25,50,75,90",
     )
     parser.add_argument(
         "--section-width",
@@ -952,6 +1172,8 @@ def main():
         raise ValueError("--batch-size 和 --cache-shard-size 必须大于 0")
     if args.section_width <= 0:
         raise ValueError("--section-width 必须大于 0")
+    if args.multi_section_panels:
+        parse_percentile_list(args.section_percentiles, "--section-percentiles")
     evaluate(args)
 
 

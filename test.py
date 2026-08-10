@@ -17,7 +17,7 @@ from config import (
     DATA_DIR,
     DATA_END_DATE,
     DATA_START_DATE,
-    DEPTH_LEVELS_25M,
+    DEFAULT_DATASET_PROFILE,
     DX,
     DY,
     DU_UNET_CKPT_NAME_TEMPLATE,
@@ -30,6 +30,9 @@ from config import (
     TWODTO3D_DATA_END_DATE,
     TWODTO3D_DATA_START_DATE,
     TWODTO3D_DEPTH_LEVELS,
+    dataset_profile_names,
+    get_2dto2d_depth_levels,
+    get_2dto2d_lon_lat_range,
     get_checkpoint_dir,
     get_output_dir,
 )
@@ -60,6 +63,58 @@ NON_DL_METHODS = {"2dvar", "modas"}
 DL_2DTO2D_METHODS = set(PARADIGM_2DTO2D_METHODS)
 DL_2DTO3D_METHODS = set(PARADIGM_2DTO3D_METHODS) - NON_DL_METHODS
 ALL_METHODS = sorted(DL_2DTO2D_METHODS | DL_2DTO3D_METHODS | NON_DL_METHODS)
+
+
+def _du_unet_depth_levels(args):
+    return get_2dto2d_depth_levels(
+        getattr(args, "dataset_profile", DEFAULT_DATASET_PROFILE)
+    )
+
+
+def _du_unet_depth_indices(args, depth_levels=None):
+    depth_levels = depth_levels or _du_unet_depth_levels(args)
+    depth_indices_arg = getattr(args, "depth_indices", None)
+    if not depth_indices_arg:
+        return list(range(len(depth_levels)))
+
+    indices = []
+    for item in depth_indices_arg.split(","):
+        idx = int(item.strip())
+        if idx < 0 or idx >= len(depth_levels):
+            raise ValueError(
+                f"depth index 越界: {idx}；当前 profile 共 {len(depth_levels)} 层"
+            )
+        if idx in indices:
+            raise ValueError(f"depth index 重复: {idx}")
+        indices.append(idx)
+    if not indices:
+        raise ValueError("--depth-indices 不能为空")
+    return indices
+
+
+def _du_unet_selected_depth_levels(args, depth_levels=None):
+    depth_levels = depth_levels or _du_unet_depth_levels(args)
+    return [depth_levels[idx] for idx in _du_unet_depth_indices(args, depth_levels)]
+
+
+def _target_normalizer_for_depth_indices(norm_stats, depth_indices):
+    target_stats = norm_stats["target"]
+    selected_stats = dict(target_stats)
+    selected_stats["climatology"] = np.asarray(target_stats["climatology"])[
+        :, depth_indices
+    ]
+    selected_stats["layer_std"] = np.asarray(target_stats["layer_std"])[depth_indices]
+    return MonthlyClimatologyLayerStdNormalizer.from_stats(selected_stats)
+
+
+def _du_unet_lon_lat_range(args):
+    return get_2dto2d_lon_lat_range(
+        getattr(args, "dataset_profile", DEFAULT_DATASET_PROFILE)
+    )
+
+
+def use_lazy_2dto2d_data(args):
+    return args.lazy_data or args.dataset_profile == "glorys12v1_all_size"
 
 
 # ==================== 命名工具 ====================
@@ -260,10 +315,23 @@ def predict_2dto2d(args):
         start_date=args.start_date,
         end_date=args.end_date,
         quality_report=args.quality_report,
+        dataset_profile=args.dataset_profile,
+        lazy=use_lazy_2dto2d_data(args),
+        normalization_chunk_size=args.normalization_chunk_size,
+        normalization_stats_path=args.normalization_stats_path,
+        rebuild_normalization_stats=args.rebuild_normalization_stats,
     )
     t = date_to_index(args.select_day, dataset.start_date, dataset.end_date)
     sample = dataset[t]
     norm_stats = dataset.get_norm_stats()
+    all_depth_levels = _du_unet_depth_levels(args)
+    if len(all_depth_levels) != dataset.num_depths:
+        raise ValueError(
+            f"dataset_profile={args.dataset_profile} 深度层数 {len(all_depth_levels)} "
+            f"与 target 数据层数 {dataset.num_depths} 不一致"
+        )
+    depth_indices = _du_unet_depth_indices(args, all_depth_levels)
+    depth_levels = [all_depth_levels[idx] for idx in depth_indices]
     sst = sample["sst"].unsqueeze(0).to(device)
     ssh_sss = sample["ssh_sss"].unsqueeze(0).to(device)
     param_stats = count_model_parameters(build_model("du_unet", out_channels=1))
@@ -281,6 +349,10 @@ def predict_2dto2d(args):
             "device": device,
             "data": {
                 "data_dir": args.data_dir,
+                "dataset_profile": args.dataset_profile,
+                "normalization_stats_path": dataset.normalization_stats_path,
+                "normalization_stats": dataset.get_normalization_reference(),
+                "rebuild_normalization_stats": args.rebuild_normalization_stats,
                 "start_date": dataset.start_date,
                 "end_date": dataset.end_date,
                 "select_day": args.select_day,
@@ -288,7 +360,8 @@ def predict_2dto2d(args):
             },
             "hyperparameters": {
                 "target_level": args.target_level,
-                "depth_m": DEPTH_LEVELS_25M,
+                "depth_indices": depth_indices,
+                "depth_m": depth_levels,
             },
             "model_config": {
                 "out_channels": 1,
@@ -296,9 +369,9 @@ def predict_2dto2d(args):
             "training_strategy": load_training_strategy_reference(train_config_path),
             "parameter_count": {
                 "per_depth_model": param_stats,
-                "num_depth_models": len(DEPTH_LEVELS_25M),
+                "num_depth_models": len(depth_levels),
                 "total_if_all_depth_models_loaded": {
-                    name: value * len(DEPTH_LEVELS_25M)
+                    name: value * len(depth_levels)
                     for name, value in param_stats.items()
                 },
             },
@@ -317,19 +390,23 @@ def predict_2dto2d(args):
         model_config_path(args.output_dir, "Du_Unet", "test"),
     )
 
-    models = _load_du_unet_models(args, device, require_all=False)
+    models = _load_du_unet_models(
+        args, device, require_all=bool(args.depth_indices)
+    )
     pred_list = []
     for model in models:
         with torch.no_grad():
-            pred_layer = model(sst, ssh_sss).cpu().numpy()
+            pred_layer = model(
+                sst, ssh_sss, output_size=sample["target"].shape[-2:]
+            ).cpu().numpy()
         pred_list.append(pred_layer)
     y_pred = np.concatenate(pred_list, axis=1)
 
-    y_true = sample["target"].unsqueeze(0).numpy()      # (1, C, H, W)
-    target_mask = sample["target_mask"].unsqueeze(0).numpy()
+    y_true = sample["target"][depth_indices].unsqueeze(0).numpy()
+    target_mask = sample["target_mask"][depth_indices].unsqueeze(0).numpy()
 
     if norm_stats.get("normalization") == "monthly_climatology_layer_std":
-        target_norm = MonthlyClimatologyLayerStdNormalizer.from_stats(norm_stats["target"])
+        target_norm = _target_normalizer_for_depth_indices(norm_stats, depth_indices)
         months = np.asarray([dataset.months[t]], dtype=np.int64)
         y_pred = target_norm.inverse_transform(y_pred, months)
         y_true = target_norm.inverse_transform(y_true, months)
@@ -395,8 +472,9 @@ def _load_du_unet_models(args, device, require_all):
     from train import build_model
 
     ckpt_dirs = _du_unet_checkpoint_dirs(args)
+    depth_levels = _du_unet_selected_depth_levels(args)
     models = []
-    for depth_m in DEPTH_LEVELS_25M:
+    for depth_m in depth_levels:
         ckpt_name = DU_UNET_CKPT_NAME_TEMPLATE.format(
             target_var=args.target_var, depth_m=depth_m
         )
@@ -521,7 +599,20 @@ def evaluate_2dto2d_period(args, out_dir):
         start_date=args.start_date,
         end_date=args.end_date,
         quality_report=args.quality_report,
+        dataset_profile=args.dataset_profile,
+        lazy=use_lazy_2dto2d_data(args),
+        normalization_chunk_size=args.normalization_chunk_size,
+        normalization_stats_path=args.normalization_stats_path,
+        rebuild_normalization_stats=args.rebuild_normalization_stats,
     )
+    all_depth_levels = _du_unet_depth_levels(args)
+    if len(all_depth_levels) != dataset.num_depths:
+        raise ValueError(
+            f"dataset_profile={args.dataset_profile} 深度层数 {len(all_depth_levels)} "
+            f"与 target 数据层数 {dataset.num_depths} 不一致"
+        )
+    depth_indices = _du_unet_depth_indices(args, all_depth_levels)
+    depth_levels = [all_depth_levels[idx] for idx in depth_indices]
     start_idx = date_to_index(args.eval_start, dataset.start_date, dataset.end_date)
     end_idx = date_to_index(args.eval_end, dataset.start_date, dataset.end_date)
     if end_idx < start_idx:
@@ -553,6 +644,10 @@ def evaluate_2dto2d_period(args, out_dir):
             "device": device,
             "data": {
                 "data_dir": args.data_dir,
+                "dataset_profile": args.dataset_profile,
+                "normalization_stats_path": dataset.normalization_stats_path,
+                "normalization_stats": dataset.get_normalization_reference(),
+                "rebuild_normalization_stats": args.rebuild_normalization_stats,
                 "start_date": dataset.start_date,
                 "end_date": dataset.end_date,
                 "eval_start": args.eval_start,
@@ -561,7 +656,8 @@ def evaluate_2dto2d_period(args, out_dir):
             },
             "hyperparameters": {
                 "eval_batch_size": args.eval_batch_size,
-                "depth_m": DEPTH_LEVELS_25M,
+                "depth_indices": depth_indices,
+                "depth_m": depth_levels,
             },
             "model_config": {
                 "out_channels": 1,
@@ -569,9 +665,9 @@ def evaluate_2dto2d_period(args, out_dir):
             "training_strategy": load_training_strategy_reference(train_config_path),
             "parameter_count": {
                 "per_depth_model": param_stats,
-                "num_depth_models": len(DEPTH_LEVELS_25M),
+                "num_depth_models": len(depth_levels),
                 "total_if_all_depth_models_loaded": {
-                    name: value * len(DEPTH_LEVELS_25M)
+                    name: value * len(depth_levels)
                     for name, value in param_stats.items()
                 },
             },
@@ -586,9 +682,7 @@ def evaluate_2dto2d_period(args, out_dir):
     )
     models = _load_du_unet_models(args, device, require_all=True)
     norm_stats = dataset.get_norm_stats()
-    target_norm = MonthlyClimatologyLayerStdNormalizer.from_stats(
-        norm_stats["target"]
-    )
+    target_norm = _target_normalizer_for_depth_indices(norm_stats, depth_indices)
 
     overall_acc = RegressionMetricAccumulator()
     depth_acc = RegressionMetricAccumulator()
@@ -599,12 +693,13 @@ def evaluate_2dto2d_period(args, out_dir):
         for batch in loader:
             sst = batch["sst"].to(device)
             ssh_sss = batch["ssh_sss"].to(device)
+            target_shape = batch["target"].shape[-2:]
             pred_norm = torch.cat(
-                [model(sst, ssh_sss) for model in models],
+                [model(sst, ssh_sss, output_size=target_shape) for model in models],
                 dim=1,
             ).cpu().numpy()
-            true_norm = batch["target"].numpy()
-            target_mask = batch["target_mask"].numpy()
+            true_norm = batch["target"][:, depth_indices].numpy()
+            target_mask = batch["target_mask"][:, depth_indices].numpy()
 
             batch_size = pred_norm.shape[0]
             batch_indices = eval_indices[offset:offset + batch_size]
@@ -664,7 +759,7 @@ def evaluate_2dto2d_period(args, out_dir):
     )
     payload = {
         "dates": np.asarray(eval_dates),
-        "depth_m": np.asarray(DEPTH_LEVELS_25M, dtype=np.int32),
+        "depth_m": np.asarray(depth_levels, dtype=np.float32),
         "overall_valid_count": overall_metrics["valid_count"],
         "by_depth_valid_count": depth_metrics["valid_count"],
         "by_day_valid_count": daily_metrics["valid_count"],
@@ -677,9 +772,9 @@ def evaluate_2dto2d_period(args, out_dir):
 
     depth_records = _grouped_metrics_to_records(
         depth_metrics,
-        list(range(len(DEPTH_LEVELS_25M))),
+        list(range(len(depth_levels))),
         "depth_index",
-        extra_values={"depth_m": DEPTH_LEVELS_25M},
+        extra_values={"depth_m": depth_levels},
     )
     summary = {
         "mode": "period",
@@ -711,7 +806,7 @@ def evaluate_2dto2d_period(args, out_dir):
         target_var=args.target_var,
     )
     _plot_period_metrics(
-        np.asarray(DEPTH_LEVELS_25M),
+        np.asarray(depth_levels),
         depth_metrics,
         "Depth / m",
         f"{args.method} {args.target_var} metrics by depth",
@@ -743,6 +838,10 @@ def save_outputs(args, y_pred, y_true, out_dir, mask=None):
     level = args.target_level
     is_2dto3d = method == "ocean_transformer"
     output_target_var = _target_var_for_outputs(args, is_2dto3d)
+    if is_2dto3d:
+        lon_range, lat_range = LON_RANGE, LAT_RANGE
+    else:
+        lon_range, lat_range = _du_unet_lon_lat_range(args)
 
     # ----- 1. 保存预测场 npy -----
     pred_name = pred_filename(method, day, target_var=output_target_var)
@@ -767,13 +866,13 @@ def save_outputs(args, y_pred, y_true, out_dir, mask=None):
             temp_map,
             title=f"{method} {day} Temp Level-{level}",
             output_path=os.path.join(out_dir, map_filename("temp", level, method, day)),
-            lon_range=LON_RANGE, lat_range=LAT_RANGE,
+            lon_range=lon_range, lat_range=lat_range,
             cmap="RdYlBu_r", cbar_label="Temperature (°C)")
         plot_level_map(
             salt_map,
             title=f"{method} {day} Salt Level-{level}",
             output_path=os.path.join(out_dir, map_filename("salt", level, method, day)),
-            lon_range=LON_RANGE, lat_range=LAT_RANGE,
+            lon_range=lon_range, lat_range=lat_range,
             cmap="viridis", cbar_label="Salinity (psu)")
     else:
         if not output_target_var:
@@ -791,7 +890,7 @@ def save_outputs(args, y_pred, y_true, out_dir, mask=None):
                     out_dir,
                     map_filename(target_var, level, method, day, target_var=output_target_var),
                 ),
-                lon_range=LON_RANGE, lat_range=LAT_RANGE)
+                lon_range=lon_range, lat_range=lat_range)
 
     # ----- 3. 有真值时：网格指标 + 误差图 + 剖面图 -----
     if y_true is not None:
@@ -814,7 +913,7 @@ def save_outputs(args, y_pred, y_true, out_dir, mask=None):
                 mae_level,
                 title=f"MAE {method} {day} Level-{level}",
                 output_path=os.path.join(out_dir, map_filename("mae", level, method, day)),
-                lon_range=LON_RANGE, lat_range=LAT_RANGE,
+                lon_range=lon_range, lat_range=lat_range,
                 cmap="RdYlBu_r", cbar_label="MAE")
 
         else:
@@ -849,9 +948,9 @@ def save_outputs(args, y_pred, y_true, out_dir, mask=None):
                         day,
                         method,
                         panel_path,
-                        lon_range=LON_RANGE,
-                        lat_range=LAT_RANGE,
-                        depth_values=DEPTH_LEVELS_25M,
+                        lon_range=lon_range,
+                        lat_range=lat_range,
+                        depth_values=_du_unet_selected_depth_levels(args),
                     )
                 else:
                     plot_level_map(
@@ -861,7 +960,7 @@ def save_outputs(args, y_pred, y_true, out_dir, mask=None):
                             out_dir,
                             map_filename("mae", level, method, day, target_var=output_target_var),
                         ),
-                        lon_range=LON_RANGE, lat_range=LAT_RANGE,
+                        lon_range=lon_range, lat_range=lat_range,
                         cmap="RdYlBu_r", cbar_label="MAE")
 
     # ----- 4. summary.json -----
@@ -898,12 +997,44 @@ def parse_args():
     g_dl.add_argument("--checkpoint", default=None, help="模型权重路径")
     g_dl.add_argument("--checkpoint-dir", default=None, help="2dto2d 多模型权重目录")
     g_dl.add_argument("--data-dir", default=DATA_DIR)
+    g_dl.add_argument(
+        "--dataset-profile",
+        choices=dataset_profile_names(),
+        default=DEFAULT_DATASET_PROFILE,
+        help="2dto2d 数据集配置；旧实验用 legacy_small，新大区域用 glorys12v1_all_size",
+    )
+    g_dl.add_argument(
+        "--lazy-data",
+        action="store_true",
+        help="Du_Unet 按样本延迟清洗/归一化；glorys12v1_all_size 会自动启用",
+    )
+    g_dl.add_argument(
+        "--normalization-chunk-size",
+        type=int,
+        default=32,
+        help="lazy 归一化统计量拟合时的时间分块大小",
+    )
+    g_dl.add_argument(
+        "--normalization-stats-path",
+        default=None,
+        help="归一化统计量 .npz；默认读取 data-dir/normalization_stats/",
+    )
+    g_dl.add_argument(
+        "--rebuild-normalization-stats",
+        action="store_true",
+        help="忽略已有统计文件并用训练时段重新拟合后覆盖",
+    )
     g_dl.add_argument("--target-var", choices=["temperature", "salinity"], default="temperature",
                       help="Du_Unet 预测目标变量")
     g_dl.add_argument("--start-date", default=DATA_START_DATE,
                       help="Du_Unet 使用的数据起始日期 YYYY-MM-DD")
     g_dl.add_argument("--end-date", default=None,
                       help="Du_Unet 使用的数据结束日期 YYYY-MM-DD，默认使用配置中的结束日期")
+    g_dl.add_argument(
+        "--depth-indices",
+        default=None,
+        help="Du_Unet 仅测试指定深度索引，逗号分隔；默认测试当前 profile 全部深度",
+    )
     g_dl.add_argument("--dummy", action="store_true",
                       help="使用合成数据 (2dto3d)")
     g_dl.add_argument("--quality-report", action="store_true",

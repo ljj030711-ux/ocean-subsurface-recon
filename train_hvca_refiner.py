@@ -9,27 +9,28 @@ from datetime import datetime
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from config import (
     CHECKPOINTS_ROOT,
     DATA_DIR,
     DATA_START_DATE,
-    DEPTH_LEVELS_25M,
+    DEFAULT_DATASET_PROFILE,
     DU_UNET_CKPT_NAME_TEMPLATE,
     OUTPUTS_ROOT,
     PARADIGM_2DTO2D,
     SEED,
+    dataset_profile_names,
+    get_2dto2d_depth_levels,
     get_checkpoint_dir,
 )
 from datasets.dataset_2dto2d import Dataset2Dto2D
 from datasets.date_utils import generate_date_list
 from models.du_unet import Du_Unet
 from models.hvca_refiner import HVCARefiner
-from utils.losses import masked_rmse_loss
+from utils.losses import hvca_refiner_loss
 from utils.run_config import (
     count_model_parameters,
-    model_config_path,
     print_and_save_run_config,
 )
 
@@ -44,27 +45,47 @@ def get_device(name=None):
     return torch.device("cpu")
 
 
-def parse_depths(depths_arg):
+def use_lazy_2dto2d_data(args):
+    return args.lazy_data or args.dataset_profile == "glorys12v1_all_size"
+
+
+def _depth_equal(a, b, tol=1e-4):
+    return abs(float(a) - float(b)) <= tol
+
+
+def _format_depth_list(depths):
+    return ", ".join(f"{float(d):g}" for d in depths)
+
+
+def parse_depths(depths_arg, depth_levels):
     if not depths_arg:
-        return list(DEPTH_LEVELS_25M)
+        return list(depth_levels)
     depths = []
     for item in depths_arg.split(","):
         text = item.strip()
         if text:
-            depths.append(int(float(text)))
+            depths.append(float(text))
     if not depths:
         raise ValueError("--depths 不能为空")
     return depths
 
 
-def resolve_depth_indices(depths):
-    available = list(DEPTH_LEVELS_25M)
-    missing = [d for d in depths if d not in available]
+def resolve_depth_indices(depths, depth_levels):
+    available = list(depth_levels)
+    missing = [
+        d for d in depths
+        if not any(_depth_equal(d, candidate) for candidate in available)
+    ]
     if missing:
         raise ValueError(
-            f"--depths 必须是 DEPTH_LEVELS_25M 的子集；缺失 checkpoint 的深度: {missing}"
+            f"--depths 必须是当前 dataset profile 深度层的子集；"
+            f"缺失 checkpoint 的深度: {_format_depth_list(missing)}；"
+            f"可选深度: {_format_depth_list(available)}"
         )
-    return [available.index(d) for d in depths]
+    return [
+        next(i for i, candidate in enumerate(available) if _depth_equal(d, candidate))
+        for d in depths
+    ]
 
 
 def get_year_split_indices(total_len, start_date_str):
@@ -97,6 +118,10 @@ def default_hvca_output_dir():
     return os.path.join(OUTPUTS_ROOT, PARADIGM_2DTO2D, "HVCARefiner")
 
 
+def run_config_path(save_dir, stage):
+    return os.path.join(save_dir, f"HVCARefiner_{stage}_config.json")
+
+
 def save_loss_curve(train_losses, val_losses, output_path):
     import matplotlib
 
@@ -123,7 +148,15 @@ def save_cache_metadata(cache_dir, payload):
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def load_du_unet_subset(args, device, depth_indices):
+def load_cache_metadata(cache_dir):
+    path = os.path.join(cache_dir, "metadata.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_du_unet_subset(args, device, depth_indices, depth_levels):
     base_dir = args.base_checkpoint_dir or get_checkpoint_dir(
         PARADIGM_2DTO2D, "Du_Unet", base_dir=CHECKPOINTS_ROOT
     )
@@ -134,7 +167,7 @@ def load_du_unet_subset(args, device, depth_indices):
 
     models = []
     for depth_idx in depth_indices:
-        depth_m = DEPTH_LEVELS_25M[depth_idx]
+        depth_m = depth_levels[depth_idx]
         ckpt_name = DU_UNET_CKPT_NAME_TEMPLATE.format(
             target_var=args.target_var, depth_m=depth_m
         )
@@ -164,10 +197,10 @@ def stack_dataset_samples(dataset, indices, depth_indices):
 
 
 @torch.no_grad()
-def infer_t0(models, sst, ssh_sss, device):
+def infer_t0(models, sst, ssh_sss, device, output_size=None):
     sst = sst.to(device)
     ssh_sss = ssh_sss.to(device)
-    pred_layers = [model(sst, ssh_sss) for model in models]
+    pred_layers = [model(sst, ssh_sss, output_size=output_size) for model in models]
     return torch.cat(pred_layers, dim=1).cpu()
 
 
@@ -187,6 +220,20 @@ def generate_t0_cache(
     """Generate normalized T0/T_true cache shards for one split."""
     os.makedirs(cache_dir, exist_ok=True)
     if cache_ready(cache_dir):
+        cached_reference = load_cache_metadata(cache_dir).get(
+            "normalization_stats"
+        )
+        current_reference = dataset.get_normalization_reference()
+        if (
+            cached_reference
+            and cached_reference.get("fingerprint")
+            and cached_reference.get("fingerprint")
+            != current_reference.get("fingerprint")
+        ):
+            raise ValueError(
+                f"已有 {split_name} cache 与当前归一化统计量不一致: {cache_dir}；"
+                "请换一个空 cache 目录重新生成。"
+            )
         print(f"[cache] 发现已有 {split_name} cache，跳过生成: {cache_dir}")
         return
 
@@ -205,7 +252,7 @@ def generate_t0_cache(
         sst, ssh_sss, target, mask = stack_dataset_samples(
             dataset, batch_indices, depth_indices
         )
-        T0 = infer_t0(models, sst, ssh_sss, device)
+        T0 = infer_t0(models, sst, ssh_sss, device, output_size=target.shape[-2:])
         months = np.asarray(dataset.months[batch_indices], dtype=np.int64)
         sample_id = [dates[int(i)] for i in batch_indices]
         payload = {
@@ -227,9 +274,10 @@ def generate_t0_cache(
             "target_var": target_var,
             "start_date": dataset.start_date,
             "end_date": dataset.end_date,
-            "depth_m": list(map(int, depth_values)),
+            "depth_m": list(map(float, depth_values)),
             "depth_indices": list(map(int, depth_indices)),
             "normalization_space": "monthly_climatology_layer_std",
+            "normalization_stats": dataset.get_normalization_reference(),
             "contains_surface": False,
         },
     )
@@ -283,9 +331,67 @@ class HvcaCacheDataset(Dataset):
         }
 
 
-def prepare_train_val_cache(args, depth_values, depth_indices, device):
+class ShardLocalBatchSampler(Sampler):
+    """Shuffle shards and samples while keeping each batch inside one shard."""
+
+    def __init__(self, dataset, batch_size, shuffle, seed=SEED, drop_last=False):
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.epoch = 0
+        if self.batch_size <= 0:
+            raise ValueError("batch_size 必须大于 0")
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self.epoch += 1
+        shard_order = np.arange(len(self.dataset.lengths), dtype=np.int64)
+        if self.shuffle:
+            rng.shuffle(shard_order)
+
+        shard_starts = [0] + self.dataset.cumulative[:-1]
+        for shard_idx in shard_order:
+            start = int(shard_starts[int(shard_idx)])
+            length = int(self.dataset.lengths[int(shard_idx)])
+            indices = np.arange(start, start + length, dtype=np.int64)
+            if self.shuffle:
+                rng.shuffle(indices)
+            for batch_start in range(0, length, self.batch_size):
+                batch = indices[batch_start : batch_start + self.batch_size]
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                yield batch.tolist()
+
+    def __len__(self):
+        if self.drop_last:
+            return sum(length // self.batch_size for length in self.dataset.lengths)
+        return sum(
+            (length + self.batch_size - 1) // self.batch_size
+            for length in self.dataset.lengths
+        )
+
+
+def prepare_train_val_cache(args, depth_values, depth_indices, depth_levels, device):
     if cache_ready(args.t0_cache_dir) and cache_ready(args.val_cache_dir):
         print("[cache] train/val cache 均已存在，直接读取")
+        cache_metadata = load_cache_metadata(args.t0_cache_dir)
+        val_metadata = load_cache_metadata(args.val_cache_dir)
+        reference = cache_metadata.get("normalization_stats")
+        val_reference = val_metadata.get("normalization_stats")
+        if (
+            reference
+            and val_reference
+            and reference.get("fingerprint") != val_reference.get("fingerprint")
+        ):
+            raise ValueError("train/val cache 使用了不同的归一化统计量，请重新生成 cache")
+        if reference:
+            args._normalization_stats_reference = reference
+            if args.normalization_stats_path is None:
+                args.normalization_stats_path = reference.get("path")
+        else:
+            print("[cache] 警告：旧 cache 未记录归一化统计文件引用")
         return
 
     dataset = Dataset2Dto2D(
@@ -294,7 +400,14 @@ def prepare_train_val_cache(args, depth_values, depth_indices, device):
         target_var=args.target_var,
         start_date=args.start_date,
         end_date=args.end_date,
+        dataset_profile=args.dataset_profile,
+        lazy=use_lazy_2dto2d_data(args),
+        normalization_chunk_size=args.normalization_chunk_size,
+        normalization_stats_path=args.normalization_stats_path,
+        rebuild_normalization_stats=args.rebuild_normalization_stats,
     )
+    args.normalization_stats_path = dataset.normalization_stats_path
+    args._normalization_stats_reference = dataset.get_normalization_reference()
     train_idx, val_idx, _ = get_year_split_indices(len(dataset), dataset.start_date)
     if args.max_samples is not None:
         train_idx = train_idx[: args.max_samples]
@@ -302,7 +415,12 @@ def prepare_train_val_cache(args, depth_values, depth_indices, device):
     if not train_idx or not val_idx:
         raise ValueError("训练或验证 split 为空，请检查 --start-date/--end-date")
 
-    models = load_du_unet_subset(args, device, depth_indices)
+    if len(depth_levels) != dataset.num_depths:
+        raise ValueError(
+            f"dataset_profile={args.dataset_profile} 深度层数 {len(depth_levels)} "
+            f"与 target 数据层数 {dataset.num_depths} 不一致"
+        )
+    models = load_du_unet_subset(args, device, depth_indices, depth_levels)
     generate_t0_cache(
         cache_dir=args.t0_cache_dir,
         dataset=dataset,
@@ -329,41 +447,82 @@ def prepare_train_val_cache(args, depth_values, depth_indices, device):
     )
 
 
-def train_one_epoch(model, loader, optimizer, scaler, depth_tensor, device, use_amp):
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    scaler,
+    depth_tensor,
+    device,
+    use_amp,
+    lambda_delta_z,
+):
     model.train()
-    total, count = 0.0, 0
+    totals = torch.zeros(3, dtype=torch.float64, device=device)
+    count = 0
     for batch in loader:
-        T0 = batch["T0"].to(device)
-        T_true = batch["T_true"].to(device)
-        mask = batch["target_mask"].to(device)
+        T0 = batch["T0"].to(device, non_blocking=True)
+        T_true = batch["T_true"].to(device, non_blocking=True)
+        mask = batch["target_mask"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=use_amp):
             pred = model(T0, depth_tensor)
-            loss = masked_rmse_loss(pred, T_true, mask)
+            loss_parts = hvca_refiner_loss(
+                pred,
+                T0,
+                T_true,
+                mask,
+                depth_tensor,
+                lambda_delta_z=lambda_delta_z,
+            )
+            loss = loss_parts["loss"]
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
-        total += float(loss.detach().cpu())
+        totals += torch.stack(
+            [loss, loss_parts["rmse"], loss_parts["delta_z"]]
+        ).detach().to(torch.float64)
         count += 1
-    return total / max(count, 1)
+    values = (totals / max(count, 1)).cpu().tolist()
+    return {
+        "loss": values[0],
+        "rmse": values[1],
+        "delta_z": values[2],
+    }
 
 
 @torch.no_grad()
-def validate(model, loader, depth_tensor, device, use_amp):
+def validate(model, loader, depth_tensor, device, use_amp, lambda_delta_z):
     model.eval()
-    total, count = 0.0, 0
+    totals = torch.zeros(3, dtype=torch.float64, device=device)
+    count = 0
     for batch in loader:
-        T0 = batch["T0"].to(device)
-        T_true = batch["T_true"].to(device)
-        mask = batch["target_mask"].to(device)
+        T0 = batch["T0"].to(device, non_blocking=True)
+        T_true = batch["T_true"].to(device, non_blocking=True)
+        mask = batch["target_mask"].to(device, non_blocking=True)
         with torch.cuda.amp.autocast(enabled=use_amp):
             pred = model(T0, depth_tensor)
-            loss = masked_rmse_loss(pred, T_true, mask)
-        total += float(loss.detach().cpu())
+            loss_parts = hvca_refiner_loss(
+                pred,
+                T0,
+                T_true,
+                mask,
+                depth_tensor,
+                lambda_delta_z=lambda_delta_z,
+            )
+            loss = loss_parts["loss"]
+        totals += torch.stack(
+            [loss, loss_parts["rmse"], loss_parts["delta_z"]]
+        ).detach().to(torch.float64)
         count += 1
-    return total / max(count, 1)
+    values = (totals / max(count, 1)).cpu().tolist()
+    return {
+        "loss": values[0],
+        "rmse": values[1],
+        "delta_z": values[2],
+    }
 
 
 def dataloader_kwargs(args, device):
@@ -390,9 +549,18 @@ def save_checkpoint(path, model, optimizer, args, depth_values, best_val, epoch)
                 "dropout": args.dropout,
                 "column_chunk_size": args.column_chunk_size,
             },
+            "loss_config": {
+                "primary": "masked_rmse_loss",
+                "lambda_delta_z": float(args.lambda_delta_z),
+                "delta_z": "mean_abs_depth_scaled_delta_layer_difference",
+            },
             "parameter_count": count_model_parameters(model),
             "depth_values": list(map(float, depth_values)),
             "target_var": args.target_var,
+            "dataset_profile": args.dataset_profile,
+            "normalization_stats": getattr(
+                args, "_normalization_stats_reference", None
+            ),
             "best_val": float(best_val),
             "epoch": int(epoch),
         },
@@ -410,9 +578,36 @@ def parse_args():
     parser.add_argument("--base-checkpoint-dir", default=default_ckpt_dir)
     parser.add_argument("--target-var", choices=["temperature", "salinity"], default="temperature")
     parser.add_argument("--data-dir", default=DATA_DIR)
+    parser.add_argument(
+        "--dataset-profile",
+        choices=dataset_profile_names(),
+        default=DEFAULT_DATASET_PROFILE,
+        help="2dto2d 数据集配置；旧实验用 legacy_small，新大区域用 glorys12v1_all_size",
+    )
     parser.add_argument("--start-date", default=DATA_START_DATE)
     parser.add_argument("--end-date", default=None)
-    parser.add_argument("--depths", default=None, help="逗号分隔深度米数，默认 DEPTH_LEVELS_25M")
+    parser.add_argument("--depths", default=None, help="逗号分隔深度米数，默认当前 dataset profile 的全部深度")
+    parser.add_argument(
+        "--lazy-data",
+        action="store_true",
+        help="按样本延迟清洗/归一化；glorys12v1_all_size 会自动启用",
+    )
+    parser.add_argument(
+        "--normalization-chunk-size",
+        type=int,
+        default=32,
+        help="lazy 归一化统计量拟合时的时间分块大小",
+    )
+    parser.add_argument(
+        "--normalization-stats-path",
+        default=None,
+        help="归一化统计量 .npz；默认保存到 data-dir/normalization_stats/",
+    )
+    parser.add_argument(
+        "--rebuild-normalization-stats",
+        action="store_true",
+        help="生成 T0 cache 前显式重算并覆盖归一化统计量",
+    )
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--cache-shard-size", type=int, default=64)
@@ -428,6 +623,12 @@ def parse_args():
         default=8192,
         help="每次送入垂向/交叉 attention 的水平柱数量，减小可降低显存和 CUDA kernel 压力",
     )
+    parser.add_argument(
+        "--lambda-delta-z",
+        type=float,
+        default=0.0,
+        help="delta 垂向平滑约束权重；0 表示关闭，v2 建议先试 0.01",
+    )
     parser.add_argument("--num-workers", type=int, default=4, help="cache DataLoader worker 数")
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--shard-cache-size", type=int, default=4, help="每个 worker 内缓存的 shard 数")
@@ -435,6 +636,12 @@ def parse_args():
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=5,
+        help="验证 RMSE 连续多少轮不下降后早停；0 表示关闭早停",
+    )
     return parser.parse_args()
 
 
@@ -442,40 +649,58 @@ def main():
     args = parse_args()
     if args.batch_size <= 0 or args.cache_shard_size <= 0:
         raise ValueError("--batch-size 和 --cache-shard-size 必须大于 0")
+    if args.lambda_delta_z < 0:
+        raise ValueError("--lambda-delta-z 不能为负数")
+    if args.early_stopping_patience < 0:
+        raise ValueError("--early-stopping-patience 不能为负数")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = get_device(args.device)
     use_amp = device.type == "cuda"
-    depth_values = parse_depths(args.depths)
-    depth_indices = resolve_depth_indices(depth_values)
+    depth_levels = get_2dto2d_depth_levels(args.dataset_profile)
+    depth_values = parse_depths(args.depths, depth_levels)
+    depth_indices = resolve_depth_indices(depth_values, depth_levels)
     depth_tensor = torch.as_tensor(depth_values, dtype=torch.float32, device=device)
 
     print("=" * 60)
     print("HVCARefiner 训练配置")
     print("=" * 60)
     print(f"target_var: {args.target_var}")
+    print(f"dataset_profile: {args.dataset_profile}")
     print(f"device: {device}")
     print(f"depths: {depth_values}")
     print(f"train cache: {args.t0_cache_dir}")
     print(f"val cache: {args.val_cache_dir}")
     print(f"Du_Unet checkpoint dir: {args.base_checkpoint_dir}")
+    print(f"lambda_delta_z: {args.lambda_delta_z}")
+    print(f"early_stopping_patience: {args.early_stopping_patience}")
     print("=" * 60)
-    prepare_train_val_cache(args, depth_values, depth_indices, device)
+    prepare_train_val_cache(args, depth_values, depth_indices, depth_levels, device)
 
     train_ds = HvcaCacheDataset(args.t0_cache_dir, shard_cache_size=args.shard_cache_size)
     val_ds = HvcaCacheDataset(args.val_cache_dir, shard_cache_size=args.shard_cache_size)
     loader_kwargs = dataloader_kwargs(args, device)
-    train_loader = DataLoader(
+    train_batch_sampler = ShardLocalBatchSampler(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
+        seed=args.seed,
+    )
+    val_batch_sampler = ShardLocalBatchSampler(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        seed=args.seed,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_sampler=train_batch_sampler,
         **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
+        batch_sampler=val_batch_sampler,
         **loader_kwargs,
     )
 
@@ -494,10 +719,10 @@ def main():
             "indexing": "1_based",
         },
         "early_stopping": {
-            "enabled": False,
-            "monitor": "val_loss",
+            "enabled": args.early_stopping_patience > 0,
+            "monitor": "val_rmse",
             "mode": "min",
-            "patience": None,
+            "patience": args.early_stopping_patience,
         },
         "optimizer": {
             "name": "AdamW",
@@ -528,9 +753,17 @@ def main():
             "seed": args.seed,
             "data": {
                 "data_dir": args.data_dir,
+                "dataset_profile": args.dataset_profile,
                 "start_date": args.start_date,
                 "end_date": args.end_date,
                 "max_samples": args.max_samples,
+                "lazy_data": use_lazy_2dto2d_data(args),
+                "normalization_chunk_size": args.normalization_chunk_size,
+                "normalization_stats_path": args.normalization_stats_path,
+                "normalization_stats": getattr(
+                    args, "_normalization_stats_reference", None
+                ),
+                "rebuild_normalization_stats": args.rebuild_normalization_stats,
             },
             "hyperparameters": {
                 "epochs": args.epochs,
@@ -542,9 +775,14 @@ def main():
                 "num_workers": args.num_workers,
                 "prefetch_factor": args.prefetch_factor,
                 "shard_cache_size": args.shard_cache_size,
+                "batch_sampling": "shard_local_random",
+                "gpu_metric_sync": "epoch_end",
+                "non_blocking_transfer": device.type == "cuda",
                 "depths": depth_values,
                 "depth_indices": depth_indices,
                 "use_amp": use_amp,
+                "lambda_delta_z": args.lambda_delta_z,
+                "early_stopping_patience": args.early_stopping_patience,
             },
             "training_strategy": training_strategy,
             "model_config": {
@@ -554,6 +792,12 @@ def main():
                 "dropout": args.dropout,
                 "column_chunk_size": args.column_chunk_size,
             },
+            "loss_config": {
+                "primary": "masked_rmse_loss",
+                "lambda_delta_z": args.lambda_delta_z,
+                "delta_z": "mean_abs_depth_scaled_delta_layer_difference",
+                "checkpoint_monitor": "val_rmse",
+            },
             "parameter_count": count_model_parameters(model),
             "paths": {
                 "save_dir": args.save_dir,
@@ -562,7 +806,7 @@ def main():
                 "base_checkpoint_dir": args.base_checkpoint_dir,
             },
         },
-        model_config_path(OUTPUTS_ROOT, "HVCARefiner", "train"),
+        run_config_path(args.save_dir, "train"),
     )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -575,30 +819,82 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     best_path = os.path.join(args.save_dir, "best.pt")
     best_val = float("inf")
-    history = {"train_loss": [], "val_loss": []}
+    epochs_without_improvement = 0
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_total_loss": [],
+        "val_total_loss": [],
+        "train_delta_z_loss": [],
+        "val_delta_z_loss": [],
+    }
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(
-            model, train_loader, optimizer, scaler, depth_tensor, device, use_amp
+        train_stats = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scaler,
+            depth_tensor,
+            device,
+            use_amp,
+            args.lambda_delta_z,
         )
-        val_loss = validate(model, val_loader, depth_tensor, device, use_amp)
+        val_stats = validate(
+            model, val_loader, depth_tensor, device, use_amp, args.lambda_delta_z
+        )
+        train_loss = train_stats["rmse"]
+        val_loss = val_stats["rmse"]
         scheduler.step(val_loss)
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        history["train_total_loss"].append(train_stats["loss"])
+        history["val_total_loss"].append(val_stats["loss"])
+        history["train_delta_z_loss"].append(train_stats["delta_z"])
+        history["val_delta_z_loss"].append(val_stats["delta_z"])
         lr_now = optimizer.param_groups[0]["lr"]
-        print(
-            f"Epoch [{epoch}/{args.epochs}] | "
-            f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | LR: {lr_now:.2e}"
-        )
+        if args.lambda_delta_z > 0:
+            print(
+                f"Epoch [{epoch}/{args.epochs}] | "
+                f"Train RMSE: {train_loss:.6f} | Val RMSE: {val_loss:.6f} | "
+                f"Train Total: {train_stats['loss']:.6f} | "
+                f"Val Total: {val_stats['loss']:.6f} | "
+                f"DeltaZ: {train_stats['delta_z']:.6f}/{val_stats['delta_z']:.6f} | "
+                f"LR: {lr_now:.2e}"
+            )
+        else:
+            print(
+                f"Epoch [{epoch}/{args.epochs}] | "
+                f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | LR: {lr_now:.2e}"
+            )
         if val_loss < best_val:
             best_val = val_loss
+            epochs_without_improvement = 0
             save_checkpoint(best_path, model, optimizer, args, depth_values, best_val, epoch)
             print(f"  -> 保存最佳 HVCARefiner: {best_path} (val={best_val:.6f})")
+        else:
+            epochs_without_improvement += 1
+            if args.early_stopping_patience > 0:
+                print(
+                    f"  -> Val 未刷新 best: "
+                    f"{epochs_without_improvement}/{args.early_stopping_patience}"
+                )
+                if epochs_without_improvement >= args.early_stopping_patience:
+                    print(
+                        f"  -> 早停触发：验证 RMSE 连续 "
+                        f"{args.early_stopping_patience} 轮未下降"
+                    )
+                    break
 
     np.savez(
         os.path.join(args.save_dir, "training_history_HVCARefiner.npz"),
         train_loss=np.asarray(history["train_loss"], dtype=np.float32),
         val_loss=np.asarray(history["val_loss"], dtype=np.float32),
+        train_total_loss=np.asarray(history["train_total_loss"], dtype=np.float32),
+        val_total_loss=np.asarray(history["val_total_loss"], dtype=np.float32),
+        train_delta_z_loss=np.asarray(history["train_delta_z_loss"], dtype=np.float32),
+        val_delta_z_loss=np.asarray(history["val_delta_z_loss"], dtype=np.float32),
+        lambda_delta_z=np.asarray(args.lambda_delta_z, dtype=np.float32),
     )
     save_loss_curve(
         history["train_loss"],

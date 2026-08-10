@@ -7,6 +7,7 @@
 DATA_DIR = "./data/raw_small_size"
 OUTPUTS_ROOT = "./outputs"
 CHECKPOINTS_ROOT = "./checkpoints"
+DEFAULT_DATASET_PROFILE = "legacy_small"
 
 DATA_START_DATE = "2002-01-01"
 DATA_END_DATE = "2023-12-31"
@@ -51,6 +52,15 @@ DEPTH_LEVELS_26M = [
 # Du_Unet 使用 5-300m 共 25 层，每层、每个变量训练一个独立 2D->2D 模型。
 DEPTH_LEVELS_25M = DEPTH_LEVELS_26M[1:]
 
+# GLORYS12V1 Global Ocean Physics Reanalysis 原生深度层，单位 m。
+GLORYS12V1_DEPTH_LEVELS_28M = [
+    0.494025, 1.541375, 2.645669, 3.819495, 5.078224, 6.440614,
+    7.929560, 9.572997, 11.405000, 13.467140, 15.810070, 18.495560,
+    21.598820, 25.211410, 29.444730, 34.434150, 40.344050, 47.373690,
+    55.764290, 65.807270, 77.853850, 92.326070, 109.729300,
+    130.666000, 155.850700, 186.125600, 222.475200, 266.040300,
+]
+
 # 结果保存路径拼接；target_var 用于 Du_Unet 的温度/盐度分目录。
 def get_output_dir(paradigm, method, base_dir=OUTPUTS_ROOT, target_var=None):
     path = f"{base_dir}/{paradigm}/{method}"
@@ -76,6 +86,71 @@ TWODTO2D_TARGET_FILENAMES = {
     "temperature": "T-FIELD_2002-01-01_2023-12-31_10_18_110_118.npy",
     "salinity": "S-FIELD_2002-01-01_2023-12-31_10_18_110_118.npy",
 }
+
+DATASET_PROFILES = {
+    "legacy_small": {
+        "description": "旧 10-18N, 110-118E 小区域实验；SST 160x160，SSH/SSS/target 64x64。",
+        "data_dir": DATA_DIR,
+        "lon_range": (110, 118),
+        "lat_range": (10, 18),
+        "depth_levels": DEPTH_LEVELS_25M,
+        "sst_filename": TWODTO2D_SST_FILENAME,
+        "ssh_filename": TWODTO2D_SSH_FILENAME,
+        "sss_filename": TWODTO2D_SSS_FILENAME,
+        "target_filenames": TWODTO2D_TARGET_FILENAMES,
+    },
+    "glorys12v1_all_size": {
+        "description": "0-24N, 105-121E 大区域实验；T-Field 保留 GLORYS12V1 1/12 度原生网格。",
+        "data_dir": "./data/raw_all_size",
+        "lon_range": (105, 121),
+        "lat_range": (0, 24),
+        "depth_levels": GLORYS12V1_DEPTH_LEVELS_28M,
+        "sst_filename": "SST_2002-01-01_2023-12-31_0_24_105_121.npy",
+        "ssh_filename": "SSH_2002-01-01_2023-12-31_0_24_105_121.npy",
+        "sss_filename": "SSS_2002-01-01_2023-12-31_0_24_105_121.npy",
+        "target_filenames": {
+            "temperature": "T-FIELD_2002-01-01_2023-12-31_0_24_105_121_0-300.npy",
+            "salinity": "S-FIELD_2002-01-01_2023-12-31_0_24_105_121_0-300.npy",
+        },
+    },
+}
+
+
+def dataset_profile_names():
+    return sorted(DATASET_PROFILES)
+
+
+def get_dataset_profile(profile_name=None):
+    name = profile_name or DEFAULT_DATASET_PROFILE
+    if name not in DATASET_PROFILES:
+        raise ValueError(
+            f"未知 dataset profile: {name}，可选：{', '.join(dataset_profile_names())}"
+        )
+    return DATASET_PROFILES[name]
+
+
+def get_2dto2d_filenames(target_var, dataset_profile=None):
+    profile = get_dataset_profile(dataset_profile)
+    target_filenames = profile["target_filenames"]
+    if target_var not in target_filenames:
+        raise ValueError(
+            f"profile={dataset_profile or DEFAULT_DATASET_PROFILE} 不支持 target_var={target_var}"
+        )
+    return {
+        "sst": profile["sst_filename"],
+        "ssh": profile["ssh_filename"],
+        "sss": profile["sss_filename"],
+        "target": target_filenames[target_var],
+    }
+
+
+def get_2dto2d_depth_levels(dataset_profile=None):
+    return list(get_dataset_profile(dataset_profile)["depth_levels"])
+
+
+def get_2dto2d_lon_lat_range(dataset_profile=None):
+    profile = get_dataset_profile(dataset_profile)
+    return profile["lon_range"], profile["lat_range"]
 
 # 2dto3d 旧流程暂时保持原始 2019-2023 数据文件。
 TWODTO3D_SURFACE_FILENAME = "sla_sss_2019-01-01_2023-12-31_10_18_110_118.npy"

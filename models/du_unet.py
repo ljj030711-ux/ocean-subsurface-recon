@@ -1,6 +1,6 @@
 """
 Du_Unet 双分支反演模型
-高分辨率 SST 分支提取细尺度特征，低分辨率 SSH/SSS 分支提取多参数特征，融合后输出单层温度或盐度。
+高分辨率 SST 分支提取细尺度特征，SSH/SSS 分支提取多参数特征，融合后输出单层温度或盐度。
 """
 
 import torch
@@ -96,18 +96,23 @@ class Du_Unet(nn.Module):
         low = F.interpolate(dec1, size=out_size, mode="bilinear", align_corners=False)
         return self.sst_to_low(low)
 
-    def _surface_branch(self, ssh_sss):
+    def _surface_branch(self, ssh_sss, out_size=None):
         enc = self.surface_enc(ssh_sss)
         bridge = self.surface_bridge(self.surface_pool(enc))
         up = self._match_size(self.surface_up(bridge), enc)
-        return self.surface_dec(torch.cat([up, enc], dim=1))
+        feat = self.surface_dec(torch.cat([up, enc], dim=1))
+        if out_size is not None and feat.shape[-2:] != tuple(out_size):
+            feat = F.interpolate(feat, size=out_size, mode="bilinear", align_corners=False)
+        return feat
 
-    def forward(self, sst, ssh_sss):
+    def forward(self, sst, ssh_sss, output_size=None):
         """
         Args:
-            sst: (B,1,160,160)
-            ssh_sss: (B,2,64,64)，通道顺序为 SSH、SSS
+            sst: (B,1,H_sst,W_sst)
+            ssh_sss: (B,2,H_surface,W_surface)，通道顺序为 SSH、SSS
+            output_size: 可选 (H_target,W_target)。不传时沿用 SSH/SSS 网格。
         """
-        sst_feat = self._sst_branch(sst, ssh_sss.shape[-2:])
-        surface_feat = self._surface_branch(ssh_sss)
+        out_size = tuple(output_size) if output_size is not None else ssh_sss.shape[-2:]
+        sst_feat = self._sst_branch(sst, out_size)
+        surface_feat = self._surface_branch(ssh_sss, out_size)
         return self.fusion(torch.cat([sst_feat, surface_feat], dim=1))
