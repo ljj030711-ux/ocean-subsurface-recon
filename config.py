@@ -40,7 +40,7 @@ DY = 10000.0
 PARADIGM_2DTO2D = "2dto2d"
 PARADIGM_2DTO3D = "2dto3d"
 
-PARADIGM_2DTO2D_METHODS = {"du_unet"}
+PARADIGM_2DTO2D_METHODS = {"du_unet", "joint_du_unet"}
 PARADIGM_2DTO3D_METHODS = {"2dvar", "modas", "ocean_transformer"}
 
 # 指定 26 层深度（旧参数， 单位 m）
@@ -167,6 +167,17 @@ DU_UNET_PATIENCE = 10
 DU_UNET_CKPT_NAME_TEMPLATE = "Du_Unet_{target_var}_depth{depth_m}m_best.pth"
 DU_UNET_HISTORY_NAME_TEMPLATE = "training_history_Du_Unet_{target_var}_depth{depth_m}m.npz"
 DU_UNET_LOSS_CURVE_TEMPLATE = "loss_Du_Unet_{target_var}_depth{depth_m}m.png"
+
+# B1：与 Du_Unet 使用相同输入和卷积骨干，但一个模型联合输出全部深度。
+JOINT_DU_UNET_CKPT_NAME_TEMPLATE = (
+    "Joint_Du_Unet_{target_var}_{num_depths}depths_best.pth"
+)
+JOINT_DU_UNET_HISTORY_NAME_TEMPLATE = (
+    "training_history_Joint_Du_Unet_{target_var}_{num_depths}depths.npz"
+)
+JOINT_DU_UNET_LOSS_CURVE_TEMPLATE = (
+    "loss_Joint_Du_Unet_{target_var}_{num_depths}depths.png"
+)
 
 # ==================== 2dvar（2dto3d） ====================
 

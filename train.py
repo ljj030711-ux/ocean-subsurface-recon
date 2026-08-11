@@ -1,4 +1,4 @@
-"""统一训练入口，支持 Du_Unet 逐层训练并兼容 ocean_transformer。"""
+"""统一训练入口，支持逐层、联合深度和 ocean_transformer 训练。"""
 
 import argparse
 import os
@@ -27,6 +27,9 @@ from config import (
     DU_UNET_LR,
     DU_UNET_PATIENCE,
     DU_UNET_WEIGHT_DECAY,
+    JOINT_DU_UNET_CKPT_NAME_TEMPLATE,
+    JOINT_DU_UNET_HISTORY_NAME_TEMPLATE,
+    JOINT_DU_UNET_LOSS_CURVE_TEMPLATE,
     TWODTO3D_DATA_START_DATE,
     TWODTO3D_BATCH_SIZE,
     TWODTO3D_D_MODEL,
@@ -58,8 +61,9 @@ from config import (
 from datasets.dataset_2dto2d import Dataset2Dto2D
 from datasets.dataset_2dto3d import DummyTwoDto3DDataset
 from models.du_unet import Du_Unet
+from models.joint_du_unet import JointDuUnet
 from models.ocean_transformer import OceanTransformer
-from utils.losses import masked_rmse_loss
+from utils.losses import masked_depth_mean_rmse_loss, masked_rmse_loss
 from utils.physics import compute_eke, compute_grad_ssh
 from utils.physics_loss import PhysicsLoss
 from utils.run_config import (
@@ -68,7 +72,7 @@ from utils.run_config import (
     print_and_save_run_config,
 )
 
-TRAINABLE_METHODS = {"du_unet", "ocean_transformer"}
+TRAINABLE_METHODS = {"du_unet", "joint_du_unet", "ocean_transformer"}
 
 
 class DepthTargetDataset(Dataset):
@@ -108,6 +112,11 @@ def build_model(method, **kwargs):
     out_ch = kwargs.get("out_channels", 1)
     if name in {"du_unet", "du-unet"}:
         return Du_Unet(out_channels=out_ch)
+    if name in {"joint_du_unet", "joint-du-unet"}:
+        num_depths = kwargs.get("num_depths", kwargs.get("out_channels"))
+        if num_depths is None:
+            raise ValueError("Joint_Du_Unet 构建时必须提供 num_depths")
+        return JointDuUnet(num_depths=num_depths)
     if name == "ocean_transformer":
         return OceanTransformer(
             in_channels=kwargs.get("in_channels", TWODTO3D_IN_CHANNELS),
@@ -165,7 +174,14 @@ def select_target_depth(target, depth_idx=None):
     return target[:, depth_idx : depth_idx + 1]
 
 
-def train_2dto2d_epoch(model, loader, optimizer, device, depth_idx=None):
+def train_2dto2d_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    depth_idx=None,
+    equal_depth_weighting=False,
+):
     model.train()
     total, count = 0.0, 0
     for batch in loader:
@@ -178,7 +194,12 @@ def train_2dto2d_epoch(model, loader, optimizer, device, depth_idx=None):
             batch["target_mask"].to(device, non_blocking=True), depth_idx=depth_idx
         )
         pred = model(sst, ssh_sss, output_size=target.shape[-2:])
-        loss = masked_rmse_loss(pred, target, target_mask)
+        loss_fn = (
+            masked_depth_mean_rmse_loss
+            if equal_depth_weighting
+            else masked_rmse_loss
+        )
+        loss = loss_fn(pred, target, target_mask)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -188,7 +209,13 @@ def train_2dto2d_epoch(model, loader, optimizer, device, depth_idx=None):
     return total / max(count, 1)
 
 
-def validate_2dto2d(model, loader, device, depth_idx=None):
+def validate_2dto2d(
+    model,
+    loader,
+    device,
+    depth_idx=None,
+    equal_depth_weighting=False,
+):
     model.eval()
     total, count = 0.0, 0
     with torch.no_grad():
@@ -202,7 +229,12 @@ def validate_2dto2d(model, loader, device, depth_idx=None):
                 batch["target_mask"].to(device, non_blocking=True), depth_idx=depth_idx
             )
             pred = model(sst, ssh_sss, output_size=target.shape[-2:])
-            loss = masked_rmse_loss(pred, target, target_mask)
+            loss_fn = (
+                masked_depth_mean_rmse_loss
+                if equal_depth_weighting
+                else masked_rmse_loss
+            )
+            loss = loss_fn(pred, target, target_mask)
             total += loss.item()
             count += 1
     return total / max(count, 1)
@@ -273,6 +305,7 @@ def train_one_model(
     checkpoint_path,
     depth_idx=None,
     criterion=None,
+    equal_depth_weighting=False,
 ):
     best_val = float("inf")
     patience_cnt = 0
@@ -284,9 +317,20 @@ def train_one_model(
             v_loss = validate_2dto3d(model, val_loader, device, criterion)
         else:
             t_loss = train_2dto2d_epoch(
-                model, train_loader, optimizer, device, depth_idx=depth_idx
+                model,
+                train_loader,
+                optimizer,
+                device,
+                depth_idx=depth_idx,
+                equal_depth_weighting=equal_depth_weighting,
             )
-            v_loss = validate_2dto2d(model, val_loader, device, depth_idx=depth_idx)
+            v_loss = validate_2dto2d(
+                model,
+                val_loader,
+                device,
+                depth_idx=depth_idx,
+                equal_depth_weighting=equal_depth_weighting,
+            )
 
         scheduler.step()
         train_losses.append(t_loss)
@@ -325,7 +369,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="统一训练入口（2dto2d / 2dto3d）")
     parser.add_argument("--method", required=True)
     parser.add_argument("--target-var", choices=["temperature", "salinity"], default="temperature",
-                        help="Du_Unet 训练目标变量")
+                        help="Du_Unet/Joint_Du_Unet 训练目标变量")
     parser.add_argument("--start-date", default=DATA_START_DATE,
                         help="Du_Unet 使用的数据起始日期 YYYY-MM-DD")
     parser.add_argument("--end-date", default=None,
@@ -400,11 +444,11 @@ def parse_args():
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--quality-report", action="store_true",
-                        help="2dto2d(Du_Unet) 加载数据时生成缺失率质检图")
+        help="2dto2d模型加载数据时生成缺失率质检图")
     parser.add_argument(
         "--depth-indices",
         default=None,
-        help="2dto2d(Du_Unet) 调试开关，仅训练指定深度索引，逗号分隔",
+        help="仅Du_Unet可用；Joint_Du_Unet必须训练全部深度",
     )
     return parser.parse_args()
 
@@ -418,18 +462,27 @@ def main():
     if args.persistent_workers and args.num_workers == 0:
         raise ValueError("--persistent-workers 要求 --num-workers 大于 0")
     method = args.method.strip().lower()
-    if method in {"du-unet"}:
+    if method == "du-unet":
         method = "du_unet"
+    if method in {"joint-du-unet", "joint_unet", "joint-unet"}:
+        method = "joint_du_unet"
     if method not in TRAINABLE_METHODS:
         raise ValueError(f"未识别的方法: {args.method}")
+    if method == "joint_du_unet" and args.depth_indices:
+        raise ValueError(
+            "B1 Joint_Du_Unet 必须联合训练全部深度，不能传 --depth-indices"
+        )
     paradigm = paradigm_of_method(method)
-    method_dir = "Du_Unet" if method == "du_unet" else method
+    method_dir = {
+        "du_unet": "Du_Unet",
+        "joint_du_unet": "Joint_Du_Unet",
+    }.get(method, method)
 
     device = get_device()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    if method == "du_unet":
+    if method in {"du_unet", "joint_du_unet"}:
         out_dir = get_output_dir(
             paradigm, method_dir, base_dir=args.output_dir, target_var=args.target_var
         )
@@ -692,6 +745,184 @@ def main():
             np.savez(os.path.join(out_dir, hist_name), train_losses=train_losses, val_losses=val_losses)
             save_loss_curve(train_losses, val_losses, os.path.join(out_dir, curve_name))
             print(f"深度 {depth_m}m 训练完成，best val={best_val:.6f}")
+        return
+
+    if method == "joint_du_unet":
+        epochs = args.epochs or DU_UNET_EPOCHS
+        batch_size = args.batch_size or DU_UNET_BATCH_SIZE
+        lr = args.lr or DU_UNET_LR
+        patience = args.patience or DU_UNET_PATIENCE
+        num_depths = dataset.num_depths
+        model = build_model("joint_du_unet", num_depths=num_depths).to(device)
+        param_stats = count_model_parameters(model)
+        scheduler_step_size = max(epochs // 3, 1)
+        loader_kwargs = dataloader_kwargs(args, device)
+
+        train_loader = DataLoader(
+            Subset(dataset, train_idx),
+            batch_size=batch_size,
+            shuffle=True,
+            **loader_kwargs,
+        )
+        val_loader = DataLoader(
+            Subset(dataset, val_idx),
+            batch_size=batch_size,
+            shuffle=False,
+            **loader_kwargs,
+        )
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=lr, weight_decay=DU_UNET_WEIGHT_DECAY
+        )
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=scheduler_step_size, gamma=0.5
+        )
+
+        ckpt_name = JOINT_DU_UNET_CKPT_NAME_TEMPLATE.format(
+            target_var=args.target_var,
+            num_depths=num_depths,
+        )
+        ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+        history_name = JOINT_DU_UNET_HISTORY_NAME_TEMPLATE.format(
+            target_var=args.target_var,
+            num_depths=num_depths,
+        )
+        curve_name = JOINT_DU_UNET_LOSS_CURVE_TEMPLATE.format(
+            target_var=args.target_var,
+            num_depths=num_depths,
+        )
+        training_strategy = {
+            "experiment": "B1_joint_output_baseline",
+            "epoch": {
+                "planned": epochs,
+                "indexing": "1_based",
+            },
+            "early_stopping": {
+                "enabled": True,
+                "monitor": "val_loss",
+                "mode": "min",
+                "patience": patience,
+            },
+            "optimizer": {
+                "name": "Adam",
+                "lr": lr,
+                "weight_decay": DU_UNET_WEIGHT_DECAY,
+            },
+            "scheduler": {
+                "name": "StepLR",
+                "step_size": scheduler_step_size,
+                "gamma": 0.5,
+                "step_on": "epoch",
+            },
+            "warmup": {
+                "enabled": False,
+                "epochs": 0,
+            },
+        }
+        config_path = model_config_path(
+            args.output_dir,
+            "Joint_Du_Unet",
+            "train",
+            target_var=args.target_var,
+        )
+        print_and_save_run_config(
+            "B1 Joint_Du_Unet 训练超参数",
+            {
+                "stage": "train",
+                "experiment": "B1_joint_output_baseline",
+                "model": "Joint_Du_Unet",
+                "method": method,
+                "paradigm": paradigm,
+                "target_var": args.target_var,
+                "device": device,
+                "seed": args.seed,
+                "data": {
+                    "data_dir": args.data_dir,
+                    "dataset_profile": args.dataset_profile,
+                    "start_date": dataset.start_date,
+                    "end_date": dataset.end_date,
+                    "train_samples": len(train_idx),
+                    "val_samples": len(val_idx),
+                    "shapes": dataset.get_data_info(),
+                    "normalize": not args.no_normalize,
+                    "lazy_data": use_lazy_2dto2d_data(args),
+                    "normalization_chunk_size": args.normalization_chunk_size,
+                    "normalization_stats_path": dataset.normalization_stats_path,
+                    "normalization_stats": dataset.get_normalization_reference(),
+                    "normalization_stats_loaded": dataset.normalization_stats_loaded,
+                    "rebuild_normalization_stats": args.rebuild_normalization_stats,
+                    "num_workers": args.num_workers,
+                    "prefetch_factor": (
+                        args.prefetch_factor if args.num_workers > 0 else None
+                    ),
+                    "pin_memory": loader_kwargs["pin_memory"],
+                    "persistent_workers": (
+                        args.persistent_workers if args.num_workers > 0 else False
+                    ),
+                    "target_loading": "all_depths_jointly",
+                    "max_samples": args.max_samples,
+                },
+                "hyperparameters": {
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "lr": lr,
+                    "learning_rate": lr,
+                    "weight_decay": DU_UNET_WEIGHT_DECAY,
+                    "patience": patience,
+                    "depth_indices": list(range(num_depths)),
+                    "depth_m": depth_levels,
+                },
+                "training_strategy": training_strategy,
+                "model_config": {
+                    "backbone": "Du_Unet",
+                    "out_channels": num_depths,
+                    "joint_depth_output": True,
+                    "attention": False,
+                    "transformer": False,
+                },
+                "loss_config": {
+                    "name": "masked_depth_mean_rmse_loss",
+                    "description": "mean of per-depth masked RMSE",
+                    "vertical_regularization": False,
+                },
+                "parameter_count": param_stats,
+                "paths": {
+                    "output_dir": out_dir,
+                    "checkpoint_dir": ckpt_dir,
+                    "checkpoint": ckpt_path,
+                    "history": os.path.join(out_dir, history_name),
+                    "loss_curve": os.path.join(out_dir, curve_name),
+                },
+            },
+            config_path,
+        )
+
+        best_val, train_losses, val_losses = train_one_model(
+            method,
+            model,
+            train_loader,
+            val_loader,
+            optimizer,
+            scheduler,
+            device,
+            epochs,
+            patience,
+            ckpt_path,
+            depth_idx=None,
+            equal_depth_weighting=True,
+        )
+        np.savez(
+            os.path.join(out_dir, history_name),
+            train_losses=np.asarray(train_losses, dtype=np.float32),
+            val_losses=np.asarray(val_losses, dtype=np.float32),
+            depth_m=np.asarray(depth_levels, dtype=np.float32),
+        )
+        save_loss_curve(
+            train_losses,
+            val_losses,
+            os.path.join(out_dir, curve_name),
+        )
+        print(f"\nB1 联合深度训练完成。最佳验证损失: {best_val:.6f}")
+        print(f"最佳权重: {ckpt_path}")
         return
 
     raise ValueError(f"未识别的方法: {method}")

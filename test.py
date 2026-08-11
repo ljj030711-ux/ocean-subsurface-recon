@@ -5,8 +5,11 @@ import json
 import os
 import warnings
 
+import matplotlib
 import numpy as np
 import torch
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Subset
 from models.inversion_2dvar import inversion_2dvar
@@ -22,6 +25,7 @@ from config import (
     DY,
     DU_UNET_CKPT_NAME_TEMPLATE,
     INFER_DEFAULT_TARGET_LEVEL,
+    JOINT_DU_UNET_CKPT_NAME_TEMPLATE,
     TRAIN_END_DATE, VAL_START_DATE, VAL_END_DATE,
     TEST_START_DATE, TEST_END_DATE,
     LON_RANGE, LAT_RANGE, DEPTH_MAX, OUTPUTS_ROOT,
@@ -303,7 +307,7 @@ def predict_2dto3d(args):
 
 
 def predict_2dto2d(args):
-    """Du_Unet 逐层推理并拼装 25 层结果。"""
+    """Run B0 layer-wise or B1 joint-depth prediction."""
     device = _get_device()
 
     from datasets.dataset_2dto2d import Dataset2Dto2D
@@ -332,17 +336,65 @@ def predict_2dto2d(args):
         )
     depth_indices = _du_unet_depth_indices(args, all_depth_levels)
     depth_levels = [all_depth_levels[idx] for idx in depth_indices]
+    if args.target_level < 0 or args.target_level >= len(depth_indices):
+        raise ValueError(
+            f"--target-level 需位于 [0, {len(depth_indices) - 1}]，"
+            f"实际为 {args.target_level}"
+        )
     sst = sample["sst"].unsqueeze(0).to(device)
     ssh_sss = sample["ssh_sss"].unsqueeze(0).to(device)
-    param_stats = count_model_parameters(build_model("du_unet", out_channels=1))
-    train_config_path = model_config_path(args.output_dir, "Du_Unet", "train")
+    is_joint = args.method == "Joint_Du_Unet"
+    model_name = "Joint_Du_Unet" if is_joint else "Du_Unet"
+    config_target_var = args.target_var if is_joint else None
+    train_config_path = model_config_path(
+        args.output_dir,
+        model_name,
+        "train",
+        target_var=config_target_var,
+    )
+
+    joint_model = None
+    loaded_checkpoint = None
+    if is_joint:
+        joint_model, loaded_checkpoint = _load_joint_du_unet_model(
+            args,
+            device,
+            dataset.num_depths,
+        )
+        param_stats = count_model_parameters(joint_model)
+        parameter_payload = param_stats
+        checkpoint_candidates = _joint_du_unet_checkpoint_candidates(
+            args,
+            dataset.num_depths,
+        )
+        model_config = {
+            "backbone": "Du_Unet",
+            "out_channels": dataset.num_depths,
+            "joint_depth_output": True,
+            "attention": False,
+            "transformer": False,
+        }
+    else:
+        param_stats = count_model_parameters(build_model("du_unet", out_channels=1))
+        parameter_payload = {
+            "per_depth_model": param_stats,
+            "num_depth_models": len(depth_levels),
+            "total_if_all_depth_models_loaded": {
+                name: value * len(depth_levels)
+                for name, value in param_stats.items()
+            },
+        }
+        checkpoint_candidates = _du_unet_checkpoint_dirs(args)
+        model_config = {"out_channels": 1}
+
     print_and_save_run_config(
-        "Du_Unet 单日测试超参数",
+        f"{model_name} 单日测试超参数",
         {
             "stage": "test",
             "mode": "single_day",
             "single": True,
-            "model": "Du_Unet",
+            "experiment": "B1_joint_output_baseline" if is_joint else "B0",
+            "model": model_name,
             "method": args.method,
             "paradigm": PARADIGM_2DTO2D,
             "target_var": args.target_var,
@@ -363,44 +415,59 @@ def predict_2dto2d(args):
                 "depth_indices": depth_indices,
                 "depth_m": depth_levels,
             },
-            "model_config": {
-                "out_channels": 1,
-            },
+            "model_config": model_config,
             "training_strategy": load_training_strategy_reference(train_config_path),
-            "parameter_count": {
-                "per_depth_model": param_stats,
-                "num_depth_models": len(depth_levels),
-                "total_if_all_depth_models_loaded": {
-                    name: value * len(depth_levels)
-                    for name, value in param_stats.items()
-                },
-            },
+            "parameter_count": parameter_payload,
             "paths": {
                 "output_dir": get_output_dir(
                     PARADIGM_2DTO2D,
-                    "Du_Unet",
+                    model_name,
                     base_dir=args.output_dir,
                     target_var=args.target_var,
                 ),
                 "checkpoint": args.checkpoint,
-                "checkpoint_dir_candidates": _du_unet_checkpoint_dirs(args),
+                "loaded_checkpoint": loaded_checkpoint,
+                "checkpoint_candidates": checkpoint_candidates,
                 "train_config": train_config_path,
             },
         },
-        model_config_path(args.output_dir, "Du_Unet", "test"),
+        model_config_path(
+            args.output_dir,
+            model_name,
+            "test",
+            target_var=config_target_var,
+        ),
     )
 
-    models = _load_du_unet_models(
-        args, device, require_all=bool(args.depth_indices)
-    )
-    pred_list = []
-    for model in models:
+    if is_joint:
         with torch.no_grad():
-            pred_layer = model(
+            pred_full = joint_model(
                 sst, ssh_sss, output_size=sample["target"].shape[-2:]
-            ).cpu().numpy()
-        pred_list.append(pred_layer)
-    y_pred = np.concatenate(pred_list, axis=1)
+            )
+        expected_shape = (
+            1,
+            dataset.num_depths,
+            sample["target"].shape[-2],
+            sample["target"].shape[-1],
+        )
+        if tuple(pred_full.shape) != expected_shape:
+            raise ValueError(
+                "Joint_Du_Unet 输出形状错误，"
+                f"expected={expected_shape}, actual={tuple(pred_full.shape)}"
+            )
+        y_pred = pred_full[:, depth_indices].cpu().numpy()
+    else:
+        models = _load_du_unet_models(
+            args, device, require_all=bool(args.depth_indices)
+        )
+        pred_list = []
+        for model in models:
+            with torch.no_grad():
+                pred_layer = model(
+                    sst, ssh_sss, output_size=sample["target"].shape[-2:]
+                ).cpu().numpy()
+            pred_list.append(pred_layer)
+        y_pred = np.concatenate(pred_list, axis=1)
 
     y_true = sample["target"][depth_indices].unsqueeze(0).numpy()
     target_mask = sample["target_mask"][depth_indices].unsqueeze(0).numpy()
@@ -446,7 +513,7 @@ def _metric_units(is_2dto3d):
 def _target_var_for_outputs(args, is_2dto3d):
     if is_2dto3d:
         return None
-    if getattr(args, "method", None) == "Du_Unet":
+    if getattr(args, "method", None) in {"Du_Unet", "Joint_Du_Unet"}:
         return getattr(args, "target_var", None)
     return None
 
@@ -499,6 +566,70 @@ def _load_du_unet_models(args, device, require_all):
         model.eval()
         models.append(model)
     return models
+
+
+def _joint_du_unet_checkpoint_candidates(args, num_depths):
+    if args.checkpoint:
+        return [args.checkpoint]
+
+    default_method_dir = get_checkpoint_dir(
+        PARADIGM_2DTO2D,
+        "Joint_Du_Unet",
+        base_dir=CHECKPOINTS_ROOT,
+    )
+    base_dir = args.checkpoint_dir or default_method_dir
+    method_dir = get_checkpoint_dir(
+        PARADIGM_2DTO2D,
+        "Joint_Du_Unet",
+        base_dir=base_dir,
+    )
+    directories = [
+        os.path.join(base_dir, args.target_var),
+        base_dir,
+        os.path.join(method_dir, args.target_var),
+        method_dir,
+    ]
+    if os.path.basename(os.path.normpath(base_dir)) == args.target_var:
+        directories.insert(0, base_dir)
+
+    ckpt_name = JOINT_DU_UNET_CKPT_NAME_TEMPLATE.format(
+        target_var=args.target_var,
+        num_depths=num_depths,
+    )
+    candidates = []
+    for directory in directories:
+        path = os.path.join(directory, ckpt_name)
+        if path not in candidates:
+            candidates.append(path)
+    return candidates
+
+
+def _load_joint_du_unet_model(args, device, num_depths):
+    """Load the single B1 all-depth checkpoint; random fallback is forbidden."""
+    from train import build_model
+
+    candidates = _joint_du_unet_checkpoint_candidates(args, num_depths)
+    ckpt_path = next(
+        (path for path in candidates if os.path.isfile(path)),
+        None,
+    )
+    if ckpt_path is None:
+        raise FileNotFoundError(
+            "缺少 Joint_Du_Unet checkpoint；已查找："
+            + ", ".join(candidates)
+        )
+
+    model = build_model("joint_du_unet", num_depths=num_depths).to(device)
+    state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Joint_Du_Unet checkpoint 与当前 {num_depths} 层 profile 不兼容: "
+            f"{ckpt_path}"
+        ) from exc
+    model.eval()
+    return model, ckpt_path
 
 
 def _apply_mask(array, mask):
@@ -588,7 +719,7 @@ def _plot_period_metrics(
 
 
 def evaluate_2dto2d_period(args, out_dir):
-    """在日期闭区间上评估 Du_Unet 的整体、逐深度和逐日指标。"""
+    """Evaluate B0 layer-wise or B1 joint-depth predictions over a period."""
     from datasets.dataset_2dto2d import Dataset2Dto2D
     from train import build_model
 
@@ -629,15 +760,59 @@ def evaluate_2dto2d_period(args, out_dir):
     )
 
     device = _get_device()
-    param_stats = count_model_parameters(build_model("du_unet", out_channels=1))
-    train_config_path = model_config_path(args.output_dir, "Du_Unet", "train")
+    is_joint = args.method == "Joint_Du_Unet"
+    model_name = "Joint_Du_Unet" if is_joint else "Du_Unet"
+    config_target_var = args.target_var if is_joint else None
+    train_config_path = model_config_path(
+        args.output_dir,
+        model_name,
+        "train",
+        target_var=config_target_var,
+    )
+
+    joint_model = None
+    loaded_checkpoint = None
+    models = None
+    if is_joint:
+        joint_model, loaded_checkpoint = _load_joint_du_unet_model(
+            args,
+            device,
+            dataset.num_depths,
+        )
+        parameter_payload = count_model_parameters(joint_model)
+        checkpoint_candidates = _joint_du_unet_checkpoint_candidates(
+            args,
+            dataset.num_depths,
+        )
+        model_config = {
+            "backbone": "Du_Unet",
+            "out_channels": dataset.num_depths,
+            "joint_depth_output": True,
+            "attention": False,
+            "transformer": False,
+        }
+    else:
+        param_stats = count_model_parameters(build_model("du_unet", out_channels=1))
+        parameter_payload = {
+            "per_depth_model": param_stats,
+            "num_depth_models": len(depth_levels),
+            "total_if_all_depth_models_loaded": {
+                name: value * len(depth_levels)
+                for name, value in param_stats.items()
+            },
+        }
+        checkpoint_candidates = _du_unet_checkpoint_dirs(args)
+        model_config = {"out_channels": 1}
+        models = _load_du_unet_models(args, device, require_all=True)
+
     print_and_save_run_config(
-        "Du_Unet 时间段测试超参数",
+        f"{model_name} 时间段测试超参数",
         {
             "stage": "test",
             "mode": "period",
             "single": False,
-            "model": "Du_Unet",
+            "experiment": "B1_joint_output_baseline" if is_joint else "B0",
+            "model": model_name,
             "method": args.method,
             "paradigm": PARADIGM_2DTO2D,
             "target_var": args.target_var,
@@ -659,28 +834,24 @@ def evaluate_2dto2d_period(args, out_dir):
                 "depth_indices": depth_indices,
                 "depth_m": depth_levels,
             },
-            "model_config": {
-                "out_channels": 1,
-            },
+            "model_config": model_config,
             "training_strategy": load_training_strategy_reference(train_config_path),
-            "parameter_count": {
-                "per_depth_model": param_stats,
-                "num_depth_models": len(depth_levels),
-                "total_if_all_depth_models_loaded": {
-                    name: value * len(depth_levels)
-                    for name, value in param_stats.items()
-                },
-            },
+            "parameter_count": parameter_payload,
             "paths": {
                 "output_dir": out_dir,
                 "checkpoint": args.checkpoint,
-                "checkpoint_dir_candidates": _du_unet_checkpoint_dirs(args),
+                "loaded_checkpoint": loaded_checkpoint,
+                "checkpoint_candidates": checkpoint_candidates,
                 "train_config": train_config_path,
             },
         },
-        model_config_path(args.output_dir, "Du_Unet", "test"),
+        model_config_path(
+            args.output_dir,
+            model_name,
+            "test",
+            target_var=config_target_var,
+        ),
     )
-    models = _load_du_unet_models(args, device, require_all=True)
     norm_stats = dataset.get_norm_stats()
     target_norm = _target_normalizer_for_depth_indices(norm_stats, depth_indices)
 
@@ -694,10 +865,28 @@ def evaluate_2dto2d_period(args, out_dir):
             sst = batch["sst"].to(device)
             ssh_sss = batch["ssh_sss"].to(device)
             target_shape = batch["target"].shape[-2:]
-            pred_norm = torch.cat(
-                [model(sst, ssh_sss, output_size=target_shape) for model in models],
-                dim=1,
-            ).cpu().numpy()
+            if is_joint:
+                pred_full = joint_model(sst, ssh_sss, output_size=target_shape)
+                expected_shape = (
+                    batch["target"].shape[0],
+                    dataset.num_depths,
+                    target_shape[0],
+                    target_shape[1],
+                )
+                if tuple(pred_full.shape) != expected_shape:
+                    raise ValueError(
+                        "Joint_Du_Unet 输出形状错误，"
+                        f"expected={expected_shape}, actual={tuple(pred_full.shape)}"
+                    )
+                pred_norm = pred_full[:, depth_indices].cpu().numpy()
+            else:
+                pred_norm = torch.cat(
+                    [
+                        model(sst, ssh_sss, output_size=target_shape)
+                        for model in models
+                    ],
+                    dim=1,
+                ).cpu().numpy()
             true_norm = batch["target"][:, depth_indices].numpy()
             target_mask = batch["target_mask"][:, depth_indices].numpy()
 
@@ -772,7 +961,7 @@ def evaluate_2dto2d_period(args, out_dir):
 
     depth_records = _grouped_metrics_to_records(
         depth_metrics,
-        list(range(len(depth_levels))),
+        depth_indices,
         "depth_index",
         extra_values={"depth_m": depth_levels},
     )
@@ -987,15 +1176,23 @@ def parse_args():
         "--eval-batch-size",
         type=int,
         default=4,
-        help="时间段评估推理 batch size，仅 Du_Unet 使用",
+        help="时间段评估推理 batch size，Du_Unet/Joint_Du_Unet 使用",
     )
-    p.add_argument("--target-level", type=int, default=INFER_DEFAULT_TARGET_LEVEL,
-                   help="可视化目标深度层索引")
+    p.add_argument(
+        "--target-level",
+        type=int,
+        default=INFER_DEFAULT_TARGET_LEVEL,
+        help="可视化深度在当前评估序列中的索引；使用--depth-indices时为切片后局部索引",
+    )
     p.add_argument("--output-dir", default=OUTPUTS_ROOT)
 
     g_dl = p.add_argument_group("DL 方法参数")
     g_dl.add_argument("--checkpoint", default=None, help="模型权重路径")
-    g_dl.add_argument("--checkpoint-dir", default=None, help="2dto2d 多模型权重目录")
+    g_dl.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="2dto2d 权重目录；Joint_Du_Unet 推荐直接传 --checkpoint",
+    )
     g_dl.add_argument("--data-dir", default=DATA_DIR)
     g_dl.add_argument(
         "--dataset-profile",
@@ -1006,7 +1203,7 @@ def parse_args():
     g_dl.add_argument(
         "--lazy-data",
         action="store_true",
-        help="Du_Unet 按样本延迟清洗/归一化；glorys12v1_all_size 会自动启用",
+        help="2dto2d模型按样本延迟清洗/归一化；glorys12v1_all_size会自动启用",
     )
     g_dl.add_argument(
         "--normalization-chunk-size",
@@ -1025,7 +1222,7 @@ def parse_args():
         help="忽略已有统计文件并用训练时段重新拟合后覆盖",
     )
     g_dl.add_argument("--target-var", choices=["temperature", "salinity"], default="temperature",
-                      help="Du_Unet 预测目标变量")
+                      help="Du_Unet/Joint_Du_Unet 预测目标变量")
     g_dl.add_argument("--start-date", default=DATA_START_DATE,
                       help="Du_Unet 使用的数据起始日期 YYYY-MM-DD")
     g_dl.add_argument("--end-date", default=None,
@@ -1033,12 +1230,12 @@ def parse_args():
     g_dl.add_argument(
         "--depth-indices",
         default=None,
-        help="Du_Unet 仅测试指定深度索引，逗号分隔；默认测试当前 profile 全部深度",
+        help="仅评估指定深度索引；Joint_Du_Unet仍先完整输出全部深度",
     )
     g_dl.add_argument("--dummy", action="store_true",
                       help="使用合成数据 (2dto3d)")
     g_dl.add_argument("--quality-report", action="store_true",
-                      help="Du_Unet 加载数据时生成缺失率质检图")
+                      help="2dto2d模型加载数据时生成缺失率质检图")
 
     g_ndl = p.add_argument_group("Non-DL 方法参数")
     g_ndl.add_argument("--sla-sss-path", default=None)
@@ -1060,14 +1257,19 @@ def main():
     method = args.method.strip().lower()
     if method == "du-unet":
         method = "du_unet"
+    if method in {"joint-du-unet", "joint_unet", "joint-unet"}:
+        method = "joint_du_unet"
     if method not in ALL_METHODS:
         raise ValueError(f"未知方法: {args.method}")
-    args.method = "Du_Unet" if method == "du_unet" else method
+    args.method = {
+        "du_unet": "Du_Unet",
+        "joint_du_unet": "Joint_Du_Unet",
+    }.get(method, method)
     if method in PARADIGM_2DTO2D_METHODS:
         paradigm = PARADIGM_2DTO2D
     else:
         paradigm = PARADIGM_2DTO3D
-    if method == "du_unet":
+    if method in {"du_unet", "joint_du_unet"}:
         out_dir = get_output_dir(
             paradigm, args.method, base_dir=args.output_dir, target_var=args.target_var
         )
@@ -1076,8 +1278,10 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     if args.eval_start:
-        if method != "du_unet":
-            raise ValueError("时间段整体评估目前仅支持 Du_Unet")
+        if method not in {"du_unet", "joint_du_unet"}:
+            raise ValueError(
+                "时间段整体评估目前仅支持 Du_Unet 和 Joint_Du_Unet"
+            )
         print("=" * 60)
         print(
             f"时间段评估：paradigm={paradigm}, method={args.method}, "

@@ -20,3 +20,4 @@ data/*
 reports/
 scripts/*
 !scripts/upload_nc_to_autodl_fs.sh
+!scripts/upload_code_to_autodl.sh

@@ -1,12 +1,12 @@
 # Ocean Subsurface Recon
 
-本项目用海表场重建水下多深度温度或盐度结构，当前包含 `Du_Unet`、`HVCARefiner`、`ocean_transformer`、`2dvar` 和 `modas` 五类方法。
+本项目用海表场重建水下多深度温度或盐度结构，当前包含 `Du_Unet`、`Joint_Du_Unet`、`HVCARefiner`、`ocean_transformer`、`2dvar` 和 `modas`。
 
 ## 总览
 
 ### 建模范式
 
-- `2dto2d`：逐变量、逐深度建模。当前主模型是 `Du_Unet`，二阶段修正模型是 `HVCARefiner`。
+- `2dto2d`：使用二维卷积处理海表场。`Du_Unet` 为逐深度B0，`Joint_Du_Unet` 为一次输出全部深度的B1，`HVCARefiner` 为B0旁支的二阶段修正模型。
 - `2dto3d`：单次输出多个深度。当前包括 `ocean_transformer`、`2dvar`、`modas`。
 
 ### 目录规则
@@ -15,6 +15,8 @@
 - checkpoint 根目录：`checkpoints/{paradigm}/{method}/`
 - Du_Unet 输出：`outputs/2dto2d/Du_Unet/{temperature|salinity}/`
 - Du_Unet 权重：`checkpoints/2dto2d/Du_Unet/{temperature|salinity}/`
+- Joint_Du_Unet 输出：`outputs/2dto2d/Joint_Du_Unet/{temperature|salinity}/`
+- Joint_Du_Unet 权重：`checkpoints/2dto2d/Joint_Du_Unet/{temperature|salinity}/`
 - HVCARefiner 输出与权重：`outputs/2dto2d/HVCARefiner/`
 - OceanTransformer 输出：`outputs/2dto3d/ocean_transformer/`
 - 2DVar 输出：`outputs/2dto3d/2dvar/`
@@ -22,10 +24,12 @@
 
 ### 运行日志和配置快照
 
-Du_Unet 和 HVCARefiner 的 train/test 入口会在运行前打印最终超参数，并保存 JSON 配置快照：
+Du_Unet、Joint_Du_Unet 和 HVCARefiner 的 train/test 入口会在运行前打印最终超参数，并保存 JSON 配置快照：
 
 - `outputs/2dto2d/Du_Unet/Du_Unet_train_config.json`
 - `outputs/2dto2d/Du_Unet/Du_Unet_test_config.json`
+- `outputs/2dto2d/Joint_Du_Unet/{target_var}/Joint_Du_Unet_train_config.json`
+- `outputs/2dto2d/Joint_Du_Unet/{target_var}/Joint_Du_Unet_test_config.json`
 - HVCARefiner 训练配置：`<train --save-dir>/HVCARefiner_train_config.json`
 - HVCARefiner 测试配置：`<test --save-dir>/HVCARefiner_test_config.json`
 
@@ -171,6 +175,166 @@ python test.py --method Du_Unet --target-var temperature \
 | `summary_Du_Unet_{target_var}_{YYYYMMDD}_{YYYYMMDD}.json` | 时间段汇总指标。 |
 | `metrics_by_depth_Du_Unet_{target_var}_{YYYYMMDD}_{YYYYMMDD}.png` | 逐深度指标曲线。 |
 | `metrics_by_day_Du_Unet_{target_var}_{YYYYMMDD}_{YYYYMMDD}.png` | 逐日指标曲线。 |
+
+## B1：Joint_Du_Unet 联合输出基线
+
+`Joint_Du_Unet` 保留B0完全相同的SST高分辨率分支、SSH/SSS低分辨率分支以及普通卷积U-Net骨干，只把最终输出从单层改为当前profile的全部深度层。模型不含注意力、Transformer、深度嵌入或垂向后处理。
+
+- `legacy_small`：一次输出25层。
+- `glorys12v1_all_size`：一次输出28层。
+- 每个目标变量只训练一个模型。
+- 训练损失为各深度masked RMSE的等权平均。
+- B1训练禁止使用`--depth-indices`，保证始终联合学习全部深度。
+
+### 上传代码到GitHub和服务器
+
+本地B1工作目录及分支：
+
+```text
+/Users/lijunjie/Documents/python/ocean-subsurface-recon-b1
+B1
+```
+
+本地提交并推送：
+
+```bash
+cd /Users/lijunjie/Documents/python/ocean-subsurface-recon-b1
+git status
+git add -A
+git status --short
+git commit -m "feat: add B1 joint-depth U-Net baseline"
+git push -u origin B1
+```
+
+如果不使用GitHub，可以直接把当前本地代码同步到AutoDL：
+
+```bash
+cd /Users/lijunjie/Documents/python/ocean-subsurface-recon-b1
+./scripts/upload_code_to_autodl.sh
+```
+
+默认上传到`/root/autodl-tmp/ocean-subsurface-recon-b1`。指定其他服务器目录：
+
+```bash
+./scripts/upload_code_to_autodl.sh /root/autodl-tmp/my-ocean-b1
+```
+
+该脚本会上传当前工作区，包括尚未提交的代码修改；它会排除`.git`、`data/`、`checkpoints/`、`outputs/`和Python缓存，不会删除服务器上已有文件。服务器地址、端口变化时可通过`SERVER_HOST`、`SERVER_PORT`和`SERVER_USER`覆盖默认值。
+
+服务器首次下载到独立目录：
+
+```bash
+git clone --branch B1 --single-branch \
+  git@github.com:ljj030711-ux/ocean-subsurface-recon.git \
+  /root/ocean-subsurface-recon-b1
+cd /root/ocean-subsurface-recon-b1
+python -m pip install -r requirements.txt
+python -m pip install pytest
+python -m pytest -q
+```
+
+执行安装前应先激活服务器上用于本项目的Python/Conda环境。上述SSH地址要求服务器已经配置GitHub SSH key；否则可改用`https://github.com/ljj030711-ux/ocean-subsurface-recon.git`。
+
+服务器已经下载过时更新：
+
+```bash
+cd /root/ocean-subsurface-recon-b1
+git pull --ff-only origin B1
+```
+
+代码仓库不包含大型数据。`--data-dir`所指目录需要直接包含当前profile要求的`.npy`文件；不能指向存放原始NetCDF的`nc/`子目录。GLORYS12V1温度实验需要：
+
+```text
+SST_2002-01-01_2023-12-31_0_24_105_121.npy
+SSH_2002-01-01_2023-12-31_0_24_105_121.npy
+SSS_2002-01-01_2023-12-31_0_24_105_121.npy
+T-FIELD_2002-01-01_2023-12-31_0_24_105_121_0-300.npy
+```
+
+### train：一次联合训练全部深度
+
+下面以服务器上的GLORYS12V1 28层温度实验为例。请根据服务器实际位置替换`/root/autodl-fs/raw_all_size`和运行产物根目录。全分辨率训练建议从batch size 1开始，确认显存余量后再增加。
+
+```bash
+cd /root/ocean-subsurface-recon-b1
+python -u train.py \
+  --method joint_du_unet \
+  --target-var temperature \
+  --dataset-profile glorys12v1_all_size \
+  --data-dir /root/autodl-fs/raw_all_size \
+  --start-date 2002-01-01 \
+  --end-date 2023-12-31 \
+  --output-dir /root/autodl-tmp/ocean-subsurface-recon-b1-runs/outputs \
+  --checkpoint-dir /root/autodl-tmp/ocean-subsurface-recon-b1-runs/checkpoints \
+  --epochs 20 \
+  --batch-size 1 \
+  --lr 1e-3 \
+  --patience 10 \
+  --lazy-data \
+  --normalization-chunk-size 8 \
+  --num-workers 4 \
+  --prefetch-factor 2 \
+  --pin-memory \
+  --persistent-workers \
+  --seed 42
+```
+
+训练输出：
+
+```text
+/root/autodl-tmp/ocean-subsurface-recon-b1-runs/
+├── checkpoints/2dto2d/Joint_Du_Unet/temperature/
+│   └── Joint_Du_Unet_temperature_28depths_best.pth
+└── outputs/2dto2d/Joint_Du_Unet/temperature/
+    ├── Joint_Du_Unet_train_config.json
+    ├── training_history_Joint_Du_Unet_temperature_28depths.npz
+    └── loss_Joint_Du_Unet_temperature_28depths.png
+```
+
+首次正式运行会用2002–2021训练期拟合归一化统计量并保存在data目录的`normalization_stats/`中；之后训练和测试应复用同一统计文件，不要在正式测试时使用`--rebuild-normalization-stats`。
+
+### test：单日预测
+
+GLORYS12V1中约50m对应深度索引17（47.37m），索引18为55.76m：
+
+```bash
+cd /root/ocean-subsurface-recon-b1
+python -u test.py \
+  --method joint_du_unet \
+  --target-var temperature \
+  --dataset-profile glorys12v1_all_size \
+  --data-dir /root/autodl-fs/raw_all_size \
+  --start-date 2002-01-01 \
+  --end-date 2023-12-31 \
+  --checkpoint /root/autodl-tmp/ocean-subsurface-recon-b1-runs/checkpoints/2dto2d/Joint_Du_Unet/temperature/Joint_Du_Unet_temperature_28depths_best.pth \
+  --output-dir /root/autodl-tmp/ocean-subsurface-recon-b1-runs/outputs \
+  --select-day 2023-06-15 \
+  --target-level 17 \
+  --lazy-data \
+  --normalization-chunk-size 8
+```
+
+### test/eval：2023年时间段评估
+
+```bash
+cd /root/ocean-subsurface-recon-b1
+python -u test.py \
+  --method joint_du_unet \
+  --target-var temperature \
+  --dataset-profile glorys12v1_all_size \
+  --data-dir /root/autodl-fs/raw_all_size \
+  --start-date 2002-01-01 \
+  --end-date 2023-12-31 \
+  --checkpoint /root/autodl-tmp/ocean-subsurface-recon-b1-runs/checkpoints/2dto2d/Joint_Du_Unet/temperature/Joint_Du_Unet_temperature_28depths_best.pth \
+  --output-dir /root/autodl-tmp/ocean-subsurface-recon-b1-runs/outputs \
+  --eval-start 2023-01-01 \
+  --eval-end 2023-12-31 \
+  --eval-batch-size 1 \
+  --lazy-data \
+  --normalization-chunk-size 8
+```
+
+时间段评估会输出overall、逐深度和逐日的MAE、RMSE、R²和相关系数，以及对应曲线和JSON汇总。测试时模型始终先输出全部28层；如传`--depth-indices`，只会在完整前向后选择部分深度计算指标。
 
 ## HVCARefiner
 
@@ -458,7 +622,7 @@ python test.py --method modas \
 ## 指标口径
 
 - 深度学习模型会在评估前反标准化回原始物理单位。
-- Du_Unet 和 HVCARefiner 的指标会排除 `target_mask=0` 的无效区域。
+- Du_Unet、Joint_Du_Unet 和 HVCARefiner 的指标会排除 `target_mask=0` 的无效区域。
 - 时间段评估包含 overall、by-depth、by-day 三类统计。
 - overall RMSE 是所有有效点平方误差总体均值开方，不是每日 RMSE 的平均。
 
@@ -466,5 +630,6 @@ python test.py --method modas \
 
 - 路径和日期：`config.py` 中的 `DATA_DIR`、`OUTPUTS_ROOT`、`CHECKPOINTS_ROOT`、`DATA_START_DATE`、`TEST_START_DATE`。
 - Du_Unet 超参数：`DU_UNET_*`。
+- Joint_Du_Unet 沿用 `DU_UNET_*` 优化设置，并动态读取当前profile的深度数。
 - OceanTransformer 超参数：`TWODTO3D_*`。
 - 深度列表：`DEPTH_LEVELS_25M`、`DEPTH_LEVELS_26M`。
