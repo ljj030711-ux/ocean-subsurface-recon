@@ -334,12 +334,14 @@ class Dataset2Dto2D(Dataset):
             return self.sst
         return _LazySSTCelsiusView(self.sst)
 
-    def _prepare_lazy_sample(self, idx, depth_idx=None):
+    def _prepare_lazy_sample(self, idx, depth_indices=None):
         month = np.asarray([self.months[idx]], dtype=np.int64)
         sst = apply_sst_unit_conversion(self.sst[idx], self.sst_unit_conversion)
         ssh = np.asarray(self.ssh[idx], dtype=np.float32)
         sss = np.asarray(self.sss[idx], dtype=np.float32)
-        target_selector = slice(None) if depth_idx is None else slice(depth_idx, depth_idx + 1)
+        target_selector = (
+            slice(None) if depth_indices is None else list(depth_indices)
+        )
         target = np.asarray(self.target[idx, target_selector], dtype=np.float32)
         target_mask = np.isfinite(target).astype(np.float32)
 
@@ -347,7 +349,7 @@ class Dataset2Dto2D(Dataset):
             sst = self._sst_norm.transform(sst[np.newaxis, ...], month)[0]
             ssh = self._ssh_norm.transform(ssh[np.newaxis, ...], month)[0]
             sss = self._sss_norm.transform(sss[np.newaxis, ...], month)[0]
-            if depth_idx is None:
+            if depth_indices is None:
                 target = self._target_norm.transform(target[np.newaxis, ...], month)[0]
             else:
                 climatology = self._target_norm.climatology[
@@ -382,17 +384,27 @@ class Dataset2Dto2D(Dataset):
 
     def get_depth_item(self, idx, depth_idx):
         """读取单个深度目标，避免逐层训练时处理完整三维 target。"""
-        if depth_idx < 0 or depth_idx >= self.num_depths:
-            raise IndexError(f"depth_idx 越界: {depth_idx}")
+        return self.get_depth_indices_item(idx, [depth_idx])
+
+    def get_depth_indices_item(self, idx, depth_indices):
+        """按给定原始层号和顺序读取一个或多个目标深度。"""
+        indices = [int(depth_idx) for depth_idx in depth_indices]
+        if not indices:
+            raise ValueError("depth_indices 不能为空")
+        if len(set(indices)) != len(indices):
+            raise ValueError(f"depth_indices 不能重复: {indices}")
+        for depth_idx in indices:
+            if depth_idx < 0 or depth_idx >= self.num_depths:
+                raise IndexError(f"depth_idx 越界: {depth_idx}")
         if self.lazy:
-            sample = self._prepare_lazy_sample(idx, depth_idx=depth_idx)
+            sample = self._prepare_lazy_sample(idx, depth_indices=indices)
         else:
             sample = (
                 self.sst[idx],
                 self.ssh[idx],
                 self.sss[idx],
-                self.target[idx, depth_idx : depth_idx + 1],
-                self.target_mask[idx, depth_idx : depth_idx + 1],
+                self.target[idx, indices],
+                self.target_mask[idx, indices],
             )
         return self._to_tensor_sample(*sample)
 

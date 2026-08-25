@@ -57,6 +57,7 @@ from config import (
     get_2dto2d_depth_levels,
     get_checkpoint_dir,
     get_output_dir,
+    joint_du_unet_depth_tag,
 )
 from datasets.dataset_2dto2d import Dataset2Dto2D
 from datasets.dataset_2dto3d import DummyTwoDto3DDataset
@@ -87,6 +88,20 @@ class DepthTargetDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.dataset.get_depth_item(idx, self.depth_idx)
+
+
+class DepthIndicesTargetDataset(Dataset):
+    """Expose an ordered target-depth subset for one joint-output model."""
+
+    def __init__(self, dataset, depth_indices):
+        self.dataset = dataset
+        self.depth_indices = tuple(int(idx) for idx in depth_indices)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        return self.dataset.get_depth_indices_item(idx, self.depth_indices)
 
 
 def use_lazy_2dto2d_data(args):
@@ -306,6 +321,7 @@ def train_one_model(
     depth_idx=None,
     criterion=None,
     equal_depth_weighting=False,
+    checkpoint_metadata=None,
 ):
     best_val = float("inf")
     patience_cnt = 0
@@ -340,7 +356,17 @@ def train_one_model(
 
         if v_loss < best_val:
             best_val = v_loss
-            torch.save(model.state_dict(), checkpoint_path)
+            if checkpoint_metadata is None:
+                checkpoint_payload = model.state_dict()
+            else:
+                checkpoint_payload = {
+                    "format_version": 1,
+                    "state_dict": model.state_dict(),
+                    "metadata": dict(checkpoint_metadata),
+                    "best_epoch": int(epoch + 1),
+                    "best_val_loss": float(v_loss),
+                }
+            torch.save(checkpoint_payload, checkpoint_path)
             patience_cnt = 0
             print(f"  -> 保存最佳模型 (val={v_loss:.6f})")
         else:
@@ -358,10 +384,17 @@ def parse_depth_indices(depth_indices_arg, depth_levels):
         return list(range(len(depth_levels)))
     out = []
     for item in depth_indices_arg.split(","):
-        idx = int(item.strip())
+        text = item.strip()
+        if not text:
+            raise ValueError("--depth-indices 不能包含空项")
+        idx = int(text)
         if idx < 0 or idx >= len(depth_levels):
             raise ValueError(f"depth index 越界: {idx}")
+        if idx in out:
+            raise ValueError(f"depth index 重复: {idx}")
         out.append(idx)
+    if not out:
+        raise ValueError("--depth-indices 不能为空")
     return out
 
 
@@ -448,7 +481,10 @@ def parse_args():
     parser.add_argument(
         "--depth-indices",
         default=None,
-        help="仅Du_Unet可用；Joint_Du_Unet必须训练全部深度",
+        help=(
+            "原始数据中的目标深度索引；Du_Unet逐层训练，"
+            "Joint_Du_Unet用一个模型联合输出这些层；默认使用全部深度"
+        ),
     )
     return parser.parse_args()
 
@@ -468,10 +504,6 @@ def main():
         method = "joint_du_unet"
     if method not in TRAINABLE_METHODS:
         raise ValueError(f"未识别的方法: {args.method}")
-    if method == "joint_du_unet" and args.depth_indices:
-        raise ValueError(
-            "B1 Joint_Du_Unet 必须联合训练全部深度，不能传 --depth-indices"
-        )
     paradigm = paradigm_of_method(method)
     method_dir = {
         "du_unet": "Du_Unet",
@@ -752,20 +784,26 @@ def main():
         batch_size = args.batch_size or DU_UNET_BATCH_SIZE
         lr = args.lr or DU_UNET_LR
         patience = args.patience or DU_UNET_PATIENCE
-        num_depths = dataset.num_depths
-        model = build_model("joint_du_unet", num_depths=num_depths).to(device)
+        depth_indices = parse_depth_indices(args.depth_indices, depth_levels)
+        selected_depth_levels = [depth_levels[idx] for idx in depth_indices]
+        num_outputs = len(depth_indices)
+        depth_tag = joint_du_unet_depth_tag(
+            depth_indices, total_num_depths=dataset.num_depths
+        )
+        joint_dataset = DepthIndicesTargetDataset(dataset, depth_indices)
+        model = build_model("joint_du_unet", num_depths=num_outputs).to(device)
         param_stats = count_model_parameters(model)
         scheduler_step_size = max(epochs // 3, 1)
         loader_kwargs = dataloader_kwargs(args, device)
 
         train_loader = DataLoader(
-            Subset(dataset, train_idx),
+            Subset(joint_dataset, train_idx),
             batch_size=batch_size,
             shuffle=True,
             **loader_kwargs,
         )
         val_loader = DataLoader(
-            Subset(dataset, val_idx),
+            Subset(joint_dataset, val_idx),
             batch_size=batch_size,
             shuffle=False,
             **loader_kwargs,
@@ -779,16 +817,16 @@ def main():
 
         ckpt_name = JOINT_DU_UNET_CKPT_NAME_TEMPLATE.format(
             target_var=args.target_var,
-            num_depths=num_depths,
+            depth_tag=depth_tag,
         )
         ckpt_path = os.path.join(ckpt_dir, ckpt_name)
         history_name = JOINT_DU_UNET_HISTORY_NAME_TEMPLATE.format(
             target_var=args.target_var,
-            num_depths=num_depths,
+            depth_tag=depth_tag,
         )
         curve_name = JOINT_DU_UNET_LOSS_CURVE_TEMPLATE.format(
             target_var=args.target_var,
-            num_depths=num_depths,
+            depth_tag=depth_tag,
         )
         training_strategy = {
             "experiment": "B1_joint_output_baseline",
@@ -823,6 +861,7 @@ def main():
             "Joint_Du_Unet",
             "train",
             target_var=args.target_var,
+            run_tag=depth_tag,
         )
         print_and_save_run_config(
             "B1 Joint_Du_Unet 训练超参数",
@@ -858,7 +897,8 @@ def main():
                     "persistent_workers": (
                         args.persistent_workers if args.num_workers > 0 else False
                     ),
-                    "target_loading": "all_depths_jointly",
+                    "dataset_num_depths": dataset.num_depths,
+                    "target_loading": "selected_depths_jointly",
                     "max_samples": args.max_samples,
                 },
                 "hyperparameters": {
@@ -868,14 +908,15 @@ def main():
                     "learning_rate": lr,
                     "weight_decay": DU_UNET_WEIGHT_DECAY,
                     "patience": patience,
-                    "depth_indices": list(range(num_depths)),
-                    "depth_m": depth_levels,
+                    "depth_indices": depth_indices,
+                    "depth_m": selected_depth_levels,
                 },
                 "training_strategy": training_strategy,
                 "model_config": {
                     "backbone": "Du_Unet",
-                    "out_channels": num_depths,
+                    "out_channels": num_outputs,
                     "joint_depth_output": True,
+                    "source_depth_indices": depth_indices,
                     "attention": False,
                     "transformer": False,
                 },
@@ -909,12 +950,31 @@ def main():
             ckpt_path,
             depth_idx=None,
             equal_depth_weighting=True,
+            checkpoint_metadata={
+                "checkpoint_type": "Joint_Du_Unet",
+                "target_var": args.target_var,
+                "dataset_profile": args.dataset_profile,
+                "dataset_num_depths": dataset.num_depths,
+                "normalize": not args.no_normalize,
+                "depth_indices": depth_indices,
+                "depth_m": selected_depth_levels,
+                "num_outputs": num_outputs,
+                "depth_tag": depth_tag,
+                "normalization_stats": dataset.get_normalization_reference(),
+                "model_config": {
+                    "backbone": "Du_Unet",
+                    "out_channels": num_outputs,
+                    "attention": False,
+                    "transformer": False,
+                },
+            },
         )
         np.savez(
             os.path.join(out_dir, history_name),
             train_losses=np.asarray(train_losses, dtype=np.float32),
             val_losses=np.asarray(val_losses, dtype=np.float32),
-            depth_m=np.asarray(depth_levels, dtype=np.float32),
+            depth_indices=np.asarray(depth_indices, dtype=np.int64),
+            depth_m=np.asarray(selected_depth_levels, dtype=np.float32),
         )
         save_loss_curve(
             train_losses,

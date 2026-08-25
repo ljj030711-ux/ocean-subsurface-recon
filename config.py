@@ -168,16 +168,36 @@ DU_UNET_CKPT_NAME_TEMPLATE = "Du_Unet_{target_var}_depth{depth_m}m_best.pth"
 DU_UNET_HISTORY_NAME_TEMPLATE = "training_history_Du_Unet_{target_var}_depth{depth_m}m.npz"
 DU_UNET_LOSS_CURVE_TEMPLATE = "loss_Du_Unet_{target_var}_depth{depth_m}m.png"
 
-# B1：与 Du_Unet 使用相同输入和卷积骨干，但一个模型联合输出全部深度。
+# B1：与 Du_Unet 使用相同输入和卷积骨干，但一个模型联合输出所选深度。
 JOINT_DU_UNET_CKPT_NAME_TEMPLATE = (
-    "Joint_Du_Unet_{target_var}_{num_depths}depths_best.pth"
+    "Joint_Du_Unet_{target_var}_{depth_tag}_best.pth"
 )
 JOINT_DU_UNET_HISTORY_NAME_TEMPLATE = (
-    "training_history_Joint_Du_Unet_{target_var}_{num_depths}depths.npz"
+    "training_history_Joint_Du_Unet_{target_var}_{depth_tag}.npz"
 )
 JOINT_DU_UNET_LOSS_CURVE_TEMPLATE = (
-    "loss_Joint_Du_Unet_{target_var}_{num_depths}depths.png"
+    "loss_Joint_Du_Unet_{target_var}_{depth_tag}.png"
 )
+
+
+def joint_du_unet_depth_tag(depth_indices, total_num_depths):
+    """为联合输出的原始深度索引生成不会相互覆盖的文件标签。"""
+    total_num_depths = int(total_num_depths)
+    indices = [int(idx) for idx in depth_indices]
+    if total_num_depths <= 0:
+        raise ValueError("total_num_depths 必须大于 0")
+    if not indices:
+        raise ValueError("depth_indices 不能为空")
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"depth_indices 不能重复: {indices}")
+    if any(idx < 0 or idx >= total_num_depths for idx in indices):
+        raise ValueError(
+            f"depth_indices 越界: {indices}；数据集共 {total_num_depths} 层"
+        )
+    if indices == list(range(total_num_depths)):
+        return f"{total_num_depths}depths"
+    index_text = "-".join(str(idx) for idx in indices)
+    return f"idx{index_text}_{len(indices)}depths"
 
 # ==================== 2dvar（2dto3d） ====================
 

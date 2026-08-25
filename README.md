@@ -6,7 +6,7 @@
 
 ### 建模范式
 
-- `2dto2d`：使用二维卷积处理海表场。`Du_Unet` 为逐深度B0，`Joint_Du_Unet` 为一次输出全部深度的B1，`HVCARefiner` 为B0旁支的二阶段修正模型。
+- `2dto2d`：使用二维卷积处理海表场。`Du_Unet` 为逐深度B0，`Joint_Du_Unet` 为一次联合输出指定深度的B1，`HVCARefiner` 为B0旁支的二阶段修正模型。
 - `2dto3d`：单次输出多个深度。当前包括 `ocean_transformer`、`2dvar`、`modas`。
 
 ### 目录规则
@@ -28,8 +28,8 @@ Du_Unet、Joint_Du_Unet 和 HVCARefiner 的 train/test 入口会在运行前打�
 
 - `outputs/2dto2d/Du_Unet/Du_Unet_train_config.json`
 - `outputs/2dto2d/Du_Unet/Du_Unet_test_config.json`
-- `outputs/2dto2d/Joint_Du_Unet/{target_var}/Joint_Du_Unet_train_config.json`
-- `outputs/2dto2d/Joint_Du_Unet/{target_var}/Joint_Du_Unet_test_config.json`
+- `outputs/2dto2d/Joint_Du_Unet/{target_var}/Joint_Du_Unet_train_config_{depth_tag}.json`
+- `outputs/2dto2d/Joint_Du_Unet/{target_var}/Joint_Du_Unet_test_config_{depth_tag}.json`
 - HVCARefiner 训练配置：`<train --save-dir>/HVCARefiner_train_config.json`
 - HVCARefiner 测试配置：`<test --save-dir>/HVCARefiner_test_config.json`
 
@@ -178,163 +178,147 @@ python test.py --method Du_Unet --target-var temperature \
 
 ## B1：Joint_Du_Unet 联合输出基线
 
-`Joint_Du_Unet` 保留B0完全相同的SST高分辨率分支、SSH/SSS低分辨率分支以及普通卷积U-Net骨干，只把最终输出从单层改为当前profile的全部深度层。模型不含注意力、Transformer、深度嵌入或垂向后处理。
+`Joint_Du_Unet` 保留B0相同的SST高分辨率分支、SSH/SSS低分辨率分支和普通卷积U-Net骨干，只把逐层独立训练改成一个模型联合输出所选深度。模型不含注意力、Transformer、深度嵌入、垂向正则或HVCA。
 
-- `legacy_small`：一次输出25层。
-- `glorys12v1_all_size`：一次输出28层。
-- 每个目标变量只训练一个模型。
-- 训练损失为各深度masked RMSE的等权平均。
-- B1训练禁止使用`--depth-indices`，保证始终联合学习全部深度。
+- `--depth-indices`是原始profile层号，输出通道数自动等于传入层数，不需要手工配置。
+- 不传`--depth-indices`时，自动联合训练当前profile的全部深度。
+- checkpoint保存原始层号及其输出通道顺序；测试会据此校验和映射。
+- 各输出层使用等权masked RMSE，以免有效海洋格点较少的深层被自动降低权重。
+- 与B0公平对照的主实验使用同一组`0,4,9,17,24,27`，而不是28层训练后只测试6层。
 
-### 上传代码到GitHub和服务器
+### 从本地打包、备份并部署到服务器
 
-本地B1工作目录及分支：
-
-```text
-/Users/lijunjie/Documents/python/ocean-subsurface-recon-b1
-B1
-```
-
-本地提交并推送：
+不经过GitHub，运行仓库自带的完整部署脚本：
 
 ```bash
 cd /Users/lijunjie/Documents/python/ocean-subsurface-recon-b1
-git status
-git add -A
-git status --short
-git commit -m "feat: add B1 joint-depth U-Net baseline"
-git push -u origin B1
+./scripts/deploy_upload.sh
 ```
 
-如果不使用GitHub，可以直接把当前本地代码同步到AutoDL：
+脚本会把当前B1代码打成一个新的`.tar.gz`压缩包，上传到服务器，并先解压到临时目录校验。校验通过后，服务器现有的`/root/ocean-subsurface-recon-b1`会改名为带时间戳的备份目录，新代码再整体切换为正式目录。因此服务器代码与本地压缩包完全一致，本地已删除的旧文件不会残留，也不需要手工清理`tests/`。
+
+默认服务器参数与原`deploy_upload.sh`一致，可按实际AutoDL实例覆盖：
 
 ```bash
-cd /Users/lijunjie/Documents/python/ocean-subsurface-recon-b1
-./scripts/upload_code_to_autodl.sh
+SERVER_HOST=connect.bjb2.seetacloud.com \
+SERVER_PORT=38916 \
+SERVER_USER=root \
+REMOTE_PARENT_DIR=/root \
+./scripts/deploy_upload.sh
 ```
 
-默认上传到`/root/autodl-tmp/ocean-subsurface-recon-b1`。指定其他服务器目录：
+脚本不会打包`.git`、数据、checkpoint、outputs、logs、cache或密钥文件，所以训练数据和实验结果不会被代码部署覆盖。旧代码备份和本次上传的压缩包都会保留在服务器；解压或校验失败时，当前正式代码目录不会被替换。
 
-```bash
-./scripts/upload_code_to_autodl.sh /root/autodl-tmp/my-ocean-b1
-```
+### 与B0相同6层的联合训练和全年测试
 
-该脚本会上传当前工作区，包括尚未提交的代码修改；它会排除`.git`、`data/`、`checkpoints/`、`outputs/`和Python缓存，不会删除服务器上已有文件。服务器地址、端口变化时可通过`SERVER_HOST`、`SERVER_PORT`和`SERVER_USER`覆盖默认值。
-
-服务器首次下载到独立目录：
-
-```bash
-git clone --branch B1 --single-branch \
-  git@github.com:ljj030711-ux/ocean-subsurface-recon.git \
-  /root/ocean-subsurface-recon-b1
-cd /root/ocean-subsurface-recon-b1
-python -m pip install -r requirements.txt
-python -m pip install pytest
-python -m pytest -q
-```
-
-执行安装前应先激活服务器上用于本项目的Python/Conda环境。上述SSH地址要求服务器已经配置GitHub SSH key；否则可改用`https://github.com/ljj030711-ux/ocean-subsurface-recon.git`。
-
-服务器已经下载过时更新：
+进入同一个tmux shell后先设置路径。数据目录必须直接包含profile要求的四个`.npy`文件，不能指向NetCDF目录。
 
 ```bash
 cd /root/ocean-subsurface-recon-b1
-git pull --ff-only origin B1
+
+DATA=/root/autodl-tmp/raw_all_size/npy
+STATS=/root/autodl-fs/raw_all_size/normalization_stats/glorys12v1_temperature_2002_2021.npz
+B1_ROOT=/root/autodl-tmp/Joint_Du_Unet_all_size
+B1_CKPT="$B1_ROOT/checkpoints"
+B1_OUT="$B1_ROOT/outputs"
+B1_LOG="$B1_ROOT/logs"
+DEPTH_IDX=0,4,9,17,24,27
+MODEL="$B1_CKPT/2dto2d/Joint_Du_Unet/temperature/Joint_Du_Unet_temperature_idx0-4-9-17-24-27_6depths_best.pth"
+
+mkdir -p "$B1_CKPT" "$B1_OUT" "$B1_LOG"
+set -o pipefail
 ```
 
-代码仓库不包含大型数据。`--data-dir`所指目录需要直接包含当前profile要求的`.npy`文件；不能指向存放原始NetCDF的`nc/`子目录。GLORYS12V1温度实验需要：
-
-```text
-SST_2002-01-01_2023-12-31_0_24_105_121.npy
-SSH_2002-01-01_2023-12-31_0_24_105_121.npy
-SSS_2002-01-01_2023-12-31_0_24_105_121.npy
-T-FIELD_2002-01-01_2023-12-31_0_24_105_121_0-300.npy
-```
-
-### train：一次联合训练全部深度
-
-下面以服务器上的GLORYS12V1 28层温度实验为例。请根据服务器实际位置替换`/root/autodl-fs/raw_all_size`和运行产物根目录。全分辨率训练建议从batch size 1开始，确认显存余量后再增加。
+训练一个联合6层模型：
 
 ```bash
-cd /root/ocean-subsurface-recon-b1
 python -u train.py \
-  --method joint_du_unet \
-  --target-var temperature \
+  --method joint_du_unet --target-var temperature \
   --dataset-profile glorys12v1_all_size \
-  --data-dir /root/autodl-fs/raw_all_size \
-  --start-date 2002-01-01 \
-  --end-date 2023-12-31 \
-  --output-dir /root/autodl-tmp/ocean-subsurface-recon-b1-runs/outputs \
-  --checkpoint-dir /root/autodl-tmp/ocean-subsurface-recon-b1-runs/checkpoints \
-  --epochs 20 \
-  --batch-size 1 \
-  --lr 1e-3 \
-  --patience 10 \
-  --lazy-data \
-  --normalization-chunk-size 8 \
-  --num-workers 4 \
-  --prefetch-factor 2 \
-  --pin-memory \
-  --persistent-workers \
-  --seed 42
+  --data-dir "$DATA" --normalization-stats-path "$STATS" \
+  --start-date 2002-01-01 --end-date 2023-12-31 \
+  --depth-indices "$DEPTH_IDX" \
+  --epochs 50 --patience 10 --batch-size 32 --lr 0.001 \
+  --num-workers 4 --prefetch-factor 2 --pin-memory --persistent-workers \
+  --checkpoint-dir "$B1_CKPT" --output-dir "$B1_OUT" --seed 42 \
+  2>&1 | tee -a "$B1_LOG/joint_du_unet_6depths_train.log"
 ```
 
-训练输出：
+训练完成后，权重应位于`$MODEL`。若显存不足，只降低`--batch-size`并在实验记录中注明；其余条件保持与B0一致。
+
+对同一6层执行2023年全年测试：
+
+```bash
+python -u test.py \
+  --method joint_du_unet --target-var temperature \
+  --dataset-profile glorys12v1_all_size \
+  --data-dir "$DATA" --normalization-stats-path "$STATS" \
+  --checkpoint "$MODEL" \
+  --start-date 2002-01-01 --end-date 2023-12-31 \
+  --eval-start 2023-01-01 --eval-end 2023-12-31 \
+  --depth-indices "$DEPTH_IDX" --eval-batch-size 8 \
+  --spatial-panels --target-levels 0,1,2,3,4,5 \
+  --output-dir "$B1_OUT" \
+  2>&1 | tee -a "$B1_LOG/joint_du_unet_6depths_test.log"
+```
+
+`--target-levels` 使用联合输出内部的局部位置，因此六层模型传
+`0,1,2,3,4,5`；它们依次对应原始 GLORYS 层号 `0,4,9,17,24,27`。
+水平图为 `Joint prediction / Truth / Absolute error` 三联图。上面的主实验命令没有传入
+任何 `section` 参数，因此只调用水平可视化，不生成垂向剖面；垂向模块仍然保留。
+不传 `--panel-days` 时，程序会用六层等权的 `structure_score=(SSIM+ACC)/2`，
+自动选择最接近 P10、P50、P90 的困难、典型和较好代表日期。如需人工覆盖，再显式传入
+`--panel-days YYYY-MM-DD,...`。
+
+如后续需要垂向分析，可在同一条全年测试命令中按需追加以下参数之一；当前水平主实验不追加：
+
+```bash
+# 单一剖面：固定中间纬度，画 depth-longitude
+--section-panels --section-axis lat --section-index middle --section-width 1
+
+# 多剖面：两个方向均在 10/25/50/75/90% 位置绘制
+--multi-section-panels --section-percentiles 10,25,50,75,90 --section-width 1
+```
+
+`--section-panels` 只绘制 `--section-axis` 指定的一个方向；
+`--multi-section-panels` 才会同时绘制固定纬度的 depth-longitude 和固定经度的
+depth-latitude。两种模式均复用 P10/P50/P90 代表日期，输出
+`Prediction / Truth / Absolute error` 垂向三联图。
+
+Joint时间段评估保留原有pooled `overall/by_depth/by_day` 指标，同时新增
+`day×depth` 的 MAE、RMSE、R²、correlation、SSIM 和 ACC。SSIM与ACC都使用
+2002–2021年训练期月气候态距平：ACC表示冷暖异常的空间相关；SSIM表示局部水平结构相似度。
+论文主要报告建议使用逐深度MAE/RMSE与SSIM/ACC；pooled R²和correlation仅作辅助，
+因为混合多层后可能被垂向温差抬高。
+
+主要产物路径：
 
 ```text
-/root/autodl-tmp/ocean-subsurface-recon-b1-runs/
+/root/autodl-tmp/Joint_Du_Unet_all_size/
 ├── checkpoints/2dto2d/Joint_Du_Unet/temperature/
-│   └── Joint_Du_Unet_temperature_28depths_best.pth
-└── outputs/2dto2d/Joint_Du_Unet/temperature/
-    ├── Joint_Du_Unet_train_config.json
-    ├── training_history_Joint_Du_Unet_temperature_28depths.npz
-    └── loss_Joint_Du_Unet_temperature_28depths.png
+│   └── Joint_Du_Unet_temperature_idx0-4-9-17-24-27_6depths_best.pth
+├── outputs/2dto2d/Joint_Du_Unet/temperature/
+│   ├── Joint_Du_Unet_train_config_idx0-4-9-17-24-27_6depths.json
+│   ├── Joint_Du_Unet_test_config_idx0-4-9-17-24-27_6depths.json
+│   ├── training_history_Joint_Du_Unet_temperature_idx0-4-9-17-24-27_6depths.npz
+│   ├── loss_Joint_Du_Unet_temperature_idx0-4-9-17-24-27_6depths.png
+│   ├── evaluation_metrics_Joint_Du_Unet_temperature_20230101_20231231.npz
+│   ├── summary_Joint_Du_Unet_temperature_20230101_20231231.json
+│   ├── metrics_by_depth_Joint_Du_Unet_temperature_20230101_20231231.png
+│   ├── metrics_by_day_Joint_Du_Unet_temperature_20230101_20231231.png
+│   ├── horizontal_structure_by_depth_Joint_Du_Unet_temperature_20230101_20231231.png
+│   ├── horizontal_structure_by_day_Joint_Du_Unet_temperature_20230101_20231231.png
+│   └── visualizations/idx0-4-9-17-24-27_6depths/
+│       ├── horizontal/
+│       │   └── map_joint_panel_temperature_gidx{original_depth_index}_lvl{local_level}_{date}.png
+│       └── vertical/                       # 仅传section参数时生成
+│           └── section_joint_panel_temperature_{section_tag}_{date}.png
+└── logs/
+    ├── joint_du_unet_6depths_train.log
+    └── joint_du_unet_6depths_test.log
 ```
 
-首次正式运行会用2002–2021训练期拟合归一化统计量并保存在data目录的`normalization_stats/`中；之后训练和测试应复用同一统计文件，不要在正式测试时使用`--rebuild-normalization-stats`。
-
-### test：单日预测
-
-GLORYS12V1中约50m对应深度索引17（47.37m），索引18为55.76m：
-
-```bash
-cd /root/ocean-subsurface-recon-b1
-python -u test.py \
-  --method joint_du_unet \
-  --target-var temperature \
-  --dataset-profile glorys12v1_all_size \
-  --data-dir /root/autodl-fs/raw_all_size \
-  --start-date 2002-01-01 \
-  --end-date 2023-12-31 \
-  --checkpoint /root/autodl-tmp/ocean-subsurface-recon-b1-runs/checkpoints/2dto2d/Joint_Du_Unet/temperature/Joint_Du_Unet_temperature_28depths_best.pth \
-  --output-dir /root/autodl-tmp/ocean-subsurface-recon-b1-runs/outputs \
-  --select-day 2023-06-15 \
-  --target-level 17 \
-  --lazy-data \
-  --normalization-chunk-size 8
-```
-
-### test/eval：2023年时间段评估
-
-```bash
-cd /root/ocean-subsurface-recon-b1
-python -u test.py \
-  --method joint_du_unet \
-  --target-var temperature \
-  --dataset-profile glorys12v1_all_size \
-  --data-dir /root/autodl-fs/raw_all_size \
-  --start-date 2002-01-01 \
-  --end-date 2023-12-31 \
-  --checkpoint /root/autodl-tmp/ocean-subsurface-recon-b1-runs/checkpoints/2dto2d/Joint_Du_Unet/temperature/Joint_Du_Unet_temperature_28depths_best.pth \
-  --output-dir /root/autodl-tmp/ocean-subsurface-recon-b1-runs/outputs \
-  --eval-start 2023-01-01 \
-  --eval-end 2023-12-31 \
-  --eval-batch-size 1 \
-  --lazy-data \
-  --normalization-chunk-size 8
-```
-
-时间段评估会输出overall、逐深度和逐日的MAE、RMSE、R²和相关系数，以及对应曲线和JSON汇总。测试时模型始终先输出全部28层；如传`--depth-indices`，只会在完整前向后选择部分深度计算指标。
+B1不训练HVCA。HVCA只保留为B0的两阶段旁支对照；把它接到B1后面会同时改变“联合输出”和“二阶段修正”两个变量，无法单独回答B1是否有效。
 
 ## HVCARefiner
 
@@ -625,6 +609,8 @@ python test.py --method modas \
 - Du_Unet、Joint_Du_Unet 和 HVCARefiner 的指标会排除 `target_mask=0` 的无效区域。
 - 时间段评估包含 overall、by-depth、by-day 三类统计。
 - overall RMSE 是所有有效点平方误差总体均值开方，不是每日 RMSE 的平均。
+- Joint_Du_Unet 额外保存 `by_day_depth_*`，用于避免把时间、深度和空间混合后掩盖局部误差。
+- Joint_Du_Unet 的SSIM和ACC按每天、每层单独计算，并等权汇总为年度水平结构指标。
 
 ## 常用配置位置
 

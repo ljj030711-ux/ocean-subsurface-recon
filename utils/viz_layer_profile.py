@@ -1,4 +1,4 @@
-"""HVCARefiner 垂向剖面六子图可视化。"""
+"""2dto2d 模型的垂向剖面可视化。"""
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -43,6 +43,161 @@ def _extract_section(field_3d, axis, index, width):
         start, end = _section_bounds(index, width, w)
         return np.nanmean(arr[:, :, start:end], axis=2), start, end
     raise ValueError(f"section_axis 必须是 lat 或 lon，实际: {axis}")
+
+
+def resolve_section_index(value, size):
+    """把 ``middle`` 或整数文本解析为合法的剖面固定轴索引。"""
+    text = str(value).strip().lower()
+    if text in {"middle", "mid", "center", "centre"}:
+        return size // 2
+    try:
+        index = int(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"section_index 必须是整数或 middle，实际: {value}"
+        ) from exc
+    if index < 0 or index >= size:
+        raise ValueError(f"section_index 超出范围 [0,{size - 1}]: {index}")
+    return index
+
+
+def build_section_specs(
+    height,
+    width,
+    multi=False,
+    axis="lat",
+    index="middle",
+    percentiles=(10.0, 25.0, 50.0, 75.0, 90.0),
+):
+    """生成单剖面或经纬两个方向的多位置剖面配置。"""
+    if multi:
+        specs = []
+        for current_axis, size in (("lat", height), ("lon", width)):
+            seen = set()
+            for percentile in percentiles:
+                percentile = float(percentile)
+                if percentile < 0.0 or percentile > 100.0:
+                    raise ValueError(
+                        f"section percentile 需位于 [0,100]，实际: {percentile}"
+                    )
+                current_index = int(round(percentile / 100.0 * (size - 1)))
+                if current_index in seen:
+                    continue
+                seen.add(current_index)
+                specs.append(
+                    {
+                        "axis": current_axis,
+                        "index": current_index,
+                        "percentile": percentile,
+                        "mode": "multi",
+                    }
+                )
+        return specs
+
+    if axis not in {"lat", "lon"}:
+        raise ValueError(f"section_axis 必须是 lat 或 lon，实际: {axis}")
+    size = height if axis == "lat" else width
+    return [
+        {
+            "axis": axis,
+            "index": resolve_section_index(index, size),
+            "percentile": None,
+            "mode": "single",
+        }
+    ]
+
+
+def plot_joint_du_unet_section_panel(
+    prediction_3d,
+    truth_3d,
+    target_var,
+    section_axis,
+    section_index,
+    section_width,
+    day,
+    output_path,
+    depth_values,
+    lon_range=(110, 118),
+    lat_range=(10, 18),
+    title_prefix="Joint_Du_Unet",
+):
+    """绘制 Joint_Du_Unet 的预测、真值和绝对误差垂向剖面。"""
+    prediction_3d = np.asarray(prediction_3d, dtype=np.float32)
+    truth_3d = np.asarray(truth_3d, dtype=np.float32)
+    if prediction_3d.shape != truth_3d.shape or prediction_3d.ndim != 3:
+        raise ValueError(
+            "prediction/truth 需要同形状 (D,H,W)，实际: "
+            f"{prediction_3d.shape}, {truth_3d.shape}"
+        )
+
+    depth = np.asarray(depth_values, dtype=np.float32)
+    d, h, w = prediction_3d.shape
+    if depth.shape != (d,) or not np.all(np.diff(depth) > 0):
+        raise ValueError(
+            f"depth_values 需要长度D且严格递增，实际: {depth.tolist()}"
+        )
+
+    prediction_section, start, end = _extract_section(
+        prediction_3d, section_axis, section_index, section_width
+    )
+    truth_section, _, _ = _extract_section(
+        truth_3d, section_axis, section_index, section_width
+    )
+    error_section = np.abs(prediction_section - truth_section)
+    x_coords, x_label = _axis_coords(
+        section_axis, lat_range, lon_range, h, w
+    )
+    section_center = (start + end - 1) / 2
+    if section_axis == "lat":
+        section_coord = np.interp(
+            section_center,
+            np.arange(h),
+            np.linspace(lat_range[0], lat_range[1], h),
+        )
+        section_label = f"lat idx {start}:{end} (~{section_coord:.2f}°N)"
+    else:
+        section_coord = np.interp(
+            section_center,
+            np.arange(w),
+            np.linspace(lon_range[0], lon_range[1], w),
+        )
+        section_label = f"lon idx {start}:{end} (~{section_coord:.2f}°E)"
+
+    cmap, value_label, error_label = field_cmap_and_label(target_var)
+    value_vmin, value_vmax = finite_vmin_vmax(
+        prediction_section, truth_section
+    )
+    error_vmin, error_vmax = finite_vmin_vmax(
+        error_section, default=(0.0, 1.0)
+    )
+    error_vmin = max(error_vmin, 0.0)
+    panels = [
+        ("Prediction", prediction_section, cmap, value_label, value_vmin, value_vmax),
+        ("Truth", truth_section, cmap, value_label, value_vmin, value_vmax),
+        ("Absolute error", error_section, "magma", error_label, error_vmin, error_vmax),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), dpi=150)
+    for ax, (title, data, panel_cmap, label, vmin, vmax) in zip(axes, panels):
+        image = ax.pcolormesh(
+            x_coords,
+            depth,
+            data,
+            cmap=panel_cmap,
+            shading="auto",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        ax.set_title(title)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Depth / m")
+        ax.invert_yaxis()
+        colorbar = fig.colorbar(image, ax=ax)
+        colorbar.set_label(label)
+    fig.suptitle(f"{title_prefix} {target_var} section {day} | {section_label}")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Joint_Du_Unet 垂向剖面图已保存至：{output_path}")
 
 
 def plot_hvca_refiner_section_panel(

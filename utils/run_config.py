@@ -10,11 +10,20 @@ import numpy as np
 from config import PARADIGM_2DTO2D
 
 
-def model_config_path(output_root, model_name, stage, target_var=None):
+def model_config_path(
+    output_root,
+    model_name,
+    stage,
+    target_var=None,
+    run_tag=None,
+):
     directory = os.path.join(output_root, PARADIGM_2DTO2D, model_name)
     if target_var:
         directory = os.path.join(directory, target_var)
-    return os.path.join(directory, f"{model_name}_{stage}_config.json")
+    suffix = f"_{run_tag}" if run_tag else ""
+    return os.path.join(
+        directory, f"{model_name}_{stage}_config{suffix}.json"
+    )
 
 
 def to_jsonable(value):

@@ -4,6 +4,7 @@
 """
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 
 class RegressionMetricAccumulator:
@@ -118,9 +119,17 @@ def correlation(y_true, y_pred):
 def _valid_mask(y_true, y_pred, mask=None):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
+    if y_true.shape != y_pred.shape:
+        raise ValueError(
+            f"y_true/y_pred 形状必须一致: {y_true.shape} vs {y_pred.shape}"
+        )
     valid = np.isfinite(y_true) & np.isfinite(y_pred)
     if mask is not None:
         mask = np.asarray(mask)
+        if mask.shape != y_true.shape:
+            raise ValueError(
+                f"mask 形状必须与目标一致: {mask.shape} vs {y_true.shape}"
+            )
         valid = valid & mask.astype(bool)
     return valid
 
@@ -148,6 +157,307 @@ def scalar_metrics(y_true, y_pred, mask=None):
         "r2": float(r2(yt, yp)),
         "correlation": float(correlation(yt, yp)),
     }
+
+
+DAY_DEPTH_METRIC_NAMES = (
+    "mae",
+    "rmse",
+    "r2",
+    "correlation",
+    "ssim",
+    "acc",
+)
+
+
+def masked_pearson_correlation(y_true, y_pred, mask=None):
+    """在共同有效区域计算 Pearson 相关系数和有效点数。"""
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    valid = _valid_mask(y_true, y_pred, mask=mask)
+    valid_count = int(np.count_nonzero(valid))
+    if valid_count < 2:
+        return np.nan, valid_count
+
+    true_valid = y_true[valid]
+    pred_valid = y_pred[valid]
+    true_centered = true_valid - np.mean(true_valid)
+    pred_centered = pred_valid - np.mean(pred_valid)
+    denominator = np.sqrt(
+        np.sum(true_centered * true_centered)
+        * np.sum(pred_centered * pred_centered)
+    )
+    if not np.isfinite(denominator) or denominator <= 0:
+        return np.nan, valid_count
+    value = np.sum(true_centered * pred_centered) / denominator
+    return float(np.clip(value, -1.0, 1.0)), valid_count
+
+
+def masked_ssim(
+    y_true,
+    y_pred,
+    mask,
+    data_range,
+    win_size=11,
+    sigma=1.5,
+    min_valid_fraction=0.8,
+    k1=0.01,
+    k2=0.03,
+):
+    """
+    计算 mask-aware Gaussian SSIM。
+
+    局部窗口有效海洋权重低于 ``min_valid_fraction`` 时排除，
+    返回 ``(ssim, valid_window_count)``。
+    """
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    if y_true.ndim != 2 or y_pred.ndim != 2:
+        raise ValueError(
+            f"masked_ssim 需要二维场，实际: {y_true.shape}, {y_pred.shape}"
+        )
+    valid = _valid_mask(y_true, y_pred, mask=mask)
+    win_size = int(win_size)
+    sigma = float(sigma)
+    data_range = float(data_range)
+    min_valid_fraction = float(min_valid_fraction)
+    if win_size < 3 or win_size % 2 == 0:
+        raise ValueError(f"win_size 必须是不小于3的奇数，实际: {win_size}")
+    if sigma <= 0 or data_range <= 0:
+        raise ValueError("sigma 和 data_range 必须大于0")
+    if min_valid_fraction < 0 or min_valid_fraction > 1:
+        raise ValueError("min_valid_fraction 必须位于[0,1]")
+    if min(y_true.shape) < win_size:
+        return np.nan, 0
+
+    radius = win_size // 2
+    truncate = radius / sigma
+    weight = valid.astype(np.float64)
+    true_valid = np.where(valid, y_true, 0.0)
+    pred_valid = np.where(valid, y_pred, 0.0)
+
+    def local_sum(array):
+        return gaussian_filter(
+            array,
+            sigma=sigma,
+            mode="constant",
+            cval=0.0,
+            truncate=truncate,
+        )
+
+    local_weight = local_sum(weight)
+    full_weight = local_sum(np.ones_like(weight, dtype=np.float64))
+    eligible = local_weight >= min_valid_fraction * full_weight
+    interior = np.zeros_like(eligible, dtype=bool)
+    interior[radius:-radius, radius:-radius] = True
+    eligible &= interior & (local_weight > 0)
+    valid_windows = int(np.count_nonzero(eligible))
+    if valid_windows == 0:
+        return np.nan, 0
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mu_true = local_sum(true_valid) / local_weight
+        mu_pred = local_sum(pred_valid) / local_weight
+        var_true = local_sum(true_valid * true_valid) / local_weight - mu_true ** 2
+        var_pred = local_sum(pred_valid * pred_valid) / local_weight - mu_pred ** 2
+        covariance = (
+            local_sum(true_valid * pred_valid) / local_weight - mu_true * mu_pred
+        )
+
+    var_true = np.maximum(var_true, 0.0)
+    var_pred = np.maximum(var_pred, 0.0)
+    c1 = (float(k1) * data_range) ** 2
+    c2 = (float(k2) * data_range) ** 2
+    numerator = (2.0 * mu_true * mu_pred + c1) * (2.0 * covariance + c2)
+    denominator = (
+        (mu_true ** 2 + mu_pred ** 2 + c1)
+        * (var_true + var_pred + c2)
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ssim_map = numerator / denominator
+    eligible &= np.isfinite(ssim_map)
+    valid_windows = int(np.count_nonzero(eligible))
+    if valid_windows == 0:
+        return np.nan, 0
+    return float(np.mean(ssim_map[eligible], dtype=np.float64)), valid_windows
+
+
+def compute_day_depth_metrics(
+    y_true,
+    y_pred,
+    mask,
+    months,
+    training_climatology,
+    ssim_data_range,
+    ssim_win_size=11,
+    ssim_sigma=1.5,
+    ssim_min_valid_fraction=0.8,
+):
+    """计算一个 batch 的每天×每层数值和水平结构指标。"""
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    mask = np.asarray(mask)
+    if y_true.ndim != 4:
+        raise ValueError(f"y_true/y_pred 需要 (B,D,H,W)，实际: {y_true.shape}")
+    _valid_mask(y_true, y_pred, mask=mask)
+    batch_size, num_depths, height, width = y_true.shape
+
+    months = np.asarray(months, dtype=np.int64)
+    if months.shape != (batch_size,) or np.any((months < 1) | (months > 12)):
+        raise ValueError(f"months 应为长度B的1..12整数，实际: {months}")
+    climatology = np.asarray(training_climatology, dtype=np.float64)
+    if climatology.shape != (12, num_depths, height, width):
+        raise ValueError(
+            "training_climatology 形状错误: "
+            f"expected={(12, num_depths, height, width)}, actual={climatology.shape}"
+        )
+    data_ranges = np.asarray(ssim_data_range, dtype=np.float64)
+    if data_ranges.shape != (num_depths,) or np.any(data_ranges <= 0):
+        raise ValueError(
+            f"ssim_data_range 应为长度D的正数，实际: {data_ranges}"
+        )
+
+    result = {
+        name: np.full((batch_size, num_depths), np.nan, dtype=np.float64)
+        for name in DAY_DEPTH_METRIC_NAMES
+    }
+    result["valid_count"] = np.zeros(
+        (batch_size, num_depths), dtype=np.int64
+    )
+    result["ssim_valid_windows"] = np.zeros(
+        (batch_size, num_depths), dtype=np.int64
+    )
+    result["acc_valid_count"] = np.zeros(
+        (batch_size, num_depths), dtype=np.int64
+    )
+
+    for day_index in range(batch_size):
+        month_climatology = climatology[months[day_index] - 1]
+        for depth_index in range(num_depths):
+            valid = (
+                mask[day_index, depth_index].astype(bool)
+                & np.isfinite(y_true[day_index, depth_index])
+                & np.isfinite(y_pred[day_index, depth_index])
+            )
+            metrics = scalar_metrics(
+                y_true[day_index, depth_index],
+                y_pred[day_index, depth_index],
+                mask=valid,
+            )
+            for name in ("mae", "rmse", "r2", "correlation"):
+                result[name][day_index, depth_index] = metrics[name]
+            result["valid_count"][day_index, depth_index] = np.count_nonzero(valid)
+
+            true_anomaly = (
+                y_true[day_index, depth_index] - month_climatology[depth_index]
+            )
+            pred_anomaly = (
+                y_pred[day_index, depth_index] - month_climatology[depth_index]
+            )
+            acc_value, acc_count = masked_pearson_correlation(
+                true_anomaly, pred_anomaly, mask=valid
+            )
+            ssim_value, ssim_windows = masked_ssim(
+                true_anomaly,
+                pred_anomaly,
+                mask=valid,
+                data_range=data_ranges[depth_index],
+                win_size=ssim_win_size,
+                sigma=ssim_sigma,
+                min_valid_fraction=ssim_min_valid_fraction,
+            )
+            result["acc"][day_index, depth_index] = acc_value
+            result["ssim"][day_index, depth_index] = ssim_value
+            result["acc_valid_count"][day_index, depth_index] = acc_count
+            result["ssim_valid_windows"][day_index, depth_index] = ssim_windows
+    return result
+
+
+def summarize_horizontal_structure(day_depth_ssim, day_depth_acc):
+    """SSIM/ACC 按天和深度等权汇总，并返回完整日标记。"""
+    day_depth_ssim = np.asarray(day_depth_ssim, dtype=np.float64)
+    day_depth_acc = np.asarray(day_depth_acc, dtype=np.float64)
+    if day_depth_ssim.shape != day_depth_acc.shape or day_depth_ssim.ndim != 2:
+        raise ValueError(
+            "day_depth_ssim/day_depth_acc 必须是同形状 (T,D): "
+            f"{day_depth_ssim.shape}, {day_depth_acc.shape}"
+        )
+
+    with np.errstate(invalid="ignore"):
+        by_day_ssim = np.nanmean(day_depth_ssim, axis=1)
+        by_day_acc = np.nanmean(day_depth_acc, axis=1)
+        by_depth_ssim = np.nanmean(day_depth_ssim, axis=0)
+        by_depth_acc = np.nanmean(day_depth_acc, axis=0)
+        annual_ssim = float(np.nanmean(day_depth_ssim))
+        annual_acc = float(np.nanmean(day_depth_acc))
+    by_day_score = (by_day_ssim + by_day_acc) / 2.0
+    by_depth_score = (by_depth_ssim + by_depth_acc) / 2.0
+    complete_day_mask = np.all(
+        np.isfinite(day_depth_ssim) & np.isfinite(day_depth_acc), axis=1
+    )
+    by_day_score = np.where(complete_day_mask, by_day_score, np.nan)
+    return {
+        "by_day_ssim": by_day_ssim,
+        "by_day_acc": by_day_acc,
+        "by_day_structure_score": by_day_score,
+        "by_depth_ssim": by_depth_ssim,
+        "by_depth_acc": by_depth_acc,
+        "by_depth_structure_score": by_depth_score,
+        "annual_mean_ssim": annual_ssim,
+        "annual_mean_acc": annual_acc,
+        "annual_mean_structure_score": (annual_ssim + annual_acc) / 2.0,
+        "complete_day_mask": complete_day_mask,
+        "by_depth_valid_days": np.sum(
+            np.isfinite(day_depth_ssim) & np.isfinite(day_depth_acc), axis=0
+        ).astype(np.int64),
+    }
+
+
+def select_structure_quantile_days(
+    dates,
+    structure_score,
+    complete_day_mask,
+    quantiles=(10.0, 50.0, 90.0),
+):
+    """选择最接近结构得分P10/P50/P90的不重复实际日期。"""
+    dates = [str(value) for value in dates]
+    score = np.asarray(structure_score, dtype=np.float64)
+    complete = np.asarray(complete_day_mask, dtype=bool)
+    if score.shape != (len(dates),) or complete.shape != score.shape:
+        raise ValueError("dates/structure_score/complete_day_mask 长度不一致")
+    eligible = np.flatnonzero(complete & np.isfinite(score))
+    if eligible.size < len(tuple(quantiles)):
+        raise ValueError(
+            "可用的完整日期不足，无法选择不重复的代表日期: "
+            f"available={eligible.size}, requested={len(tuple(quantiles))}"
+        )
+
+    selected = []
+    used = set()
+    eligible_scores = score[eligible]
+    for quantile in quantiles:
+        quantile = float(quantile)
+        target = float(np.percentile(eligible_scores, quantile))
+        candidates = sorted(
+            (
+                (abs(float(score[index]) - target), dates[index], int(index))
+                for index in eligible
+                if int(index) not in used
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        _, _, index = candidates[0]
+        used.add(index)
+        selected.append(
+            {
+                "role": f"p{int(quantile):02d}",
+                "quantile": quantile,
+                "target_score": target,
+                "date": dates[index],
+                "day_index": index,
+                "structure_score": float(score[index]),
+            }
+        )
+    return selected
 
 
 # ==================== 层反演网格指标 ====================

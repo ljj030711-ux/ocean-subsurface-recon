@@ -4,7 +4,7 @@ from models.du_unet import Du_Unet
 
 
 class JointDuUnet(Du_Unet):
-    """Predict every configured depth in one forward pass.
+    """Predict the selected depth set in one forward pass.
 
     This wrapper intentionally adds no attention, Transformer, depth embedding,
     or vertical post-processing.  Relative to the layer-wise B0 Du_Unet
