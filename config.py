@@ -40,7 +40,7 @@ DY = 10000.0
 PARADIGM_2DTO2D = "2dto2d"
 PARADIGM_2DTO3D = "2dto3d"
 
-PARADIGM_2DTO2D_METHODS = {"du_unet", "joint_du_unet"}
+PARADIGM_2DTO2D_METHODS = {"du_unet", "joint_du_unet", "joint_duvit"}
 PARADIGM_2DTO3D_METHODS = {"2dvar", "modas", "ocean_transformer"}
 
 # 指定 26 层深度（旧参数， 单位 m）
@@ -178,6 +178,30 @@ JOINT_DU_UNET_HISTORY_NAME_TEMPLATE = (
 JOINT_DU_UNET_LOSS_CURVE_TEMPLATE = (
     "loss_Joint_Du_Unet_{target_var}_{depth_tag}.png"
 )
+
+# B2：在B1联合输出骨干的两个卷积瓶颈中加入空间ViT；暂不启用跳连注意力。
+JOINT_DUVIT_CKPT_NAME_TEMPLATE = (
+    "Joint_DUViT_{target_var}_{depth_tag}_best.pth"
+)
+JOINT_DUVIT_HISTORY_NAME_TEMPLATE = (
+    "training_history_Joint_DUViT_{target_var}_{depth_tag}.npz"
+)
+JOINT_DUVIT_LOSS_CURVE_TEMPLATE = (
+    "loss_Joint_DUViT_{target_var}_{depth_tag}.png"
+)
+
+JOINT_DUVIT_SST_EMBED_DIM = 256
+JOINT_DUVIT_SST_PATCH_SIZE = 1
+JOINT_DUVIT_SST_NUM_HEADS = 8
+JOINT_DUVIT_SST_NUM_LAYERS = 2
+JOINT_DUVIT_SST_MAX_TOKENS = 256
+JOINT_DUVIT_SURFACE_EMBED_DIM = 128
+JOINT_DUVIT_SURFACE_PATCH_SIZE = 2
+JOINT_DUVIT_SURFACE_NUM_HEADS = 4
+JOINT_DUVIT_SURFACE_NUM_LAYERS = 2
+JOINT_DUVIT_SURFACE_MAX_TOKENS = 512
+JOINT_DUVIT_MLP_RATIO = 4
+JOINT_DUVIT_DROPOUT = 0.1
 
 
 def joint_du_unet_depth_tag(depth_indices, total_num_depths):

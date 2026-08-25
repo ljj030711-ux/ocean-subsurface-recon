@@ -4,7 +4,7 @@ set -euo pipefail
 # 禁止 macOS 在压缩包中写入 ._* AppleDouble 元数据文件。
 export COPYFILE_DISABLE=1
 
-PROJECT_NAME="ocean-subsurface-recon-b1"
+PROJECT_NAME="ocean-subsurface-recon-b2"
 SERVER_USER="${SERVER_USER:-root}"
 SERVER_HOST="${SERVER_HOST:-connect.bjb1.seetacloud.com}"
 SERVER_PORT="${SERVER_PORT:-50490}"
@@ -153,7 +153,7 @@ echo "Uploaded archive retained at: ${archive_path}"
 REMOTE_DEPLOY
 
 echo
-echo "B1 deployment completed successfully."
+echo "B2 deployment completed successfully."
 echo "Server project: ${REMOTE_PROJECT_DIR}"
 echo "Server backup:  ${REMOTE_BACKUP_DIR} (when a previous version existed)"
 echo "Server archive: ${REMOTE_ARCHIVE_PATH}"

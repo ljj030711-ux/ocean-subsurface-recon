@@ -26,6 +26,7 @@ from config import (
     DU_UNET_CKPT_NAME_TEMPLATE,
     INFER_DEFAULT_TARGET_LEVEL,
     JOINT_DU_UNET_CKPT_NAME_TEMPLATE,
+    JOINT_DUVIT_CKPT_NAME_TEMPLATE,
     TRAIN_END_DATE, VAL_START_DATE, VAL_END_DATE,
     TEST_START_DATE, TEST_END_DATE,
     LON_RANGE, LAT_RANGE, DEPTH_MAX, OUTPUTS_ROOT,
@@ -79,6 +80,29 @@ NON_DL_METHODS = {"2dvar", "modas"}
 DL_2DTO2D_METHODS = set(PARADIGM_2DTO2D_METHODS)
 DL_2DTO3D_METHODS = set(PARADIGM_2DTO3D_METHODS) - NON_DL_METHODS
 ALL_METHODS = sorted(DL_2DTO2D_METHODS | DL_2DTO3D_METHODS | NON_DL_METHODS)
+JOINT_METHOD_NAMES = {"Joint_Du_Unet", "Joint_DUViT"}
+
+
+def _is_joint_method(args):
+    return getattr(args, "method", None) in JOINT_METHOD_NAMES
+
+
+def _joint_method_spec(args):
+    if getattr(args, "method", None) == "Joint_DUViT":
+        return {
+            "method_key": "joint_duvit",
+            "model_name": "Joint_DUViT",
+            "checkpoint_type": "Joint_DUViT",
+            "checkpoint_template": JOINT_DUVIT_CKPT_NAME_TEMPLATE,
+            "experiment": "B2_spatial_vit_bottlenecks",
+        }
+    return {
+        "method_key": "joint_du_unet",
+        "model_name": "Joint_Du_Unet",
+        "checkpoint_type": "Joint_Du_Unet",
+        "checkpoint_template": JOINT_DU_UNET_CKPT_NAME_TEMPLATE,
+        "experiment": "B1_joint_output_baseline",
+    }
 
 
 def _du_unet_depth_levels(args):
@@ -134,7 +158,7 @@ def _joint_evaluation_depths(args, depth_levels, checkpoint_depth_indices):
     ]
     if missing:
         raise ValueError(
-            "请求评估的原始深度索引未包含在该 Joint_Du_Unet checkpoint 中: "
+            "请求评估的原始深度索引未包含在该联合模型checkpoint中: "
             f"{missing}；checkpoint 可用层为 {list(checkpoint_depth_indices)}"
         )
     output_positions = [position_by_depth[idx] for idx in evaluation_indices]
@@ -459,7 +483,7 @@ def predict_2dto3d(args):
 
 
 def predict_2dto2d(args):
-    """Run B0 layer-wise or B1 joint-depth prediction."""
+    """Run B0 layer-wise or a joint-depth B1/B2 prediction."""
     device = _get_device()
 
     from datasets.dataset_2dto2d import Dataset2Dto2D
@@ -486,8 +510,9 @@ def predict_2dto2d(args):
             f"dataset_profile={args.dataset_profile} 深度层数 {len(all_depth_levels)} "
             f"与 target 数据层数 {dataset.num_depths} 不一致"
         )
-    is_joint = args.method == "Joint_Du_Unet"
-    model_name = "Joint_Du_Unet" if is_joint else "Du_Unet"
+    is_joint = _is_joint_method(args)
+    joint_spec = _joint_method_spec(args) if is_joint else None
+    model_name = joint_spec["model_name"] if is_joint else "Du_Unet"
     joint_model = None
     joint_output_positions = None
     checkpoint_depth_indices = None
@@ -538,15 +563,15 @@ def predict_2dto2d(args):
             args,
             dataset.num_depths,
         )
-        model_config = {
-            "backbone": "Du_Unet",
-            "out_channels": len(checkpoint_depth_indices),
-            "joint_depth_output": True,
-            "checkpoint_depth_indices": checkpoint_depth_indices,
-            "evaluation_output_positions": joint_output_positions,
-            "attention": False,
-            "transformer": False,
-        }
+        model_config = dict((checkpoint_metadata or {}).get("model_config") or {})
+        model_config.update(
+            {
+                "out_channels": len(checkpoint_depth_indices),
+                "joint_depth_output": True,
+                "checkpoint_depth_indices": checkpoint_depth_indices,
+                "evaluation_output_positions": joint_output_positions,
+            }
+        )
     else:
         param_stats = count_model_parameters(build_model("du_unet", out_channels=1))
         parameter_payload = {
@@ -566,7 +591,7 @@ def predict_2dto2d(args):
             "stage": "test",
             "mode": "single_day",
             "single": True,
-            "experiment": "B1_joint_output_baseline" if is_joint else "B0",
+            "experiment": joint_spec["experiment"] if is_joint else "B0",
             "model": model_name,
             "method": args.method,
             "paradigm": PARADIGM_2DTO2D,
@@ -627,7 +652,7 @@ def predict_2dto2d(args):
         )
         if tuple(pred_full.shape) != expected_shape:
             raise ValueError(
-                "Joint_Du_Unet 输出形状错误，"
+                f"{model_name} 输出形状错误，"
                 f"expected={expected_shape}, actual={tuple(pred_full.shape)}"
             )
         y_pred = pred_full[:, joint_output_positions].cpu().numpy()
@@ -688,7 +713,11 @@ def _metric_units(is_2dto3d):
 def _target_var_for_outputs(args, is_2dto3d):
     if is_2dto3d:
         return None
-    if getattr(args, "method", None) in {"Du_Unet", "Joint_Du_Unet"}:
+    if getattr(args, "method", None) in {
+        "Du_Unet",
+        "Joint_Du_Unet",
+        "Joint_DUViT",
+    }:
         return getattr(args, "target_var", None)
     return None
 
@@ -744,18 +773,19 @@ def _load_du_unet_models(args, device, require_all):
 
 
 def _joint_du_unet_checkpoint_candidates(args, dataset_num_depths):
+    spec = _joint_method_spec(args)
     if args.checkpoint:
         return [args.checkpoint]
 
     default_method_dir = get_checkpoint_dir(
         PARADIGM_2DTO2D,
-        "Joint_Du_Unet",
+        spec["model_name"],
         base_dir=CHECKPOINTS_ROOT,
     )
     base_dir = args.checkpoint_dir or default_method_dir
     method_dir = get_checkpoint_dir(
         PARADIGM_2DTO2D,
-        "Joint_Du_Unet",
+        spec["model_name"],
         base_dir=base_dir,
     )
     directories = [
@@ -773,7 +803,7 @@ def _joint_du_unet_checkpoint_candidates(args, dataset_num_depths):
     depth_tag = joint_du_unet_depth_tag(
         requested_depth_indices, dataset_num_depths
     )
-    ckpt_name = JOINT_DU_UNET_CKPT_NAME_TEMPLATE.format(
+    ckpt_name = spec["checkpoint_template"].format(
         target_var=args.target_var,
         depth_tag=depth_tag,
     )
@@ -800,9 +830,10 @@ def _joint_output_channels_from_state_dict(state_dict):
 
 
 def _load_joint_du_unet_model(args, device, dataset):
-    """Load one joint checkpoint and recover its original-profile depth mapping."""
+    """Load one B1/B2 joint checkpoint and recover its depth mapping."""
     from train import build_model
 
+    spec = _joint_method_spec(args)
     candidates = _joint_du_unet_checkpoint_candidates(args, dataset.num_depths)
     ckpt_path = next(
         (path for path in candidates if os.path.isfile(path)),
@@ -810,7 +841,7 @@ def _load_joint_du_unet_model(args, device, dataset):
     )
     if ckpt_path is None:
         raise FileNotFoundError(
-            "缺少 Joint_Du_Unet checkpoint；已查找："
+            f"缺少 {spec['model_name']} checkpoint；已查找："
             + ", ".join(candidates)
         )
 
@@ -819,7 +850,7 @@ def _load_joint_du_unet_model(args, device, dataset):
     if structured_checkpoint:
         if checkpoint.get("format_version") != 1:
             raise ValueError(
-                "不支持的 Joint_Du_Unet checkpoint format_version: "
+                f"不支持的 {spec['model_name']} checkpoint format_version: "
                 f"{checkpoint.get('format_version')!r}"
             )
         state_dict = checkpoint["state_dict"]
@@ -846,7 +877,7 @@ def _load_joint_du_unet_model(args, device, dataset):
         missing_metadata = sorted(required_metadata - set(metadata))
         if missing_metadata:
             raise ValueError(
-                "Joint_Du_Unet checkpoint 缺少必要元数据: "
+                f"{spec['model_name']} checkpoint 缺少必要元数据: "
                 + ", ".join(missing_metadata)
             )
 
@@ -855,7 +886,7 @@ def _load_joint_du_unet_model(args, device, dataset):
     if stored_indices is None:
         if num_outputs != dataset.num_depths:
             raise ValueError(
-                "该旧版 Joint_Du_Unet checkpoint 只有 "
+                f"该旧版 {spec['model_name']} checkpoint 只有 "
                 f"{num_outputs} 个输出且未记录原始 depth_indices，无法安全映射；"
                 "请使用新版 train.py 重新训练"
             )
@@ -925,7 +956,7 @@ def _load_joint_du_unet_model(args, device, dataset):
         )
 
     expected_metadata = {
-        "checkpoint_type": "Joint_Du_Unet",
+        "checkpoint_type": spec["checkpoint_type"],
         "target_var": args.target_var,
         "dataset_profile": args.dataset_profile,
         "dataset_num_depths": dataset.num_depths,
@@ -952,12 +983,35 @@ def _load_joint_du_unet_model(args, device, dataset):
                 "checkpoint 与测试数据使用的归一化统计量指纹不一致"
             )
 
-    model = build_model("joint_du_unet", num_depths=num_outputs).to(device)
+    build_kwargs = {"num_depths": num_outputs}
+    if spec["method_key"] == "joint_duvit" and metadata_model_config:
+        sst_vit = metadata_model_config.get("sst_vit") or {}
+        surface_vit = metadata_model_config.get("surface_vit") or {}
+        build_kwargs.update(
+            {
+                "sst_embed_dim": sst_vit.get("embed_dim"),
+                "sst_patch_size": sst_vit.get("patch_size"),
+                "sst_num_heads": sst_vit.get("num_heads"),
+                "sst_num_layers": sst_vit.get("num_layers"),
+                "sst_max_tokens": sst_vit.get("max_tokens"),
+                "surface_embed_dim": surface_vit.get("embed_dim"),
+                "surface_patch_size": surface_vit.get("patch_size"),
+                "surface_num_heads": surface_vit.get("num_heads"),
+                "surface_num_layers": surface_vit.get("num_layers"),
+                "surface_max_tokens": surface_vit.get("max_tokens"),
+                "mlp_ratio": sst_vit.get("mlp_ratio"),
+                "dropout": sst_vit.get("dropout"),
+            }
+        )
+        build_kwargs = {
+            key: value for key, value in build_kwargs.items() if value is not None
+        }
+    model = build_model(spec["method_key"], **build_kwargs).to(device)
     try:
         model.load_state_dict(state_dict)
     except RuntimeError as exc:
         raise RuntimeError(
-            f"Joint_Du_Unet checkpoint 与当前 {num_outputs} 输出模型不兼容: "
+            f"{spec['model_name']} checkpoint 与当前 {num_outputs} 输出模型不兼容: "
             f"{ckpt_path}"
         ) from exc
     model.eval()
@@ -1128,7 +1182,7 @@ def _render_joint_horizontal_panels(
     device,
     out_dir,
 ):
-    """为 Joint_Du_Unet 代表日期生成指定深度的水平三联图。"""
+    """为联合深度模型的代表日期生成指定深度水平三联图。"""
     if not panel_day_records:
         print("[spatial-panels] 没有可绘制的代表日期，跳过水平图")
         return []
@@ -1170,7 +1224,7 @@ def _render_joint_horizontal_panels(
         )
         if tuple(pred_full.shape) != expected_shape:
             raise ValueError(
-                "Joint_Du_Unet 可视化推理输出形状错误，"
+                f"{args.method} 可视化推理输出形状错误，"
                 f"expected={expected_shape}, actual={tuple(pred_full.shape)}"
             )
 
@@ -1196,7 +1250,7 @@ def _render_joint_horizontal_panels(
                 acc_value = float(day_depth_metrics["acc"][day_index, level])
                 role = record["role"].upper()
                 method_label = (
-                    f"Joint_Du_Unet {role} | SSIM={ssim_value:.3f}, "
+                    f"{args.method} {role} | SSIM={ssim_value:.3f}, "
                     f"ACC={acc_value:.3f}"
                 )
                 filename = (
@@ -1253,7 +1307,7 @@ def _render_joint_section_panels(
     device,
     out_dir,
 ):
-    """按需为 Joint_Du_Unet 代表日期绘制垂向剖面，不参与默认流程。"""
+    """按需为联合深度模型绘制垂向剖面，不参与默认流程。"""
     if not panel_day_records:
         print("[section-panels] 没有可绘制的代表日期，跳过垂向剖面")
         return []
@@ -1298,7 +1352,7 @@ def _render_joint_section_panels(
         )
         if tuple(pred_full.shape) != expected_shape:
             raise ValueError(
-                "Joint_Du_Unet 垂向可视化输出形状错误，"
+                f"{args.method} 垂向可视化输出形状错误，"
                 f"expected={expected_shape}, actual={tuple(pred_full.shape)}"
             )
 
@@ -1350,7 +1404,7 @@ def _render_joint_section_panels(
                     depth_values=depth_levels,
                     lon_range=lon_range,
                     lat_range=lat_range,
-                    title_prefix=f"Joint_Du_Unet {role.upper()}",
+                    title_prefix=f"{args.method} {role.upper()}",
                 )
                 rendered.append(
                     {
@@ -1373,7 +1427,7 @@ def _render_joint_section_panels(
 
 
 def evaluate_2dto2d_period(args, out_dir):
-    """Evaluate B0 layer-wise or B1 joint-depth predictions over a period."""
+    """Evaluate B0 layer-wise or B1/B2 joint-depth predictions over a period."""
     from datasets.dataset_2dto2d import Dataset2Dto2D
     from train import build_model
 
@@ -1412,8 +1466,9 @@ def evaluate_2dto2d_period(args, out_dir):
     )
 
     device = _get_device()
-    is_joint = args.method == "Joint_Du_Unet"
-    model_name = "Joint_Du_Unet" if is_joint else "Du_Unet"
+    is_joint = _is_joint_method(args)
+    joint_spec = _joint_method_spec(args) if is_joint else None
+    model_name = joint_spec["model_name"] if is_joint else "Du_Unet"
     config_target_var = args.target_var if is_joint else None
 
     joint_model = None
@@ -1437,15 +1492,15 @@ def evaluate_2dto2d_period(args, out_dir):
             args,
             dataset.num_depths,
         )
-        model_config = {
-            "backbone": "Du_Unet",
-            "out_channels": len(checkpoint_depth_indices),
-            "joint_depth_output": True,
-            "checkpoint_depth_indices": checkpoint_depth_indices,
-            "evaluation_output_positions": joint_output_positions,
-            "attention": False,
-            "transformer": False,
-        }
+        model_config = dict((checkpoint_metadata or {}).get("model_config") or {})
+        model_config.update(
+            {
+                "out_channels": len(checkpoint_depth_indices),
+                "joint_depth_output": True,
+                "checkpoint_depth_indices": checkpoint_depth_indices,
+                "evaluation_output_positions": joint_output_positions,
+            }
+        )
     else:
         depth_indices = _du_unet_depth_indices(args, all_depth_levels)
         param_stats = count_model_parameters(build_model("du_unet", out_channels=1))
@@ -1466,7 +1521,7 @@ def evaluate_2dto2d_period(args, out_dir):
     section_requested = args.section_panels or args.multi_section_panels
     if (args.spatial_panels or section_requested) and not is_joint:
         raise ValueError(
-            "水平/垂向解释面板当前仅用于 Joint_Du_Unet 时间段评估"
+            "水平/垂向解释面板当前仅用于联合深度模型时间段评估"
         )
     target_levels = (
         _validate_panel_levels(args.target_levels, len(depth_indices))
@@ -1494,7 +1549,7 @@ def evaluate_2dto2d_period(args, out_dir):
             "stage": "test",
             "mode": "period",
             "single": False,
-            "experiment": "B1_joint_output_baseline" if is_joint else "B0",
+            "experiment": joint_spec["experiment"] if is_joint else "B0",
             "model": model_name,
             "method": args.method,
             "paradigm": PARADIGM_2DTO2D,
@@ -1594,7 +1649,7 @@ def evaluate_2dto2d_period(args, out_dir):
                 )
                 if tuple(pred_full.shape) != expected_shape:
                     raise ValueError(
-                        "Joint_Du_Unet 输出形状错误，"
+                        f"{model_name} 输出形状错误，"
                         f"expected={expected_shape}, actual={tuple(pred_full.shape)}"
                     )
                 pred_norm = pred_full[:, joint_output_positions].cpu().numpy()
@@ -2185,7 +2240,7 @@ def parse_args():
         "--eval-batch-size",
         type=int,
         default=4,
-        help="时间段评估推理 batch size，Du_Unet/Joint_Du_Unet 使用",
+        help="时间段评估推理 batch size，Du_Unet及联合深度模型使用",
     )
     p.add_argument(
         "--target-level",
@@ -2200,7 +2255,7 @@ def parse_args():
     g_dl.add_argument(
         "--checkpoint-dir",
         default=None,
-        help="2dto2d 权重目录；Joint_Du_Unet 推荐直接传 --checkpoint",
+        help="2dto2d 权重目录；联合深度模型推荐直接传 --checkpoint",
     )
     g_dl.add_argument("--data-dir", default=DATA_DIR)
     g_dl.add_argument(
@@ -2231,7 +2286,7 @@ def parse_args():
         help="忽略已有统计文件并用训练时段重新拟合后覆盖",
     )
     g_dl.add_argument("--target-var", choices=["temperature", "salinity"], default="temperature",
-                      help="Du_Unet/Joint_Du_Unet 预测目标变量")
+                      help="Du_Unet/联合深度模型预测目标变量")
     g_dl.add_argument("--start-date", default=DATA_START_DATE,
                       help="Du_Unet 使用的数据起始日期 YYYY-MM-DD")
     g_dl.add_argument("--end-date", default=None,
@@ -2240,14 +2295,14 @@ def parse_args():
         "--depth-indices",
         default=None,
         help=(
-            "按原始profile层号评估指定深度；Joint_Du_Unet必须是其训练层的子集；"
+            "按原始profile层号评估指定深度；联合模型必须是其训练层的子集；"
             "不传时自动评估checkpoint中记录的全部输出层"
         ),
     )
     g_dl.add_argument(
         "--spatial-panels",
         action="store_true",
-        help="Joint_Du_Unet 时间段评估输出预测/真值/绝对误差二维水平面板",
+        help="联合深度模型时间段评估输出预测/真值/绝对误差二维水平面板",
     )
     g_dl.add_argument(
         "--target-levels",
@@ -2269,7 +2324,7 @@ def parse_args():
         "--section-panels",
         action="store_true",
         help=(
-            "可选：Joint_Du_Unet 时间段评估输出一个垂向剖面三联图；"
+            "可选：联合深度模型时间段评估输出一个垂向剖面三联图；"
             "不传则不调用垂向可视化"
         ),
     )
@@ -2346,17 +2401,20 @@ def main():
         method = "du_unet"
     if method in {"joint-du-unet", "joint_unet", "joint-unet"}:
         method = "joint_du_unet"
+    if method in {"joint-duvit", "joint_vit", "joint-vit"}:
+        method = "joint_duvit"
     if method not in ALL_METHODS:
         raise ValueError(f"未知方法: {args.method}")
     args.method = {
         "du_unet": "Du_Unet",
         "joint_du_unet": "Joint_Du_Unet",
+        "joint_duvit": "Joint_DUViT",
     }.get(method, method)
     if method in PARADIGM_2DTO2D_METHODS:
         paradigm = PARADIGM_2DTO2D
     else:
         paradigm = PARADIGM_2DTO3D
-    if method in {"du_unet", "joint_du_unet"}:
+    if method in {"du_unet", "joint_du_unet", "joint_duvit"}:
         out_dir = get_output_dir(
             paradigm, args.method, base_dir=args.output_dir, target_var=args.target_var
         )
@@ -2365,9 +2423,9 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     if args.eval_start:
-        if method not in {"du_unet", "joint_du_unet"}:
+        if method not in {"du_unet", "joint_du_unet", "joint_duvit"}:
             raise ValueError(
-                "时间段整体评估目前仅支持 Du_Unet 和 Joint_Du_Unet"
+                "时间段整体评估目前仅支持Du_Unet和联合深度模型"
             )
         print("=" * 60)
         print(

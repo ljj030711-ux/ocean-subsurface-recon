@@ -1,12 +1,12 @@
 # Ocean Subsurface Recon
 
-本项目用海表场重建水下多深度温度或盐度结构，当前包含 `Du_Unet`、`Joint_Du_Unet`、`HVCARefiner`、`ocean_transformer`、`2dvar` 和 `modas`。
+本项目用海表场重建水下多深度温度或盐度结构，当前包含 `Du_Unet`、`Joint_Du_Unet`、`Joint_DUViT`、`HVCARefiner`、`ocean_transformer`、`2dvar` 和 `modas`。
 
 ## 总览
 
 ### 建模范式
 
-- `2dto2d`：使用二维卷积处理海表场。`Du_Unet` 为逐深度B0，`Joint_Du_Unet` 为一次联合输出指定深度的B1，`HVCARefiner` 为B0旁支的二阶段修正模型。
+- `2dto2d`：`Du_Unet`为逐深度B0，`Joint_Du_Unet`为联合输出B1，`Joint_DUViT`为在两个瓶颈加入空间ViT的B2，`HVCARefiner`为B0旁支的二阶段修正模型。
 - `2dto3d`：单次输出多个深度。当前包括 `ocean_transformer`、`2dvar`、`modas`。
 
 ### 目录规则
@@ -17,6 +17,8 @@
 - Du_Unet 权重：`checkpoints/2dto2d/Du_Unet/{temperature|salinity}/`
 - Joint_Du_Unet 输出：`outputs/2dto2d/Joint_Du_Unet/{temperature|salinity}/`
 - Joint_Du_Unet 权重：`checkpoints/2dto2d/Joint_Du_Unet/{temperature|salinity}/`
+- Joint_DUViT 输出：`outputs/2dto2d/Joint_DUViT/{temperature|salinity}/`
+- Joint_DUViT 权重：`checkpoints/2dto2d/Joint_DUViT/{temperature|salinity}/`
 - HVCARefiner 输出与权重：`outputs/2dto2d/HVCARefiner/`
 - OceanTransformer 输出：`outputs/2dto3d/ocean_transformer/`
 - 2DVar 输出：`outputs/2dto3d/2dvar/`
@@ -24,12 +26,14 @@
 
 ### 运行日志和配置快照
 
-Du_Unet、Joint_Du_Unet 和 HVCARefiner 的 train/test 入口会在运行前打印最终超参数，并保存 JSON 配置快照：
+Du_Unet、Joint_Du_Unet、Joint_DUViT和HVCARefiner的train/test入口会在运行前打印最终超参数，并保存JSON配置快照：
 
 - `outputs/2dto2d/Du_Unet/Du_Unet_train_config.json`
 - `outputs/2dto2d/Du_Unet/Du_Unet_test_config.json`
 - `outputs/2dto2d/Joint_Du_Unet/{target_var}/Joint_Du_Unet_train_config_{depth_tag}.json`
 - `outputs/2dto2d/Joint_Du_Unet/{target_var}/Joint_Du_Unet_test_config_{depth_tag}.json`
+- `outputs/2dto2d/Joint_DUViT/{target_var}/Joint_DUViT_train_config_{depth_tag}.json`
+- `outputs/2dto2d/Joint_DUViT/{target_var}/Joint_DUViT_test_config_{depth_tag}.json`
 - HVCARefiner 训练配置：`<train --save-dir>/HVCARefiner_train_config.json`
 - HVCARefiner 测试配置：`<test --save-dir>/HVCARefiner_test_config.json`
 
@@ -162,7 +166,7 @@ python test.py --method Du_Unet --target-var temperature \
 
 | 参数 | 含义 |
 | --- | --- |
-| `--eval-start` / `--eval-end` | 闭区间评估日期；目前时间段模式仅支持 Du_Unet。 |
+| `--eval-start` / `--eval-end` | 闭区间评估日期；支持Du_Unet及联合深度模型。 |
 | `--eval-batch-size` | 时间段推理 batch size。 |
 | 其他参数 | 与单日预测一致。 |
 
@@ -319,6 +323,112 @@ Joint时间段评估保留原有pooled `overall/by_depth/by_day` 指标，同时
 ```
 
 B1不训练HVCA。HVCA只保留为B0的两阶段旁支对照；把它接到B1后面会同时改变“联合输出”和“二阶段修正”两个变量，无法单独回答B1是否有效。
+
+## B2：Joint_DUViT 双瓶颈空间ViT
+
+`Joint_DUViT`从B1独立派生，不修改`Joint_Du_Unet`。模型保持相同的SST、SSH、SSS输入、双分支卷积骨干、普通跳连、融合头和动态联合深度输出，只新增两个空间ViT瓶颈：
+
+- SST瓶颈：256通道、Patch 1、Embedding 256、8 heads、2层、MLP ratio 4。
+- SSH/SSS瓶颈：64通道、Patch 2、Embedding 128、4 heads、2层、MLP ratio 4。
+- 两个ViT均采用可插值的可学习二维位置编码、Pre-LayerNorm、GELU和dropout 0.1。
+- 全局注意力Token上限分别为256和512，控制全区域数据的显存开销；CNN残差保留原始局部特征。
+- 当前版本`skip_attention=false`、`vertical_transformer=false`，没有开启跳连Attention Gate，也没有HVCA。
+- 六层输出通道数仍由`--depth-indices 0,4,9,17,24,27`自动得到，无需手工设置为6。
+- 六层B2共5,802,950个可训练参数；B1六层为2,943,110个。
+
+### 从本地打包、备份并部署到服务器
+
+```bash
+cd /Users/lijunjie/Documents/python/ocean-subsurface-recon-b2
+./scripts/deploy_upload.sh
+```
+
+脚本会上传压缩包、在服务器临时目录解压校验，并把旧的
+`/root/ocean-subsurface-recon-b2`改名为带时间戳的备份后整体替换。服务器地址变化时：
+
+```bash
+SERVER_HOST=connect.bjb2.seetacloud.com \
+SERVER_PORT=38916 \
+SERVER_USER=root \
+REMOTE_PARENT_DIR=/root \
+./scripts/deploy_upload.sh
+```
+
+### 同六层训练
+
+在同一个tmux shell设置路径：
+
+```bash
+cd /root/ocean-subsurface-recon-b2
+
+DATA=/root/autodl-tmp/raw_all_size/npy
+STATS=/root/autodl-fs/raw_all_size/normalization_stats/glorys12v1_temperature_2002_2021.npz
+B2_ROOT=/root/autodl-tmp/Joint_DUViT_all_size
+B2_CKPT="$B2_ROOT/checkpoints"
+B2_OUT="$B2_ROOT/outputs"
+B2_LOG="$B2_ROOT/logs"
+DEPTH_IDX=0,4,9,17,24,27
+MODEL="$B2_CKPT/2dto2d/Joint_DUViT/temperature/Joint_DUViT_temperature_idx0-4-9-17-24-27_6depths_best.pth"
+
+mkdir -p "$B2_CKPT" "$B2_OUT" "$B2_LOG"
+set -o pipefail
+```
+
+先用batch size 4训练；确认显存余量后可以提高，但同一组比较需记录实际batch size：
+
+```bash
+python -u train.py \
+  --method joint_duvit --target-var temperature \
+  --dataset-profile glorys12v1_all_size \
+  --data-dir "$DATA" --normalization-stats-path "$STATS" \
+  --start-date 2002-01-01 --end-date 2023-12-31 \
+  --depth-indices "$DEPTH_IDX" \
+  --epochs 50 --patience 10 --batch-size 4 --lr 0.001 \
+  --num-workers 4 --prefetch-factor 2 --pin-memory --persistent-workers \
+  --checkpoint-dir "$B2_CKPT" --output-dir "$B2_OUT" --seed 42 \
+  2>&1 | tee -a "$B2_LOG/joint_duvit_6depths_train.log"
+```
+
+### 2023年全年测试和水平图
+
+```bash
+python -u test.py \
+  --method joint_duvit --target-var temperature \
+  --dataset-profile glorys12v1_all_size \
+  --data-dir "$DATA" --normalization-stats-path "$STATS" \
+  --checkpoint "$MODEL" \
+  --start-date 2002-01-01 --end-date 2023-12-31 \
+  --eval-start 2023-01-01 --eval-end 2023-12-31 \
+  --depth-indices "$DEPTH_IDX" --eval-batch-size 4 \
+  --spatial-panels --target-levels 0,1,2,3,4,5 \
+  --output-dir "$B2_OUT" \
+  2>&1 | tee -a "$B2_LOG/joint_duvit_6depths_test.log"
+```
+
+这条测试命令只生成水平面板，不传`section`参数，因此不调用垂向可视化。主要路径：
+
+```text
+/root/autodl-tmp/Joint_DUViT_all_size/
+├── checkpoints/2dto2d/Joint_DUViT/temperature/
+│   └── Joint_DUViT_temperature_idx0-4-9-17-24-27_6depths_best.pth
+├── outputs/2dto2d/Joint_DUViT/temperature/
+│   ├── Joint_DUViT_train_config_idx0-4-9-17-24-27_6depths.json
+│   ├── Joint_DUViT_test_config_idx0-4-9-17-24-27_6depths.json
+│   ├── training_history_Joint_DUViT_temperature_idx0-4-9-17-24-27_6depths.npz
+│   ├── loss_Joint_DUViT_temperature_idx0-4-9-17-24-27_6depths.png
+│   ├── evaluation_metrics_Joint_DUViT_temperature_20230101_20231231.npz
+│   ├── summary_Joint_DUViT_temperature_20230101_20231231.json
+│   ├── metrics_by_depth_Joint_DUViT_temperature_20230101_20231231.png
+│   ├── metrics_by_day_Joint_DUViT_temperature_20230101_20231231.png
+│   ├── horizontal_structure_by_depth_Joint_DUViT_temperature_20230101_20231231.png
+│   ├── horizontal_structure_by_day_Joint_DUViT_temperature_20230101_20231231.png
+│   └── visualizations/idx0-4-9-17-24-27_6depths/horizontal/
+└── logs/
+    ├── joint_duvit_6depths_train.log
+    └── joint_duvit_6depths_test.log
+```
+
+B2与B1的主对比保持相同输入、六层、数据划分、归一化、损失、学习率、训练轮数和随机种子，重点比较逐深度RMSE以及年度SSIM、ACC。水平案例使用同一批日期，不能让两个模型各自挑选不同日期后直接比较。
 
 ## HVCARefiner
 
@@ -606,16 +716,17 @@ python test.py --method modas \
 ## 指标口径
 
 - 深度学习模型会在评估前反标准化回原始物理单位。
-- Du_Unet、Joint_Du_Unet 和 HVCARefiner 的指标会排除 `target_mask=0` 的无效区域。
+- Du_Unet、Joint_Du_Unet、Joint_DUViT和HVCARefiner的指标会排除`target_mask=0`的无效区域。
 - 时间段评估包含 overall、by-depth、by-day 三类统计。
 - overall RMSE 是所有有效点平方误差总体均值开方，不是每日 RMSE 的平均。
-- Joint_Du_Unet 额外保存 `by_day_depth_*`，用于避免把时间、深度和空间混合后掩盖局部误差。
-- Joint_Du_Unet 的SSIM和ACC按每天、每层单独计算，并等权汇总为年度水平结构指标。
+- Joint_Du_Unet和Joint_DUViT额外保存`by_day_depth_*`，用于避免把时间、深度和空间混合后掩盖局部误差。
+- Joint_Du_Unet和Joint_DUViT的SSIM、ACC按每天、每层单独计算，并等权汇总为年度水平结构指标。
 
 ## 常用配置位置
 
 - 路径和日期：`config.py` 中的 `DATA_DIR`、`OUTPUTS_ROOT`、`CHECKPOINTS_ROOT`、`DATA_START_DATE`、`TEST_START_DATE`。
 - Du_Unet 超参数：`DU_UNET_*`。
 - Joint_Du_Unet 沿用 `DU_UNET_*` 优化设置，并动态读取当前profile的深度数。
+- Joint_DUViT沿用`DU_UNET_*`优化设置；空间ViT结构参数位于`JOINT_DUVIT_*`。
 - OceanTransformer 超参数：`TWODTO3D_*`。
 - 深度列表：`DEPTH_LEVELS_25M`、`DEPTH_LEVELS_26M`。

@@ -30,6 +30,21 @@ from config import (
     JOINT_DU_UNET_CKPT_NAME_TEMPLATE,
     JOINT_DU_UNET_HISTORY_NAME_TEMPLATE,
     JOINT_DU_UNET_LOSS_CURVE_TEMPLATE,
+    JOINT_DUVIT_CKPT_NAME_TEMPLATE,
+    JOINT_DUVIT_DROPOUT,
+    JOINT_DUVIT_HISTORY_NAME_TEMPLATE,
+    JOINT_DUVIT_LOSS_CURVE_TEMPLATE,
+    JOINT_DUVIT_MLP_RATIO,
+    JOINT_DUVIT_SST_EMBED_DIM,
+    JOINT_DUVIT_SST_NUM_HEADS,
+    JOINT_DUVIT_SST_NUM_LAYERS,
+    JOINT_DUVIT_SST_MAX_TOKENS,
+    JOINT_DUVIT_SST_PATCH_SIZE,
+    JOINT_DUVIT_SURFACE_EMBED_DIM,
+    JOINT_DUVIT_SURFACE_NUM_HEADS,
+    JOINT_DUVIT_SURFACE_NUM_LAYERS,
+    JOINT_DUVIT_SURFACE_MAX_TOKENS,
+    JOINT_DUVIT_SURFACE_PATCH_SIZE,
     TWODTO3D_DATA_START_DATE,
     TWODTO3D_BATCH_SIZE,
     TWODTO3D_D_MODEL,
@@ -63,6 +78,7 @@ from datasets.dataset_2dto2d import Dataset2Dto2D
 from datasets.dataset_2dto3d import DummyTwoDto3DDataset
 from models.du_unet import Du_Unet
 from models.joint_du_unet import JointDuUnet
+from models.joint_duvit import JointDUViT
 from models.ocean_transformer import OceanTransformer
 from utils.losses import masked_depth_mean_rmse_loss, masked_rmse_loss
 from utils.physics import compute_eke, compute_grad_ssh
@@ -73,7 +89,12 @@ from utils.run_config import (
     print_and_save_run_config,
 )
 
-TRAINABLE_METHODS = {"du_unet", "joint_du_unet", "ocean_transformer"}
+TRAINABLE_METHODS = {
+    "du_unet",
+    "joint_du_unet",
+    "joint_duvit",
+    "ocean_transformer",
+}
 
 
 class DepthTargetDataset(Dataset):
@@ -132,6 +153,45 @@ def build_model(method, **kwargs):
         if num_depths is None:
             raise ValueError("Joint_Du_Unet 构建时必须提供 num_depths")
         return JointDuUnet(num_depths=num_depths)
+    if name in {"joint_duvit", "joint-duvit"}:
+        num_depths = kwargs.get("num_depths", kwargs.get("out_channels"))
+        if num_depths is None:
+            raise ValueError("Joint_DUViT 构建时必须提供 num_depths")
+        return JointDUViT(
+            num_depths=num_depths,
+            sst_embed_dim=kwargs.get(
+                "sst_embed_dim", JOINT_DUVIT_SST_EMBED_DIM
+            ),
+            sst_patch_size=kwargs.get(
+                "sst_patch_size", JOINT_DUVIT_SST_PATCH_SIZE
+            ),
+            sst_num_heads=kwargs.get(
+                "sst_num_heads", JOINT_DUVIT_SST_NUM_HEADS
+            ),
+            sst_num_layers=kwargs.get(
+                "sst_num_layers", JOINT_DUVIT_SST_NUM_LAYERS
+            ),
+            sst_max_tokens=kwargs.get(
+                "sst_max_tokens", JOINT_DUVIT_SST_MAX_TOKENS
+            ),
+            surface_embed_dim=kwargs.get(
+                "surface_embed_dim", JOINT_DUVIT_SURFACE_EMBED_DIM
+            ),
+            surface_patch_size=kwargs.get(
+                "surface_patch_size", JOINT_DUVIT_SURFACE_PATCH_SIZE
+            ),
+            surface_num_heads=kwargs.get(
+                "surface_num_heads", JOINT_DUVIT_SURFACE_NUM_HEADS
+            ),
+            surface_num_layers=kwargs.get(
+                "surface_num_layers", JOINT_DUVIT_SURFACE_NUM_LAYERS
+            ),
+            surface_max_tokens=kwargs.get(
+                "surface_max_tokens", JOINT_DUVIT_SURFACE_MAX_TOKENS
+            ),
+            mlp_ratio=kwargs.get("mlp_ratio", JOINT_DUVIT_MLP_RATIO),
+            dropout=kwargs.get("dropout", JOINT_DUVIT_DROPOUT),
+        )
     if name == "ocean_transformer":
         return OceanTransformer(
             in_channels=kwargs.get("in_channels", TWODTO3D_IN_CHANNELS),
@@ -483,7 +543,8 @@ def parse_args():
         default=None,
         help=(
             "原始数据中的目标深度索引；Du_Unet逐层训练，"
-            "Joint_Du_Unet用一个模型联合输出这些层；默认使用全部深度"
+            "Joint_Du_Unet/Joint_DUViT用一个模型联合输出这些层；"
+            "默认使用全部深度"
         ),
     )
     return parser.parse_args()
@@ -502,19 +563,22 @@ def main():
         method = "du_unet"
     if method in {"joint-du-unet", "joint_unet", "joint-unet"}:
         method = "joint_du_unet"
+    if method in {"joint-duvit", "joint_vit", "joint-vit"}:
+        method = "joint_duvit"
     if method not in TRAINABLE_METHODS:
         raise ValueError(f"未识别的方法: {args.method}")
     paradigm = paradigm_of_method(method)
     method_dir = {
         "du_unet": "Du_Unet",
         "joint_du_unet": "Joint_Du_Unet",
+        "joint_duvit": "Joint_DUViT",
     }.get(method, method)
 
     device = get_device()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    if method in {"du_unet", "joint_du_unet"}:
+    if method in {"du_unet", "joint_du_unet", "joint_duvit"}:
         out_dir = get_output_dir(
             paradigm, method_dir, base_dir=args.output_dir, target_var=args.target_var
         )
@@ -779,7 +843,29 @@ def main():
             print(f"深度 {depth_m}m 训练完成，best val={best_val:.6f}")
         return
 
-    if method == "joint_du_unet":
+    if method in {"joint_du_unet", "joint_duvit"}:
+        is_duvit = method == "joint_duvit"
+        model_name = "Joint_DUViT" if is_duvit else "Joint_Du_Unet"
+        experiment_name = (
+            "B2_spatial_vit_bottlenecks"
+            if is_duvit
+            else "B1_joint_output_baseline"
+        )
+        ckpt_template = (
+            JOINT_DUVIT_CKPT_NAME_TEMPLATE
+            if is_duvit
+            else JOINT_DU_UNET_CKPT_NAME_TEMPLATE
+        )
+        history_template = (
+            JOINT_DUVIT_HISTORY_NAME_TEMPLATE
+            if is_duvit
+            else JOINT_DU_UNET_HISTORY_NAME_TEMPLATE
+        )
+        curve_template = (
+            JOINT_DUVIT_LOSS_CURVE_TEMPLATE
+            if is_duvit
+            else JOINT_DU_UNET_LOSS_CURVE_TEMPLATE
+        )
         epochs = args.epochs or DU_UNET_EPOCHS
         batch_size = args.batch_size or DU_UNET_BATCH_SIZE
         lr = args.lr or DU_UNET_LR
@@ -791,7 +877,19 @@ def main():
             depth_indices, total_num_depths=dataset.num_depths
         )
         joint_dataset = DepthIndicesTargetDataset(dataset, depth_indices)
-        model = build_model("joint_du_unet", num_depths=num_outputs).to(device)
+        model = build_model(method, num_depths=num_outputs).to(device)
+        architecture_config = (
+            model.model_config()
+            if is_duvit
+            else {
+                "backbone": "Du_Unet",
+                "out_channels": num_outputs,
+                "joint_depth_output": True,
+                "attention": False,
+                "transformer": False,
+            }
+        )
+        architecture_config["source_depth_indices"] = list(depth_indices)
         param_stats = count_model_parameters(model)
         scheduler_step_size = max(epochs // 3, 1)
         loader_kwargs = dataloader_kwargs(args, device)
@@ -815,21 +913,21 @@ def main():
             optimizer, step_size=scheduler_step_size, gamma=0.5
         )
 
-        ckpt_name = JOINT_DU_UNET_CKPT_NAME_TEMPLATE.format(
+        ckpt_name = ckpt_template.format(
             target_var=args.target_var,
             depth_tag=depth_tag,
         )
         ckpt_path = os.path.join(ckpt_dir, ckpt_name)
-        history_name = JOINT_DU_UNET_HISTORY_NAME_TEMPLATE.format(
+        history_name = history_template.format(
             target_var=args.target_var,
             depth_tag=depth_tag,
         )
-        curve_name = JOINT_DU_UNET_LOSS_CURVE_TEMPLATE.format(
+        curve_name = curve_template.format(
             target_var=args.target_var,
             depth_tag=depth_tag,
         )
         training_strategy = {
-            "experiment": "B1_joint_output_baseline",
+            "experiment": experiment_name,
             "epoch": {
                 "planned": epochs,
                 "indexing": "1_based",
@@ -858,17 +956,17 @@ def main():
         }
         config_path = model_config_path(
             args.output_dir,
-            "Joint_Du_Unet",
+            model_name,
             "train",
             target_var=args.target_var,
             run_tag=depth_tag,
         )
         print_and_save_run_config(
-            "B1 Joint_Du_Unet 训练超参数",
+            f"{'B2' if is_duvit else 'B1'} {model_name} 训练超参数",
             {
                 "stage": "train",
-                "experiment": "B1_joint_output_baseline",
-                "model": "Joint_Du_Unet",
+                "experiment": experiment_name,
+                "model": model_name,
                 "method": method,
                 "paradigm": paradigm,
                 "target_var": args.target_var,
@@ -912,14 +1010,7 @@ def main():
                     "depth_m": selected_depth_levels,
                 },
                 "training_strategy": training_strategy,
-                "model_config": {
-                    "backbone": "Du_Unet",
-                    "out_channels": num_outputs,
-                    "joint_depth_output": True,
-                    "source_depth_indices": depth_indices,
-                    "attention": False,
-                    "transformer": False,
-                },
+                "model_config": architecture_config,
                 "loss_config": {
                     "name": "masked_depth_mean_rmse_loss",
                     "description": "mean of per-depth masked RMSE",
@@ -951,7 +1042,7 @@ def main():
             depth_idx=None,
             equal_depth_weighting=True,
             checkpoint_metadata={
-                "checkpoint_type": "Joint_Du_Unet",
+                "checkpoint_type": model_name,
                 "target_var": args.target_var,
                 "dataset_profile": args.dataset_profile,
                 "dataset_num_depths": dataset.num_depths,
@@ -961,12 +1052,7 @@ def main():
                 "num_outputs": num_outputs,
                 "depth_tag": depth_tag,
                 "normalization_stats": dataset.get_normalization_reference(),
-                "model_config": {
-                    "backbone": "Du_Unet",
-                    "out_channels": num_outputs,
-                    "attention": False,
-                    "transformer": False,
-                },
+                "model_config": architecture_config,
             },
         )
         np.savez(
@@ -981,7 +1067,10 @@ def main():
             val_losses,
             os.path.join(out_dir, curve_name),
         )
-        print(f"\nB1 联合深度训练完成。最佳验证损失: {best_val:.6f}")
+        print(
+            f"\n{'B2 空间ViT' if is_duvit else 'B1 联合深度'}训练完成。"
+            f"最佳验证损失: {best_val:.6f}"
+        )
         print(f"最佳权重: {ckpt_path}")
         return
 
