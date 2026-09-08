@@ -4,7 +4,7 @@ set -euo pipefail
 # 禁止 macOS 在压缩包中写入 ._* AppleDouble 元数据文件。
 export COPYFILE_DISABLE=1
 
-PROJECT_NAME="ocean-subsurface-recon-b2"
+PROJECT_NAME="ocean-subsurface-recon-b3"
 SERVER_USER="${SERVER_USER:-root}"
 SERVER_HOST="${SERVER_HOST:-connect.bjb1.seetacloud.com}"
 SERVER_PORT="${SERVER_PORT:-50490}"
@@ -32,7 +32,9 @@ for command_name in tar scp ssh; do
   fi
 done
 
-if [ ! -f "${PROJECT_DIR}/train.py" ] || [ ! -f "${PROJECT_DIR}/test.py" ]; then
+if [ ! -f "${PROJECT_DIR}/train.py" ] || \
+   [ ! -f "${PROJECT_DIR}/test.py" ] || \
+   [ ! -f "${PROJECT_DIR}/models/b3_depthformer/model.py" ]; then
   echo "Project root is invalid: ${PROJECT_DIR}" >&2
   exit 1
 fi
@@ -132,7 +134,9 @@ fi
 mkdir -p -- "${staging_dir}"
 tar -xzf "${archive_path}" -C "${staging_dir}"
 
-if [ ! -f "${staging_dir}/train.py" ] || [ ! -f "${staging_dir}/test.py" ]; then
+if [ ! -f "${staging_dir}/train.py" ] || \
+   [ ! -f "${staging_dir}/test.py" ] || \
+   [ ! -f "${staging_dir}/models/b3_depthformer/model.py" ]; then
   echo "Extracted project validation failed; current deployment was not changed" >&2
   exit 1
 fi
@@ -153,7 +157,7 @@ echo "Uploaded archive retained at: ${archive_path}"
 REMOTE_DEPLOY
 
 echo
-echo "B2 deployment completed successfully."
+echo "B3 deployment completed successfully."
 echo "Server project: ${REMOTE_PROJECT_DIR}"
 echo "Server backup:  ${REMOTE_BACKUP_DIR} (when a previous version existed)"
 echo "Server archive: ${REMOTE_ARCHIVE_PATH}"

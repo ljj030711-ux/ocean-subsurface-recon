@@ -1,12 +1,12 @@
 # Ocean Subsurface Recon
 
-本项目用海表场重建水下多深度温度或盐度结构，当前包含 `Du_Unet`、`Joint_Du_Unet`、`Joint_DUViT`、`HVCARefiner`、`ocean_transformer`、`2dvar` 和 `modas`。
+本项目用海表场重建水下多深度温度或盐度结构，当前包含 `Du_Unet`、`Joint_Du_Unet`、`Joint_DUViT`、`B3_DepthFormer`、`HVCARefiner`、`ocean_transformer`、`2dvar` 和 `modas`。
 
 ## 总览
 
 ### 建模范式
 
-- `2dto2d`：`Du_Unet`为逐深度B0，`Joint_Du_Unet`为联合输出B1，`Joint_DUViT`为在两个瓶颈加入空间ViT的B2，`HVCARefiner`为B0旁支的二阶段修正模型。
+- `2dto2d`：`Du_Unet`为逐深度B0，`Joint_Du_Unet`为联合输出B1，`Joint_DUViT`为在两个瓶颈加入空间ViT的B2，`B3_DepthFormer`为BOS启动的深度自回归Transformer，`HVCARefiner`为B0旁支的二阶段修正模型。
 - `2dto3d`：单次输出多个深度。当前包括 `ocean_transformer`、`2dvar`、`modas`。
 
 ### 目录规则
@@ -19,6 +19,8 @@
 - Joint_Du_Unet 权重：`checkpoints/2dto2d/Joint_Du_Unet/{temperature|salinity}/`
 - Joint_DUViT 输出：`outputs/2dto2d/Joint_DUViT/{temperature|salinity}/`
 - Joint_DUViT 权重：`checkpoints/2dto2d/Joint_DUViT/{temperature|salinity}/`
+- B3_DepthFormer 输出：`outputs/2dto2d/B3_DepthFormer/{temperature|salinity}/`
+- B3_DepthFormer 权重：`checkpoints/2dto2d/B3_DepthFormer/{temperature|salinity}/`
 - HVCARefiner 输出与权重：`outputs/2dto2d/HVCARefiner/`
 - OceanTransformer 输出：`outputs/2dto3d/ocean_transformer/`
 - 2DVar 输出：`outputs/2dto3d/2dvar/`
@@ -26,7 +28,7 @@
 
 ### 运行日志和配置快照
 
-Du_Unet、Joint_Du_Unet、Joint_DUViT和HVCARefiner的train/test入口会在运行前打印最终超参数，并保存JSON配置快照：
+Du_Unet、Joint_Du_Unet、Joint_DUViT、B3_DepthFormer和HVCARefiner的train/test入口会在运行前打印最终超参数，并保存JSON配置快照：
 
 - `outputs/2dto2d/Du_Unet/Du_Unet_train_config.json`
 - `outputs/2dto2d/Du_Unet/Du_Unet_test_config.json`
@@ -34,6 +36,8 @@ Du_Unet、Joint_Du_Unet、Joint_DUViT和HVCARefiner的train/test入口会在运�
 - `outputs/2dto2d/Joint_Du_Unet/{target_var}/Joint_Du_Unet_test_config_{depth_tag}.json`
 - `outputs/2dto2d/Joint_DUViT/{target_var}/Joint_DUViT_train_config_{depth_tag}.json`
 - `outputs/2dto2d/Joint_DUViT/{target_var}/Joint_DUViT_test_config_{depth_tag}.json`
+- `outputs/2dto2d/B3_DepthFormer/{target_var}/B3_DepthFormer_train_config_{depth_tag}.json`
+- `outputs/2dto2d/B3_DepthFormer/{target_var}/B3_DepthFormer_test_config_{depth_tag}.json`
 - HVCARefiner 训练配置：`<train --save-dir>/HVCARefiner_train_config.json`
 - HVCARefiner 测试配置：`<test --save-dir>/HVCARefiner_test_config.json`
 
@@ -54,6 +58,10 @@ Du_Unet 和 HVCARefiner 使用 `DEPTH_LEVELS_25M`，从 5m 开始：
 ```
 
 `--depth-indices` 是索引，`--depths` 是实际米数。
+
+## B3：DepthFormer 深度自回归模型
+
+B3 将 SST、SSH、SSS 编码为共享海表记忆，以可学习 BOS token 启动，按真实深度从浅到深生成目标温度层。模型结构、指定六层实验、CPU smoke test、训练/评估指令和完整超参数见 [B3 实现说明](docs/B3_DEPTHFORMER.md)。
 
 ## Du_Unet
 

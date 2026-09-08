@@ -16,6 +16,7 @@ from models.inversion_2dvar import inversion_2dvar
 from models.inversion_modas import inversion_modas
 
 from config import (
+    B3_DEPTHFORMER_CKPT_NAME_TEMPLATE,
     CHECKPOINTS_ROOT,
     DATA_DIR,
     DATA_END_DATE,
@@ -80,7 +81,7 @@ NON_DL_METHODS = {"2dvar", "modas"}
 DL_2DTO2D_METHODS = set(PARADIGM_2DTO2D_METHODS)
 DL_2DTO3D_METHODS = set(PARADIGM_2DTO3D_METHODS) - NON_DL_METHODS
 ALL_METHODS = sorted(DL_2DTO2D_METHODS | DL_2DTO3D_METHODS | NON_DL_METHODS)
-JOINT_METHOD_NAMES = {"Joint_Du_Unet", "Joint_DUViT"}
+JOINT_METHOD_NAMES = {"Joint_Du_Unet", "Joint_DUViT", "B3_DepthFormer"}
 
 
 def _is_joint_method(args):
@@ -88,6 +89,14 @@ def _is_joint_method(args):
 
 
 def _joint_method_spec(args):
+    if getattr(args, "method", None) == "B3_DepthFormer":
+        return {
+            "method_key": "b3_depthformer",
+            "model_name": "B3_DepthFormer",
+            "checkpoint_type": "B3_DepthFormer",
+            "checkpoint_template": B3_DEPTHFORMER_CKPT_NAME_TEMPLATE,
+            "experiment": "B3_BOS_depth_autoregressive",
+        }
     if getattr(args, "method", None) == "Joint_DUViT":
         return {
             "method_key": "joint_duvit",
@@ -483,7 +492,7 @@ def predict_2dto3d(args):
 
 
 def predict_2dto2d(args):
-    """Run B0 layer-wise or a joint-depth B1/B2 prediction."""
+    """Run B0 layer-wise or a joint-depth B1/B2/B3 prediction."""
     device = _get_device()
 
     from datasets.dataset_2dto2d import Dataset2Dto2D
@@ -717,6 +726,7 @@ def _target_var_for_outputs(args, is_2dto3d):
         "Du_Unet",
         "Joint_Du_Unet",
         "Joint_DUViT",
+        "B3_DepthFormer",
     }:
         return getattr(args, "target_var", None)
     return None
@@ -815,7 +825,14 @@ def _joint_du_unet_checkpoint_candidates(args, dataset_num_depths):
     return candidates
 
 
-def _joint_output_channels_from_state_dict(state_dict):
+def _joint_output_channels_from_state_dict(state_dict, method_key):
+    if method_key == "b3_depthformer":
+        depth_values = state_dict.get("depth_embedding.depth_values")
+        if depth_values is None or not hasattr(depth_values, "numel"):
+            raise ValueError(
+                "无法从 B3 checkpoint 推断深度数；缺少 depth_embedding.depth_values"
+            )
+        return int(depth_values.numel())
     candidates = [
         value
         for key, value in state_dict.items()
@@ -830,7 +847,7 @@ def _joint_output_channels_from_state_dict(state_dict):
 
 
 def _load_joint_du_unet_model(args, device, dataset):
-    """Load one B1/B2 joint checkpoint and recover its depth mapping."""
+    """Load one B1/B2/B3 joint checkpoint and recover its depth mapping."""
     from train import build_model
 
     spec = _joint_method_spec(args)
@@ -881,7 +898,9 @@ def _load_joint_du_unet_model(args, device, dataset):
                 + ", ".join(missing_metadata)
             )
 
-    num_outputs = _joint_output_channels_from_state_dict(state_dict)
+    num_outputs = _joint_output_channels_from_state_dict(
+        state_dict, spec["method_key"]
+    )
     stored_indices = metadata.get("depth_indices")
     if stored_indices is None:
         if num_outputs != dataset.num_depths:
@@ -928,6 +947,15 @@ def _load_joint_du_unet_model(args, device, dataset):
         raise ValueError(
             "checkpoint model_config.out_channels 与权重不一致: "
             f"metadata={metadata_out_channels}, weights={num_outputs}"
+        )
+    metadata_num_depths = metadata_model_config.get("num_depths")
+    if (
+        metadata_num_depths is not None
+        and int(metadata_num_depths) != num_outputs
+    ):
+        raise ValueError(
+            "checkpoint model_config.num_depths 与权重不一致: "
+            f"metadata={metadata_num_depths}, weights={num_outputs}"
         )
 
     expected_depth_values = [
@@ -983,7 +1011,38 @@ def _load_joint_du_unet_model(args, device, dataset):
                 "checkpoint 与测试数据使用的归一化统计量指纹不一致"
             )
 
-    build_kwargs = {"num_depths": num_outputs}
+    if spec["method_key"] == "b3_depthformer":
+        if not structured_checkpoint:
+            raise ValueError("B3 仅支持包含结构元数据的新版 checkpoint")
+        build_kwargs = {
+            "depth_values": metadata_model_config.get(
+                "depth_values", metadata.get("depth_m")
+            ),
+            "d_model": metadata_model_config.get("d_model"),
+            "nhead": metadata_model_config.get("nhead"),
+            "encoder_layers": metadata_model_config.get("encoder_layers"),
+            "decoder_layers": metadata_model_config.get("decoder_layers"),
+            "dim_feedforward": metadata_model_config.get("dim_feedforward"),
+            "dropout": metadata_model_config.get("dropout"),
+            "sst_patch_size": metadata_model_config.get("sst_patch_size"),
+            "surface_patch_size": metadata_model_config.get(
+                "surface_patch_size"
+            ),
+            "output_patch_size": metadata_model_config.get("output_patch_size"),
+            "refinement_channels": metadata_model_config.get(
+                "refinement_channels"
+            ),
+            "base_grid_size": metadata_model_config.get("base_grid_size"),
+        }
+        missing = sorted(
+            key for key, value in build_kwargs.items() if value is None
+        )
+        if missing:
+            raise ValueError(
+                "B3 checkpoint model_config 缺少模型参数: " + ", ".join(missing)
+            )
+    else:
+        build_kwargs = {"num_depths": num_outputs}
     if spec["method_key"] == "joint_duvit" and metadata_model_config:
         sst_vit = metadata_model_config.get("sst_vit") or {}
         surface_vit = metadata_model_config.get("surface_vit") or {}
@@ -1427,7 +1486,7 @@ def _render_joint_section_panels(
 
 
 def evaluate_2dto2d_period(args, out_dir):
-    """Evaluate B0 layer-wise or B1/B2 joint-depth predictions over a period."""
+    """Evaluate B0 layer-wise or B1/B2/B3 joint-depth predictions."""
     from datasets.dataset_2dto2d import Dataset2Dto2D
     from train import build_model
 
@@ -2403,18 +2462,26 @@ def main():
         method = "joint_du_unet"
     if method in {"joint-duvit", "joint_vit", "joint-vit"}:
         method = "joint_duvit"
+    if method in {"b3-depthformer", "b3"}:
+        method = "b3_depthformer"
     if method not in ALL_METHODS:
         raise ValueError(f"未知方法: {args.method}")
     args.method = {
         "du_unet": "Du_Unet",
         "joint_du_unet": "Joint_Du_Unet",
         "joint_duvit": "Joint_DUViT",
+        "b3_depthformer": "B3_DepthFormer",
     }.get(method, method)
     if method in PARADIGM_2DTO2D_METHODS:
         paradigm = PARADIGM_2DTO2D
     else:
         paradigm = PARADIGM_2DTO3D
-    if method in {"du_unet", "joint_du_unet", "joint_duvit"}:
+    if method in {
+        "du_unet",
+        "joint_du_unet",
+        "joint_duvit",
+        "b3_depthformer",
+    }:
         out_dir = get_output_dir(
             paradigm, args.method, base_dir=args.output_dir, target_var=args.target_var
         )
@@ -2423,7 +2490,12 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     if args.eval_start:
-        if method not in {"du_unet", "joint_du_unet", "joint_duvit"}:
+        if method not in {
+            "du_unet",
+            "joint_du_unet",
+            "joint_duvit",
+            "b3_depthformer",
+        }:
             raise ValueError(
                 "时间段整体评估目前仅支持Du_Unet和联合深度模型"
             )

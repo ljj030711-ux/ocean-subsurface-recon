@@ -13,6 +13,28 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import (
+    B3_DEPTHFORMER_BASE_GRID_SIZE,
+    B3_DEPTHFORMER_BATCH_SIZE,
+    B3_DEPTHFORMER_CKPT_NAME_TEMPLATE,
+    B3_DEPTHFORMER_DECODER_LAYERS,
+    B3_DEPTHFORMER_DIM_FF,
+    B3_DEPTHFORMER_D_MODEL,
+    B3_DEPTHFORMER_DROPOUT,
+    B3_DEPTHFORMER_ENCODER_LAYERS,
+    B3_DEPTHFORMER_EPOCHS,
+    B3_DEPTHFORMER_HISTORY_NAME_TEMPLATE,
+    B3_DEPTHFORMER_LOSS_CURVE_TEMPLATE,
+    B3_DEPTHFORMER_LR,
+    B3_DEPTHFORMER_NHEAD,
+    B3_DEPTHFORMER_OUTPUT_PATCH_SIZE,
+    B3_DEPTHFORMER_PATIENCE,
+    B3_DEPTHFORMER_REFINEMENT_CHANNELS,
+    B3_DEPTHFORMER_SST_PATCH_SIZE,
+    B3_DEPTHFORMER_SURFACE_PATCH_SIZE,
+    B3_DEPTHFORMER_TEACHER_FORCING_DECAY_EPOCHS,
+    B3_DEPTHFORMER_TEACHER_FORCING_END,
+    B3_DEPTHFORMER_TEACHER_FORCING_START,
+    B3_DEPTHFORMER_WEIGHT_DECAY,
     CHECKPOINTS_ROOT,
     DATA_DIR,
     DATA_START_DATE,
@@ -76,6 +98,7 @@ from config import (
 )
 from datasets.dataset_2dto2d import Dataset2Dto2D
 from datasets.dataset_2dto3d import DummyTwoDto3DDataset
+from models.b3_depthformer import B3DepthFormer
 from models.du_unet import Du_Unet
 from models.joint_du_unet import JointDuUnet
 from models.joint_duvit import JointDUViT
@@ -90,6 +113,7 @@ from utils.run_config import (
 )
 
 TRAINABLE_METHODS = {
+    "b3_depthformer",
     "du_unet",
     "joint_du_unet",
     "joint_duvit",
@@ -191,6 +215,40 @@ def build_model(method, **kwargs):
             ),
             mlp_ratio=kwargs.get("mlp_ratio", JOINT_DUVIT_MLP_RATIO),
             dropout=kwargs.get("dropout", JOINT_DUVIT_DROPOUT),
+        )
+    if name in {"b3_depthformer", "b3-depthformer", "b3"}:
+        depth_values = kwargs.get("depth_values")
+        if depth_values is None:
+            raise ValueError("B3_DepthFormer 构建时必须提供 depth_values")
+        return B3DepthFormer(
+            depth_values=depth_values,
+            d_model=kwargs.get("d_model", B3_DEPTHFORMER_D_MODEL),
+            nhead=kwargs.get("nhead", B3_DEPTHFORMER_NHEAD),
+            encoder_layers=kwargs.get(
+                "encoder_layers", B3_DEPTHFORMER_ENCODER_LAYERS
+            ),
+            decoder_layers=kwargs.get(
+                "decoder_layers", B3_DEPTHFORMER_DECODER_LAYERS
+            ),
+            dim_feedforward=kwargs.get(
+                "dim_feedforward", B3_DEPTHFORMER_DIM_FF
+            ),
+            dropout=kwargs.get("dropout", B3_DEPTHFORMER_DROPOUT),
+            sst_patch_size=kwargs.get(
+                "sst_patch_size", B3_DEPTHFORMER_SST_PATCH_SIZE
+            ),
+            surface_patch_size=kwargs.get(
+                "surface_patch_size", B3_DEPTHFORMER_SURFACE_PATCH_SIZE
+            ),
+            output_patch_size=kwargs.get(
+                "output_patch_size", B3_DEPTHFORMER_OUTPUT_PATCH_SIZE
+            ),
+            refinement_channels=kwargs.get(
+                "refinement_channels", B3_DEPTHFORMER_REFINEMENT_CHANNELS
+            ),
+            base_grid_size=kwargs.get(
+                "base_grid_size", B3_DEPTHFORMER_BASE_GRID_SIZE
+            ),
         )
     if name == "ocean_transformer":
         return OceanTransformer(
@@ -315,6 +373,72 @@ def validate_2dto2d(
     return total / max(count, 1)
 
 
+def teacher_forcing_ratio_for_epoch(epoch, start, end, decay_epochs):
+    """Linearly decay the probability of feeding the previous true layer."""
+    start = float(start)
+    end = float(end)
+    decay_epochs = int(decay_epochs)
+    if not 0.0 <= start <= 1.0 or not 0.0 <= end <= 1.0:
+        raise ValueError("teacher forcing start/end 必须位于 [0,1]")
+    if decay_epochs <= 0:
+        raise ValueError("teacher forcing decay epochs 必须大于0")
+    progress = min(max(int(epoch), 0) / max(decay_epochs - 1, 1), 1.0)
+    return start + (end - start) * progress
+
+
+def train_b3_depthformer_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    teacher_forcing_ratio,
+):
+    """Train B3 with selected normalized depths and scheduled sampling."""
+    model.train()
+    total, count = 0.0, 0
+    for batch in loader:
+        sst = batch["sst"].to(device, non_blocking=True)
+        ssh_sss = batch["ssh_sss"].to(device, non_blocking=True)
+        target = batch["target"].to(device, non_blocking=True)
+        target_mask = batch["target_mask"].to(device, non_blocking=True)
+        pred = model(
+            sst,
+            ssh_sss,
+            target=target,
+            output_size=target.shape[-2:],
+            teacher_forcing_ratio=teacher_forcing_ratio,
+        )
+        loss = masked_depth_mean_rmse_loss(pred, target, target_mask)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        total += loss.item()
+        count += 1
+    return total / max(count, 1)
+
+
+def validate_b3_depthformer(model, loader, device):
+    """Validate under the same fully autoregressive condition used at test time."""
+    model.eval()
+    total, count = 0.0, 0
+    with torch.no_grad():
+        for batch in loader:
+            sst = batch["sst"].to(device, non_blocking=True)
+            ssh_sss = batch["ssh_sss"].to(device, non_blocking=True)
+            target = batch["target"].to(device, non_blocking=True)
+            target_mask = batch["target_mask"].to(device, non_blocking=True)
+            pred = model(
+                sst,
+                ssh_sss,
+                output_size=target.shape[-2:],
+            )
+            loss = masked_depth_mean_rmse_loss(pred, target, target_mask)
+            total += loss.item()
+            count += 1
+    return total / max(count, 1)
+
+
 def build_2dto3d_features(surface_raw):
     ssh = surface_raw[:, 0:1]
     sss = surface_raw[:, 1:2]
@@ -382,15 +506,31 @@ def train_one_model(
     criterion=None,
     equal_depth_weighting=False,
     checkpoint_metadata=None,
+    teacher_forcing_schedule=None,
 ):
     best_val = float("inf")
     patience_cnt = 0
     train_losses, val_losses = [], []
 
     for epoch in range(epochs):
+        teacher_forcing_ratio = None
         if method == "ocean_transformer":
             t_loss = train_2dto3d_epoch(model, train_loader, optimizer, device, criterion)
             v_loss = validate_2dto3d(model, val_loader, device, criterion)
+        elif method == "b3_depthformer":
+            if teacher_forcing_schedule is None:
+                raise ValueError("B3 训练缺少 teacher_forcing_schedule")
+            teacher_forcing_ratio = teacher_forcing_ratio_for_epoch(
+                epoch, *teacher_forcing_schedule
+            )
+            t_loss = train_b3_depthformer_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                teacher_forcing_ratio,
+            )
+            v_loss = validate_b3_depthformer(model, val_loader, device)
         else:
             t_loss = train_2dto2d_epoch(
                 model,
@@ -412,7 +552,15 @@ def train_one_model(
         train_losses.append(t_loss)
         val_losses.append(v_loss)
         lr_now = scheduler.get_last_lr()[0]
-        print(f"Epoch [{epoch + 1}/{epochs}] | Train: {t_loss:.6f} | Val: {v_loss:.6f} | LR: {lr_now:.2e}")
+        teacher_text = (
+            f" | Teacher forcing: {teacher_forcing_ratio:.3f}"
+            if teacher_forcing_ratio is not None
+            else ""
+        )
+        print(
+            f"Epoch [{epoch + 1}/{epochs}] | Train: {t_loss:.6f} | "
+            f"Val: {v_loss:.6f} | LR: {lr_now:.2e}{teacher_text}"
+        )
 
         if v_loss < best_val:
             best_val = v_loss
@@ -543,9 +691,73 @@ def parse_args():
         default=None,
         help=(
             "原始数据中的目标深度索引；Du_Unet逐层训练，"
-            "Joint_Du_Unet/Joint_DUViT用一个模型联合输出这些层；"
+            "联合模型和B3用一个模型输出这些层；"
             "默认使用全部深度"
         ),
+    )
+    b3 = parser.add_argument_group("B3 DepthFormer 模型参数")
+    b3.add_argument("--b3-d-model", type=int, default=B3_DEPTHFORMER_D_MODEL)
+    b3.add_argument("--b3-nhead", type=int, default=B3_DEPTHFORMER_NHEAD)
+    b3.add_argument(
+        "--b3-encoder-layers",
+        type=int,
+        default=B3_DEPTHFORMER_ENCODER_LAYERS,
+    )
+    b3.add_argument(
+        "--b3-decoder-layers",
+        type=int,
+        default=B3_DEPTHFORMER_DECODER_LAYERS,
+    )
+    b3.add_argument(
+        "--b3-dim-feedforward",
+        type=int,
+        default=B3_DEPTHFORMER_DIM_FF,
+    )
+    b3.add_argument("--b3-dropout", type=float, default=B3_DEPTHFORMER_DROPOUT)
+    b3.add_argument(
+        "--b3-sst-patch-size",
+        type=int,
+        default=B3_DEPTHFORMER_SST_PATCH_SIZE,
+    )
+    b3.add_argument(
+        "--b3-surface-patch-size",
+        type=int,
+        default=B3_DEPTHFORMER_SURFACE_PATCH_SIZE,
+    )
+    b3.add_argument(
+        "--b3-output-patch-size",
+        type=int,
+        default=B3_DEPTHFORMER_OUTPUT_PATCH_SIZE,
+    )
+    b3.add_argument(
+        "--b3-refinement-channels",
+        type=int,
+        default=B3_DEPTHFORMER_REFINEMENT_CHANNELS,
+    )
+    b3.add_argument(
+        "--b3-base-grid-height",
+        type=int,
+        default=B3_DEPTHFORMER_BASE_GRID_SIZE[0],
+    )
+    b3.add_argument(
+        "--b3-base-grid-width",
+        type=int,
+        default=B3_DEPTHFORMER_BASE_GRID_SIZE[1],
+    )
+    b3.add_argument(
+        "--b3-teacher-forcing-start",
+        type=float,
+        default=B3_DEPTHFORMER_TEACHER_FORCING_START,
+    )
+    b3.add_argument(
+        "--b3-teacher-forcing-end",
+        type=float,
+        default=B3_DEPTHFORMER_TEACHER_FORCING_END,
+    )
+    b3.add_argument(
+        "--b3-teacher-forcing-decay-epochs",
+        type=int,
+        default=B3_DEPTHFORMER_TEACHER_FORCING_DECAY_EPOCHS,
     )
     return parser.parse_args()
 
@@ -565,6 +777,8 @@ def main():
         method = "joint_du_unet"
     if method in {"joint-duvit", "joint_vit", "joint-vit"}:
         method = "joint_duvit"
+    if method in {"b3-depthformer", "b3"}:
+        method = "b3_depthformer"
     if method not in TRAINABLE_METHODS:
         raise ValueError(f"未识别的方法: {args.method}")
     paradigm = paradigm_of_method(method)
@@ -572,13 +786,19 @@ def main():
         "du_unet": "Du_Unet",
         "joint_du_unet": "Joint_Du_Unet",
         "joint_duvit": "Joint_DUViT",
+        "b3_depthformer": "B3_DepthFormer",
     }.get(method, method)
 
     device = get_device()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    if method in {"du_unet", "joint_du_unet", "joint_duvit"}:
+    if method in {
+        "du_unet",
+        "joint_du_unet",
+        "joint_duvit",
+        "b3_depthformer",
+    }:
         out_dir = get_output_dir(
             paradigm, method_dir, base_dir=args.output_dir, target_var=args.target_var
         )
@@ -841,6 +1061,247 @@ def main():
             np.savez(os.path.join(out_dir, hist_name), train_losses=train_losses, val_losses=val_losses)
             save_loss_curve(train_losses, val_losses, os.path.join(out_dir, curve_name))
             print(f"深度 {depth_m}m 训练完成，best val={best_val:.6f}")
+        return
+
+    if method == "b3_depthformer":
+        epochs = args.epochs or B3_DEPTHFORMER_EPOCHS
+        batch_size = args.batch_size or B3_DEPTHFORMER_BATCH_SIZE
+        lr = args.lr or B3_DEPTHFORMER_LR
+        patience = args.patience or B3_DEPTHFORMER_PATIENCE
+        depth_indices = parse_depth_indices(args.depth_indices, depth_levels)
+        if depth_indices != sorted(depth_indices):
+            raise ValueError(
+                "B3 --depth-indices 必须按从浅到深递增，例如 0,4,9,17,24,27"
+            )
+        selected_depth_levels = [depth_levels[idx] for idx in depth_indices]
+        num_outputs = len(depth_indices)
+        depth_tag = joint_du_unet_depth_tag(
+            depth_indices, total_num_depths=dataset.num_depths
+        )
+        model_kwargs = {
+            "depth_values": selected_depth_levels,
+            "d_model": args.b3_d_model,
+            "nhead": args.b3_nhead,
+            "encoder_layers": args.b3_encoder_layers,
+            "decoder_layers": args.b3_decoder_layers,
+            "dim_feedforward": args.b3_dim_feedforward,
+            "dropout": args.b3_dropout,
+            "sst_patch_size": args.b3_sst_patch_size,
+            "surface_patch_size": args.b3_surface_patch_size,
+            "output_patch_size": args.b3_output_patch_size,
+            "refinement_channels": args.b3_refinement_channels,
+            "base_grid_size": (
+                args.b3_base_grid_height,
+                args.b3_base_grid_width,
+            ),
+        }
+        model = build_model(method, **model_kwargs).to(device)
+        architecture_config = model.model_config()
+        architecture_config["source_depth_indices"] = list(depth_indices)
+        param_stats = count_model_parameters(model)
+        b3_dataset = DepthIndicesTargetDataset(dataset, depth_indices)
+        loader_kwargs = dataloader_kwargs(args, device)
+        train_loader = DataLoader(
+            Subset(b3_dataset, train_idx),
+            batch_size=batch_size,
+            shuffle=True,
+            **loader_kwargs,
+        )
+        val_loader = DataLoader(
+            Subset(b3_dataset, val_idx),
+            batch_size=batch_size,
+            shuffle=False,
+            **loader_kwargs,
+        )
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=B3_DEPTHFORMER_WEIGHT_DECAY,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(epochs, 1),
+            eta_min=lr * 0.05,
+        )
+        teacher_forcing_schedule = (
+            args.b3_teacher_forcing_start,
+            args.b3_teacher_forcing_end,
+            args.b3_teacher_forcing_decay_epochs,
+        )
+        # Validate the complete schedule before creating any artifacts.
+        teacher_forcing_ratio_for_epoch(0, *teacher_forcing_schedule)
+
+        ckpt_name = B3_DEPTHFORMER_CKPT_NAME_TEMPLATE.format(
+            target_var=args.target_var,
+            depth_tag=depth_tag,
+        )
+        history_name = B3_DEPTHFORMER_HISTORY_NAME_TEMPLATE.format(
+            target_var=args.target_var,
+            depth_tag=depth_tag,
+        )
+        curve_name = B3_DEPTHFORMER_LOSS_CURVE_TEMPLATE.format(
+            target_var=args.target_var,
+            depth_tag=depth_tag,
+        )
+        ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+        history_path = os.path.join(out_dir, history_name)
+        curve_path = os.path.join(out_dir, curve_name)
+        training_strategy = {
+            "experiment": "B3_BOS_depth_autoregressive",
+            "epoch": {"planned": epochs, "indexing": "1_based"},
+            "early_stopping": {
+                "enabled": True,
+                "monitor": "autoregressive_val_loss",
+                "mode": "min",
+                "patience": patience,
+            },
+            "optimizer": {
+                "name": "AdamW",
+                "lr": lr,
+                "weight_decay": B3_DEPTHFORMER_WEIGHT_DECAY,
+            },
+            "scheduler": {
+                "name": "CosineAnnealingLR",
+                "t_max_epochs": epochs,
+                "eta_min": lr * 0.05,
+                "step_on": "epoch",
+            },
+            "teacher_forcing": {
+                "start_ratio": args.b3_teacher_forcing_start,
+                "end_ratio": args.b3_teacher_forcing_end,
+                "linear_decay_epochs": args.b3_teacher_forcing_decay_epochs,
+                "selection": "per_sample_Bernoulli",
+                "validation_ratio": 0.0,
+            },
+        }
+        config_path = model_config_path(
+            args.output_dir,
+            "B3_DepthFormer",
+            "train",
+            target_var=args.target_var,
+            run_tag=depth_tag,
+        )
+        checkpoint_metadata = {
+            "checkpoint_type": "B3_DepthFormer",
+            "target_var": args.target_var,
+            "dataset_profile": args.dataset_profile,
+            "dataset_num_depths": dataset.num_depths,
+            "normalize": not args.no_normalize,
+            "depth_indices": depth_indices,
+            "depth_m": selected_depth_levels,
+            "num_outputs": num_outputs,
+            "depth_tag": depth_tag,
+            "normalization_stats": dataset.get_normalization_reference(),
+            "model_config": architecture_config,
+        }
+        print_and_save_run_config(
+            "B3 B3_DepthFormer 训练超参数",
+            {
+                "stage": "train",
+                "experiment": "B3_BOS_depth_autoregressive",
+                "model": "B3_DepthFormer",
+                "method": method,
+                "paradigm": paradigm,
+                "target_var": args.target_var,
+                "device": device,
+                "seed": args.seed,
+                "data": {
+                    "data_dir": args.data_dir,
+                    "dataset_profile": args.dataset_profile,
+                    "start_date": dataset.start_date,
+                    "end_date": dataset.end_date,
+                    "train_samples": len(train_idx),
+                    "val_samples": len(val_idx),
+                    "shapes": dataset.get_data_info(),
+                    "normalize": not args.no_normalize,
+                    "lazy_data": use_lazy_2dto2d_data(args),
+                    "normalization_chunk_size": args.normalization_chunk_size,
+                    "normalization_stats_path": dataset.normalization_stats_path,
+                    "normalization_stats": dataset.get_normalization_reference(),
+                    "normalization_stats_loaded": dataset.normalization_stats_loaded,
+                    "rebuild_normalization_stats": args.rebuild_normalization_stats,
+                    "num_workers": args.num_workers,
+                    "prefetch_factor": (
+                        args.prefetch_factor if args.num_workers > 0 else None
+                    ),
+                    "pin_memory": loader_kwargs["pin_memory"],
+                    "persistent_workers": (
+                        args.persistent_workers if args.num_workers > 0 else False
+                    ),
+                    "dataset_num_depths": dataset.num_depths,
+                    "target_loading": "selected_depths_shallow_to_deep",
+                    "max_samples": args.max_samples,
+                },
+                "hyperparameters": {
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "lr": lr,
+                    "learning_rate": lr,
+                    "weight_decay": B3_DEPTHFORMER_WEIGHT_DECAY,
+                    "patience": patience,
+                    "depth_indices": depth_indices,
+                    "depth_m": selected_depth_levels,
+                    "teacher_forcing_start": args.b3_teacher_forcing_start,
+                    "teacher_forcing_end": args.b3_teacher_forcing_end,
+                    "teacher_forcing_decay_epochs": (
+                        args.b3_teacher_forcing_decay_epochs
+                    ),
+                },
+                "training_strategy": training_strategy,
+                "model_config": architecture_config,
+                "loss_config": {
+                    "name": "masked_depth_mean_rmse_loss",
+                    "description": "mean of per-depth masked RMSE",
+                    "depth_weighting": "equal",
+                    "vertical_regularization": False,
+                },
+                "parameter_count": param_stats,
+                "paths": {
+                    "output_dir": out_dir,
+                    "checkpoint_dir": ckpt_dir,
+                    "checkpoint": ckpt_path,
+                    "history": history_path,
+                    "loss_curve": curve_path,
+                },
+            },
+            config_path,
+        )
+
+        best_val, train_losses, val_losses = train_one_model(
+            method,
+            model,
+            train_loader,
+            val_loader,
+            optimizer,
+            scheduler,
+            device,
+            epochs,
+            patience,
+            ckpt_path,
+            equal_depth_weighting=True,
+            checkpoint_metadata=checkpoint_metadata,
+            teacher_forcing_schedule=teacher_forcing_schedule,
+        )
+        teacher_forcing_ratios = [
+            teacher_forcing_ratio_for_epoch(epoch, *teacher_forcing_schedule)
+            for epoch in range(len(train_losses))
+        ]
+        np.savez(
+            history_path,
+            train_losses=np.asarray(train_losses, dtype=np.float32),
+            val_losses=np.asarray(val_losses, dtype=np.float32),
+            teacher_forcing_ratios=np.asarray(
+                teacher_forcing_ratios, dtype=np.float32
+            ),
+            depth_indices=np.asarray(depth_indices, dtype=np.int64),
+            depth_m=np.asarray(selected_depth_levels, dtype=np.float32),
+        )
+        save_loss_curve(train_losses, val_losses, curve_path)
+        print(
+            "\nB3 深度自回归训练完成。"
+            f"最佳自回归验证损失: {best_val:.6f}"
+        )
+        print(f"最佳权重: {ckpt_path}")
         return
 
     if method in {"joint_du_unet", "joint_duvit"}:

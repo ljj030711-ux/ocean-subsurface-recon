@@ -21,3 +21,4 @@ reports/
 scripts/*
 !scripts/upload_nc_to_autodl_fs.sh
 !scripts/deploy_upload.sh
+!scripts/smoke_b3.py

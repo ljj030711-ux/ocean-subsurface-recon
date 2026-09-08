@@ -40,7 +40,12 @@ DY = 10000.0
 PARADIGM_2DTO2D = "2dto2d"
 PARADIGM_2DTO3D = "2dto3d"
 
-PARADIGM_2DTO2D_METHODS = {"du_unet", "joint_du_unet", "joint_duvit"}
+PARADIGM_2DTO2D_METHODS = {
+    "du_unet",
+    "joint_du_unet",
+    "joint_duvit",
+    "b3_depthformer",
+}
 PARADIGM_2DTO3D_METHODS = {"2dvar", "modas", "ocean_transformer"}
 
 # 指定 26 层深度（旧参数， 单位 m）
@@ -202,6 +207,39 @@ JOINT_DUVIT_SURFACE_NUM_LAYERS = 2
 JOINT_DUVIT_SURFACE_MAX_TOKENS = 512
 JOINT_DUVIT_MLP_RATIO = 4
 JOINT_DUVIT_DROPOUT = 0.1
+
+# B3：BOS启动的深度自回归Transformer。当前主实验先使用六个指定深度，
+# 深度数量和实际米数仍由 --depth-indices 动态传入，不固化在模型中。
+B3_DEPTHFORMER_CKPT_NAME_TEMPLATE = (
+    "B3_DepthFormer_{target_var}_{depth_tag}_best.pth"
+)
+B3_DEPTHFORMER_HISTORY_NAME_TEMPLATE = (
+    "training_history_B3_DepthFormer_{target_var}_{depth_tag}.npz"
+)
+B3_DEPTHFORMER_LOSS_CURVE_TEMPLATE = (
+    "loss_B3_DepthFormer_{target_var}_{depth_tag}.png"
+)
+
+B3_DEPTHFORMER_D_MODEL = 128
+B3_DEPTHFORMER_NHEAD = 8
+B3_DEPTHFORMER_ENCODER_LAYERS = 4
+B3_DEPTHFORMER_DECODER_LAYERS = 3
+B3_DEPTHFORMER_DIM_FF = 512
+B3_DEPTHFORMER_DROPOUT = 0.1
+B3_DEPTHFORMER_SST_PATCH_SIZE = 16
+B3_DEPTHFORMER_SURFACE_PATCH_SIZE = 4
+B3_DEPTHFORMER_OUTPUT_PATCH_SIZE = 8
+B3_DEPTHFORMER_REFINEMENT_CHANNELS = 32
+B3_DEPTHFORMER_BASE_GRID_SIZE = (16, 16)
+
+B3_DEPTHFORMER_EPOCHS = 50
+B3_DEPTHFORMER_BATCH_SIZE = 2
+B3_DEPTHFORMER_LR = 1e-4
+B3_DEPTHFORMER_WEIGHT_DECAY = 1e-4
+B3_DEPTHFORMER_PATIENCE = 10
+B3_DEPTHFORMER_TEACHER_FORCING_START = 1.0
+B3_DEPTHFORMER_TEACHER_FORCING_END = 0.5
+B3_DEPTHFORMER_TEACHER_FORCING_DECAY_EPOCHS = 30
 
 
 def joint_du_unet_depth_tag(depth_indices, total_num_depths):
