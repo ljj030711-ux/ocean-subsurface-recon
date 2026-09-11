@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import time
 from datetime import datetime
 
 import matplotlib
@@ -111,6 +112,13 @@ from utils.run_config import (
     model_config_path,
     print_and_save_run_config,
 )
+from utils.reproducibility import (
+    build_reproducibility_report,
+    configure_reproducibility,
+    make_dataloader_generator,
+    print_reproducibility_report,
+    seed_dataloader_worker,
+)
 
 TRAINABLE_METHODS = {
     "b3_depthformer",
@@ -153,10 +161,12 @@ def use_lazy_2dto2d_data(args):
     return args.lazy_data or args.dataset_profile == "glorys12v1_all_size"
 
 
-def dataloader_kwargs(args, device):
+def dataloader_kwargs(args, device, seed_offset=0):
     kwargs = {
         "num_workers": args.num_workers,
         "pin_memory": bool(args.pin_memory and device.type == "cuda"),
+        "generator": make_dataloader_generator(args.seed + seed_offset),
+        "worker_init_fn": seed_dataloader_worker,
     }
     if args.num_workers > 0:
         kwargs.update(
@@ -510,9 +520,11 @@ def train_one_model(
 ):
     best_val = float("inf")
     patience_cnt = 0
-    train_losses, val_losses = [], []
+    train_losses, val_losses, epoch_times_seconds = [], [], []
+    training_started = time.perf_counter()
 
     for epoch in range(epochs):
+        epoch_started = time.perf_counter()
         teacher_forcing_ratio = None
         if method == "ocean_transformer":
             t_loss = train_2dto3d_epoch(model, train_loader, optimizer, device, criterion)
@@ -557,9 +569,12 @@ def train_one_model(
             if teacher_forcing_ratio is not None
             else ""
         )
+        epoch_elapsed = time.perf_counter() - epoch_started
+        epoch_times_seconds.append(epoch_elapsed)
         print(
             f"Epoch [{epoch + 1}/{epochs}] | Train: {t_loss:.6f} | "
-            f"Val: {v_loss:.6f} | LR: {lr_now:.2e}{teacher_text}"
+            f"Val: {v_loss:.6f} | LR: {lr_now:.2e}{teacher_text} | "
+            f"Time: {epoch_elapsed:.2f}s"
         )
 
         if v_loss < best_val:
@@ -583,7 +598,25 @@ def train_one_model(
                 print(f"  -> 早停触发 (patience={patience})")
                 break
 
-    return best_val, train_losses, val_losses
+    total_training_seconds = time.perf_counter() - training_started
+    mean_epoch_seconds = (
+        float(np.mean(epoch_times_seconds)) if epoch_times_seconds else 0.0
+    )
+    print(
+        "训练计时 | "
+        f"总耗时: {total_training_seconds:.2f}s "
+        f"({total_training_seconds / 60.0:.2f}min, "
+        f"{total_training_seconds / 3600.0:.2f}h) | "
+        f"平均每轮: {mean_epoch_seconds:.2f}s | "
+        f"实际轮数: {len(epoch_times_seconds)}"
+    )
+    return (
+        best_val,
+        train_losses,
+        val_losses,
+        epoch_times_seconds,
+        total_training_seconds,
+    )
 
 
 def parse_depth_indices(depth_indices_arg, depth_levels):
@@ -789,9 +822,9 @@ def main():
         "b3_depthformer": "B3_DepthFormer",
     }.get(method, method)
 
+    configure_reproducibility(args.seed)
     device = get_device()
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    reproducibility = build_reproducibility_report(args.seed, device)
 
     if method in {
         "du_unet",
@@ -824,6 +857,7 @@ def main():
     print(f"方法:       {method_dir}")
     print(f"范式:       {paradigm}")
     print(f"设备:       {device}")
+    print_reproducibility_report(reproducibility)
     print(f"输出目录:   {out_dir}")
     print(f"权重目录:   {ckpt_dir}")
     print("=" * 60)
@@ -843,18 +877,19 @@ def main():
             dataset = TwoDto3DDataset(args.data_dir, normalize=True)
             train_idx, val_idx, _ = get_year_split_indices(len(dataset), TWODTO3D_DATA_START_DATE)
 
-        loader_kwargs = dataloader_kwargs(args, device)
+        train_loader_kwargs = dataloader_kwargs(args, device, seed_offset=0)
+        val_loader_kwargs = dataloader_kwargs(args, device, seed_offset=1)
         train_loader = DataLoader(
             Subset(dataset, train_idx),
             batch_size=batch_size,
             shuffle=True,
-            **loader_kwargs,
+            **train_loader_kwargs,
         )
         val_loader = DataLoader(
             Subset(dataset, val_idx),
             batch_size=batch_size,
             shuffle=False,
-            **loader_kwargs,
+            **val_loader_kwargs,
         )
 
         model = build_model(method).to(device)
@@ -867,11 +902,23 @@ def main():
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(epochs // 3, 1), gamma=0.5)
 
         best_ckpt = os.path.join(ckpt_dir, f"{method}_best.pth")
-        best_val, train_losses, val_losses = train_one_model(
+        (
+            best_val,
+            train_losses,
+            val_losses,
+            epoch_times_seconds,
+            total_training_seconds,
+        ) = train_one_model(
             method, model, train_loader, val_loader, optimizer, scheduler, device,
             epochs, patience, best_ckpt, criterion=criterion
         )
-        np.savez(os.path.join(out_dir, f"training_history_{method}.npz"), train_losses=train_losses, val_losses=val_losses)
+        np.savez(
+            os.path.join(out_dir, f"training_history_{method}.npz"),
+            train_losses=train_losses,
+            val_losses=val_losses,
+            epoch_times_seconds=np.asarray(epoch_times_seconds, dtype=np.float64),
+            total_training_seconds=np.asarray(total_training_seconds, dtype=np.float64),
+        )
         save_loss_curve(train_losses, val_losses, os.path.join(out_dir, f"loss_{method}.png"))
         print(f"\n训练完成。最佳验证损失: {best_val:.6f}")
         print(f"最佳权重: {best_ckpt}")
@@ -953,6 +1000,7 @@ def main():
                 "target_var": args.target_var,
                 "device": device,
                 "seed": args.seed,
+                "reproducibility": reproducibility,
                 "data": {
                     "data_dir": args.data_dir,
                     "dataset_profile": args.dataset_profile,
@@ -971,6 +1019,9 @@ def main():
                     "pin_memory": loader_kwargs["pin_memory"],
                     "persistent_workers": (
                         args.persistent_workers if args.num_workers > 0 else False
+                    ),
+                    "dataloader_seed_rule": (
+                        "train=seed+2*depth_index; val=train+1"
                     ),
                     "target_loading": "selected_depth_only",
                     "normalization_stats_path": dataset.normalization_stats_path,
@@ -1016,17 +1067,23 @@ def main():
             print("-" * 60)
 
             depth_dataset = DepthTargetDataset(dataset, depth_idx)
+            train_loader_kwargs = dataloader_kwargs(
+                args, device, seed_offset=2 * depth_idx
+            )
+            val_loader_kwargs = dataloader_kwargs(
+                args, device, seed_offset=2 * depth_idx + 1
+            )
             train_loader = DataLoader(
                 Subset(depth_dataset, train_idx),
                 batch_size=batch_size,
                 shuffle=True,
-                **loader_kwargs,
+                **train_loader_kwargs,
             )
             val_loader = DataLoader(
                 Subset(depth_dataset, val_idx),
                 batch_size=batch_size,
                 shuffle=False,
-                **loader_kwargs,
+                **val_loader_kwargs,
             )
             model = build_model("du_unet", out_channels=1).to(device)
             optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=DU_UNET_WEIGHT_DECAY)
@@ -1038,7 +1095,13 @@ def main():
             )
             ckpt_path = os.path.join(ckpt_dir, ckpt_name)
 
-            best_val, train_losses, val_losses = train_one_model(
+            (
+                best_val,
+                train_losses,
+                val_losses,
+                epoch_times_seconds,
+                total_training_seconds,
+            ) = train_one_model(
                 "du_unet",
                 model,
                 train_loader,
@@ -1058,7 +1121,15 @@ def main():
             curve_name = DU_UNET_LOSS_CURVE_TEMPLATE.format(
                 target_var=args.target_var, depth_m=depth_m
             )
-            np.savez(os.path.join(out_dir, hist_name), train_losses=train_losses, val_losses=val_losses)
+            np.savez(
+                os.path.join(out_dir, hist_name),
+                train_losses=train_losses,
+                val_losses=val_losses,
+                epoch_times_seconds=np.asarray(epoch_times_seconds, dtype=np.float64),
+                total_training_seconds=np.asarray(
+                    total_training_seconds, dtype=np.float64
+                ),
+            )
             save_loss_curve(train_losses, val_losses, os.path.join(out_dir, curve_name))
             print(f"深度 {depth_m}m 训练完成，best val={best_val:.6f}")
         return
@@ -1100,18 +1171,19 @@ def main():
         architecture_config["source_depth_indices"] = list(depth_indices)
         param_stats = count_model_parameters(model)
         b3_dataset = DepthIndicesTargetDataset(dataset, depth_indices)
-        loader_kwargs = dataloader_kwargs(args, device)
+        train_loader_kwargs = dataloader_kwargs(args, device, seed_offset=0)
+        val_loader_kwargs = dataloader_kwargs(args, device, seed_offset=1)
         train_loader = DataLoader(
             Subset(b3_dataset, train_idx),
             batch_size=batch_size,
             shuffle=True,
-            **loader_kwargs,
+            **train_loader_kwargs,
         )
         val_loader = DataLoader(
             Subset(b3_dataset, val_idx),
             batch_size=batch_size,
             shuffle=False,
-            **loader_kwargs,
+            **val_loader_kwargs,
         )
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -1193,6 +1265,7 @@ def main():
             "depth_tag": depth_tag,
             "normalization_stats": dataset.get_normalization_reference(),
             "model_config": architecture_config,
+            "reproducibility": reproducibility,
         }
         print_and_save_run_config(
             "B3 B3_DepthFormer 训练超参数",
@@ -1205,6 +1278,7 @@ def main():
                 "target_var": args.target_var,
                 "device": device,
                 "seed": args.seed,
+                "reproducibility": reproducibility,
                 "data": {
                     "data_dir": args.data_dir,
                     "dataset_profile": args.dataset_profile,
@@ -1224,10 +1298,12 @@ def main():
                     "prefetch_factor": (
                         args.prefetch_factor if args.num_workers > 0 else None
                     ),
-                    "pin_memory": loader_kwargs["pin_memory"],
+                    "pin_memory": train_loader_kwargs["pin_memory"],
                     "persistent_workers": (
                         args.persistent_workers if args.num_workers > 0 else False
                     ),
+                    "train_dataloader_seed": args.seed,
+                    "val_dataloader_seed": args.seed + 1,
                     "dataset_num_depths": dataset.num_depths,
                     "target_loading": "selected_depths_shallow_to_deep",
                     "max_samples": args.max_samples,
@@ -1267,7 +1343,13 @@ def main():
             config_path,
         )
 
-        best_val, train_losses, val_losses = train_one_model(
+        (
+            best_val,
+            train_losses,
+            val_losses,
+            epoch_times_seconds,
+            total_training_seconds,
+        ) = train_one_model(
             method,
             model,
             train_loader,
@@ -1293,6 +1375,11 @@ def main():
             teacher_forcing_ratios=np.asarray(
                 teacher_forcing_ratios, dtype=np.float32
             ),
+            epoch_times_seconds=np.asarray(epoch_times_seconds, dtype=np.float64),
+            total_training_seconds=np.asarray(
+                total_training_seconds, dtype=np.float64
+            ),
+            seed=np.asarray(args.seed, dtype=np.int64),
             depth_indices=np.asarray(depth_indices, dtype=np.int64),
             depth_m=np.asarray(selected_depth_levels, dtype=np.float32),
         )
@@ -1353,19 +1440,20 @@ def main():
         architecture_config["source_depth_indices"] = list(depth_indices)
         param_stats = count_model_parameters(model)
         scheduler_step_size = max(epochs // 3, 1)
-        loader_kwargs = dataloader_kwargs(args, device)
+        train_loader_kwargs = dataloader_kwargs(args, device, seed_offset=0)
+        val_loader_kwargs = dataloader_kwargs(args, device, seed_offset=1)
 
         train_loader = DataLoader(
             Subset(joint_dataset, train_idx),
             batch_size=batch_size,
             shuffle=True,
-            **loader_kwargs,
+            **train_loader_kwargs,
         )
         val_loader = DataLoader(
             Subset(joint_dataset, val_idx),
             batch_size=batch_size,
             shuffle=False,
-            **loader_kwargs,
+            **val_loader_kwargs,
         )
         optimizer = torch.optim.Adam(
             model.parameters(), lr=lr, weight_decay=DU_UNET_WEIGHT_DECAY
@@ -1433,6 +1521,7 @@ def main():
                 "target_var": args.target_var,
                 "device": device,
                 "seed": args.seed,
+                "reproducibility": reproducibility,
                 "data": {
                     "data_dir": args.data_dir,
                     "dataset_profile": args.dataset_profile,
@@ -1452,10 +1541,12 @@ def main():
                     "prefetch_factor": (
                         args.prefetch_factor if args.num_workers > 0 else None
                     ),
-                    "pin_memory": loader_kwargs["pin_memory"],
+                    "pin_memory": train_loader_kwargs["pin_memory"],
                     "persistent_workers": (
                         args.persistent_workers if args.num_workers > 0 else False
                     ),
+                    "train_dataloader_seed": args.seed,
+                    "val_dataloader_seed": args.seed + 1,
                     "dataset_num_depths": dataset.num_depths,
                     "target_loading": "selected_depths_jointly",
                     "max_samples": args.max_samples,
@@ -1489,7 +1580,13 @@ def main():
             config_path,
         )
 
-        best_val, train_losses, val_losses = train_one_model(
+        (
+            best_val,
+            train_losses,
+            val_losses,
+            epoch_times_seconds,
+            total_training_seconds,
+        ) = train_one_model(
             method,
             model,
             train_loader,
@@ -1514,12 +1611,18 @@ def main():
                 "depth_tag": depth_tag,
                 "normalization_stats": dataset.get_normalization_reference(),
                 "model_config": architecture_config,
+                "reproducibility": reproducibility,
             },
         )
         np.savez(
             os.path.join(out_dir, history_name),
             train_losses=np.asarray(train_losses, dtype=np.float32),
             val_losses=np.asarray(val_losses, dtype=np.float32),
+            epoch_times_seconds=np.asarray(epoch_times_seconds, dtype=np.float64),
+            total_training_seconds=np.asarray(
+                total_training_seconds, dtype=np.float64
+            ),
+            seed=np.asarray(args.seed, dtype=np.int64),
             depth_indices=np.asarray(depth_indices, dtype=np.int64),
             depth_m=np.asarray(selected_depth_levels, dtype=np.float32),
         )

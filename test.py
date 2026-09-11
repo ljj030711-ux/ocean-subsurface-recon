@@ -33,6 +33,7 @@ from config import (
     LON_RANGE, LAT_RANGE, DEPTH_MAX, OUTPUTS_ROOT,
     PARADIGM_2DTO2D, PARADIGM_2DTO2D_METHODS,
     PARADIGM_2DTO3D, PARADIGM_2DTO3D_METHODS,
+    SEED,
     TWODTO3D_DATA_END_DATE,
     TWODTO3D_DATA_START_DATE,
     TWODTO3D_DEPTH_LEVELS,
@@ -71,6 +72,11 @@ from utils.run_config import (
     load_run_config,
     model_config_path,
     print_and_save_run_config,
+)
+from utils.reproducibility import (
+    build_reproducibility_report,
+    configure_reproducibility,
+    print_reproducibility_report,
 )
 
 warnings.filterwarnings("ignore")
@@ -606,6 +612,8 @@ def predict_2dto2d(args):
             "paradigm": PARADIGM_2DTO2D,
             "target_var": args.target_var,
             "device": device,
+            "seed": args.seed,
+            "reproducibility": args.reproducibility,
             "data": {
                 "data_dir": args.data_dir,
                 "dataset_profile": args.dataset_profile,
@@ -1222,6 +1230,114 @@ def _plot_horizontal_structure_metrics(
     print(f"水平结构指标图已保存至：{output_path}")
 
 
+def _save_joint_case_fields_archive(
+    args,
+    horizontal_dir,
+    out_dir,
+    panel_day_records,
+    target_levels,
+    depth_indices,
+    depth_levels,
+    lon_range,
+    lat_range,
+    case_fields_by_day,
+):
+    """Save all selected date-depth case fields into one portable NPZ."""
+    ordered_dates = [record["date"] for record in panel_day_records]
+    missing = [day for day in ordered_dates if day not in case_fields_by_day]
+    if missing:
+        raise RuntimeError(f"以下日期缺少二维案例场，无法保存NPZ: {missing}")
+
+    prediction = np.stack(
+        [case_fields_by_day[day]["prediction"] for day in ordered_dates]
+    ).astype(np.float32, copy=False)
+    truth = np.stack(
+        [case_fields_by_day[day]["truth"] for day in ordered_dates]
+    ).astype(np.float32, copy=False)
+    valid_mask = np.stack(
+        [case_fields_by_day[day]["valid_mask"] for day in ordered_dates]
+    ).astype(bool, copy=False)
+    monthly_climatology = np.stack(
+        [case_fields_by_day[day]["monthly_climatology"] for day in ordered_dates]
+    ).astype(np.float32, copy=False)
+
+    height, width = prediction.shape[-2:]
+    longitude = np.linspace(
+        float(lon_range[0]), float(lon_range[1]), width, dtype=np.float32
+    )
+    latitude = np.linspace(
+        float(lat_range[0]), float(lat_range[1]), height, dtype=np.float32
+    )
+    dates_tag = "_".join(day.replace("-", "") for day in ordered_dates)
+    selected_depth_indices = [depth_indices[level] for level in target_levels]
+    depth_tag = "gidx" + "-".join(str(index) for index in selected_depth_indices)
+    filename = (
+        f"case_fields_{args.method}_{args.target_var}_{depth_tag}_{dates_tag}.npz"
+    )
+    output_path = os.path.join(horizontal_dir, filename)
+    payload = {
+        "format_version": np.asarray(1, dtype=np.int64),
+        "method": np.asarray(args.method),
+        "target_var": np.asarray(args.target_var),
+        "dataset_profile": np.asarray(args.dataset_profile),
+        "dates": np.asarray(ordered_dates),
+        "months": np.asarray(
+            [case_fields_by_day[day]["month"] for day in ordered_dates],
+            dtype=np.int64,
+        ),
+        "roles": np.asarray(
+            [record["role"] for record in panel_day_records]
+        ),
+        "target_levels": np.asarray(target_levels, dtype=np.int64),
+        "depth_indices": np.asarray(selected_depth_indices, dtype=np.int64),
+        "depth_m": np.asarray(
+            [depth_levels[level] for level in target_levels], dtype=np.float32
+        ),
+        "longitude": longitude,
+        "latitude": latitude,
+        "lon_range": np.asarray(lon_range, dtype=np.float32),
+        "lat_range": np.asarray(lat_range, dtype=np.float32),
+        "prediction": prediction,
+        "truth": truth,
+        "valid_mask": valid_mask,
+        "monthly_climatology": monthly_climatology,
+        "prediction_anomaly": prediction - monthly_climatology,
+        "truth_anomaly": truth - monthly_climatology,
+        "signed_error": prediction - truth,
+        "absolute_error": np.abs(prediction - truth),
+        "anomaly_reference": np.asarray(
+            "2002-2021 training monthly climatology"
+        ),
+    }
+    metric_names = (
+        "mae",
+        "rmse",
+        "r2",
+        "correlation",
+        "ssim",
+        "acc",
+        "valid_count",
+        "ssim_valid_windows",
+        "acc_valid_count",
+    )
+    for metric_name in metric_names:
+        payload[metric_name] = np.stack(
+            [case_fields_by_day[day][metric_name] for day in ordered_dates]
+        )
+
+    np.savez_compressed(output_path, **payload)
+    relative_path = os.path.relpath(output_path, out_dir)
+    print(f"固定日期二维案例场已保存至：{output_path}")
+    return {
+        "file": relative_path,
+        "dates": ordered_dates,
+        "target_levels": [int(level) for level in target_levels],
+        "depth_indices": [int(depth_indices[level]) for level in target_levels],
+        "depth_m": [float(depth_levels[level]) for level in target_levels],
+        "field_shape": list(prediction.shape),
+    }
+
+
 @torch.no_grad()
 def _render_joint_horizontal_panels(
     args,
@@ -1237,6 +1353,7 @@ def _render_joint_horizontal_panels(
     eval_dates,
     panel_day_records,
     day_depth_metrics,
+    selected_training_climatology,
     dataset,
     device,
     out_dir,
@@ -1244,12 +1361,13 @@ def _render_joint_horizontal_panels(
     """为联合深度模型的代表日期生成指定深度水平三联图。"""
     if not panel_day_records:
         print("[spatial-panels] 没有可绘制的代表日期，跳过水平图")
-        return []
+        return [], None
 
     panel_days = {record["date"] for record in panel_day_records}
     panel_record_by_day = {record["date"]: record for record in panel_day_records}
     day_index_by_date = {day: index for index, day in enumerate(eval_dates)}
     rendered_spatial = []
+    case_fields_by_day = {}
     lon_range, lat_range = _du_unet_lon_lat_range(args)
     profile_depth_levels = _du_unet_depth_levels(args)
     evaluation_depth_tag = joint_du_unet_depth_tag(
@@ -1303,6 +1421,38 @@ def _render_joint_horizontal_panels(
             true_3d = np.where(valid, y_true[local_index], np.nan)
             record = panel_record_by_day[day]
             day_index = day_index_by_date[day]
+            selected_levels = np.asarray(target_levels, dtype=np.int64)
+            selected_valid = valid[selected_levels]
+            month = int(months[local_index])
+            climatology = np.asarray(
+                selected_training_climatology[month - 1, selected_levels],
+                dtype=np.float32,
+            )
+            case_fields_by_day[day] = {
+                "month": month,
+                "prediction": np.asarray(
+                    pred_3d[selected_levels], dtype=np.float32
+                ),
+                "truth": np.asarray(true_3d[selected_levels], dtype=np.float32),
+                "valid_mask": selected_valid,
+                "monthly_climatology": np.where(
+                    selected_valid, climatology, np.nan
+                ).astype(np.float32),
+            }
+            for metric_name in (
+                "mae",
+                "rmse",
+                "r2",
+                "correlation",
+                "ssim",
+                "acc",
+                "valid_count",
+                "ssim_valid_windows",
+                "acc_valid_count",
+            ):
+                case_fields_by_day[day][metric_name] = np.asarray(
+                    day_depth_metrics[metric_name][day_index, selected_levels]
+                )
             for level in target_levels:
                 global_depth_index = int(depth_indices[level])
                 ssim_value = float(day_depth_metrics["ssim"][day_index, level])
@@ -1346,7 +1496,19 @@ def _render_joint_horizontal_panels(
     missing = sorted(panel_days - {record["date"] for record in rendered_spatial})
     if missing:
         raise RuntimeError(f"以下日期未成功绘制二维水平图: {missing}")
-    return rendered_spatial
+    case_fields_archive = _save_joint_case_fields_archive(
+        args,
+        horizontal_dir,
+        out_dir,
+        panel_day_records,
+        target_levels,
+        depth_indices,
+        depth_levels,
+        lon_range,
+        lat_range,
+        case_fields_by_day,
+    )
+    return rendered_spatial, case_fields_archive
 
 
 @torch.no_grad()
@@ -1614,6 +1776,8 @@ def evaluate_2dto2d_period(args, out_dir):
             "paradigm": PARADIGM_2DTO2D,
             "target_var": args.target_var,
             "device": device,
+            "seed": args.seed,
+            "reproducibility": args.reproducibility,
             "data": {
                 "data_dir": args.data_dir,
                 "dataset_profile": args.dataset_profile,
@@ -1831,6 +1995,7 @@ def evaluate_2dto2d_period(args, out_dir):
         payload[f"by_day_{metric_name}"] = daily_metrics[metric_name]
     rendered_spatial_panels = []
     rendered_section_panels = []
+    case_fields_archive = None
     annual_equal_depth_mae = None
     annual_equal_depth_rmse = None
     if is_joint:
@@ -1887,23 +2052,26 @@ def evaluate_2dto2d_period(args, out_dir):
     np.savez(os.path.join(out_dir, evaluation_name), **payload)
 
     if args.spatial_panels:
-        rendered_spatial_panels = _render_joint_horizontal_panels(
-            args,
-            joint_model,
-            loader,
-            target_norm,
-            checkpoint_depth_indices,
-            joint_output_positions,
-            depth_indices,
-            depth_levels,
-            target_levels,
-            eval_indices,
-            eval_dates,
-            panel_day_records,
-            day_depth_metrics,
-            dataset,
-            device,
-            out_dir,
+        rendered_spatial_panels, case_fields_archive = (
+            _render_joint_horizontal_panels(
+                args,
+                joint_model,
+                loader,
+                target_norm,
+                checkpoint_depth_indices,
+                joint_output_positions,
+                depth_indices,
+                depth_levels,
+                target_levels,
+                eval_indices,
+                eval_dates,
+                panel_day_records,
+                day_depth_metrics,
+                selected_training_climatology,
+                dataset,
+                device,
+                out_dir,
+            )
         )
     if section_requested:
         rendered_section_panels = _render_joint_section_panels(
@@ -1987,6 +2155,8 @@ def evaluate_2dto2d_period(args, out_dir):
         "mode": "period",
         "method": args.method,
         "target_var": args.target_var,
+        "seed": args.seed,
+        "reproducibility": args.reproducibility,
         "eval_start": args.eval_start,
         "eval_end": args.eval_end,
         "num_days": len(eval_dates),
@@ -2013,6 +2183,7 @@ def evaluate_2dto2d_period(args, out_dir):
                 else "manual panel-days" if args.spatial_panels else None
             ),
             "files": rendered_spatial_panels,
+            "case_fields": case_fields_archive,
         },
         "section_panels": {
             "enabled": bool(section_requested),
@@ -2152,6 +2323,8 @@ def save_outputs(args, y_pred, y_true, out_dir, mask=None):
     summary = {
         "method": method,
         "target_var": getattr(args, "target_var", None),
+        "seed": getattr(args, "seed", None),
+        "reproducibility": getattr(args, "reproducibility", None),
         "select_day": day,
         "target_level": level,
         "pred_shape": list(y_pred.shape),
@@ -2318,6 +2491,12 @@ def parse_args():
     )
     g_dl.add_argument("--data-dir", default=DATA_DIR)
     g_dl.add_argument(
+        "--seed",
+        type=int,
+        default=SEED,
+        help="测试随机种子；默认与训练配置一致",
+    )
+    g_dl.add_argument(
         "--dataset-profile",
         choices=dataset_profile_names(),
         default=DEFAULT_DATASET_PROFILE,
@@ -2454,6 +2633,13 @@ def main():
         _parse_percentile_list(
             args.section_percentiles, "--section-percentiles"
         )
+
+    configure_reproducibility(args.seed)
+    runtime_device = _get_device()
+    args.reproducibility = build_reproducibility_report(
+        args.seed, runtime_device
+    )
+    print_reproducibility_report(args.reproducibility)
 
     method = args.method.strip().lower()
     if method == "du-unet":

@@ -1,10 +1,12 @@
 """Smoke tests for the B3 BOS-started depth-autoregressive pipeline."""
 
 import os
+import random
 import tempfile
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from config import (
@@ -19,6 +21,11 @@ from models.b3_depthformer import B3DepthFormer
 from test import _load_joint_du_unet_model
 from train import teacher_forcing_ratio_for_epoch
 from utils.losses import masked_depth_mean_rmse_loss
+from utils.reproducibility import (
+    build_reproducibility_report,
+    configure_reproducibility,
+    make_dataloader_generator,
+)
 
 
 DEPTH_INDICES = [0, 4, 9, 17, 24, 27]
@@ -55,6 +62,51 @@ def synthetic_batch(batch_size=1):
 
 
 class B3DepthFormerSmokeTest(unittest.TestCase):
+    def test_fixed_seed_repeats_rngs_and_dataloader_order(self):
+        configure_reproducibility(2026)
+        first_python = random.random()
+        first_numpy = np.random.random(4)
+        first_torch = torch.rand(4)
+        first_order = torch.randperm(
+            12, generator=make_dataloader_generator(2026)
+        )
+
+        configure_reproducibility(2026)
+        report = build_reproducibility_report(2026, torch.device("cpu"))
+        self.assertEqual(first_python, random.random())
+        np.testing.assert_array_equal(first_numpy, np.random.random(4))
+        torch.testing.assert_close(first_torch, torch.rand(4), rtol=0, atol=0)
+        torch.testing.assert_close(
+            first_order,
+            torch.randperm(12, generator=make_dataloader_generator(2026)),
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(report["seed"], 2026)
+        self.assertEqual(report["device"]["type"], "cpu")
+        self.assertTrue(report["deterministic_algorithms"])
+
+    def test_scheduled_sampling_is_repeatable(self):
+        batch = synthetic_batch()
+        configure_reproducibility(31415)
+        first_model = tiny_model().train()
+        first = first_model(
+            batch["sst"],
+            batch["ssh_sss"],
+            target=batch["target"],
+            teacher_forcing_ratio=0.5,
+        )
+
+        configure_reproducibility(31415)
+        second_model = tiny_model().train()
+        second = second_model(
+            batch["sst"],
+            batch["ssh_sss"],
+            target=batch["target"],
+            teacher_forcing_ratio=0.5,
+        )
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+
     def test_different_input_resolutions_and_backward(self):
         batch = synthetic_batch(batch_size=2)
         model = tiny_model().train()
