@@ -90,6 +90,23 @@ ALL_METHODS = sorted(DL_2DTO2D_METHODS | DL_2DTO3D_METHODS | NON_DL_METHODS)
 JOINT_METHOD_NAMES = {"Joint_Du_Unet", "Joint_DUViT", "B3_DepthFormer"}
 
 
+def _safe_weights_only_load(path, map_location):
+    """Load project checkpoints while allowlisting PyTorch's version string type.
+
+    B3 checkpoints are generated locally by this project. PyTorch 2.6 rejects
+    the ``TorchVersion`` metadata object under ``weights_only=True`` unless its
+    exact type is explicitly allowlisted. No arbitrary checkpoint globals are
+    enabled here.
+    """
+    torch_version_module = getattr(torch, "torch_version", None)
+    torch_version_type = getattr(torch_version_module, "TorchVersion", None)
+    safe_globals = getattr(torch.serialization, "safe_globals", None)
+    if torch_version_type is not None and safe_globals is not None:
+        with safe_globals([torch_version_type]):
+            return torch.load(path, map_location=map_location, weights_only=True)
+    return torch.load(path, map_location=map_location, weights_only=True)
+
+
 def _is_joint_method(args):
     return getattr(args, "method", None) in JOINT_METHOD_NAMES
 
@@ -463,7 +480,7 @@ def predict_2dto3d(args):
     model = build_model("ocean_transformer").to(device)
     if args.checkpoint and os.path.exists(args.checkpoint):
         model.load_state_dict(
-            torch.load(args.checkpoint, map_location=device, weights_only=True))
+            _safe_weights_only_load(args.checkpoint, map_location=device))
         print(f"已加载权重: {args.checkpoint}")
     else:
         print("未提供/找到权重，使用随机初始化模型")
@@ -778,7 +795,7 @@ def _load_du_unet_models(args, device, require_all):
         model = build_model("du_unet", out_channels=1).to(device)
         if ckpt_path is not None:
             model.load_state_dict(
-                torch.load(ckpt_path, map_location=device, weights_only=True)
+                _safe_weights_only_load(ckpt_path, map_location=device)
             )
         else:
             print(
@@ -870,7 +887,7 @@ def _load_joint_du_unet_model(args, device, dataset):
             + ", ".join(candidates)
         )
 
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
+    checkpoint = _safe_weights_only_load(ckpt_path, map_location=device)
     structured_checkpoint = isinstance(checkpoint, dict) and "state_dict" in checkpoint
     if structured_checkpoint:
         if checkpoint.get("format_version") != 1:
@@ -1041,6 +1058,10 @@ def _load_joint_du_unet_model(args, device, dataset):
                 "refinement_channels"
             ),
             "base_grid_size": metadata_model_config.get("base_grid_size"),
+            # Old B3 checkpoints predate this field and are the causal model.
+            "depth_attention": metadata_model_config.get(
+                "depth_attention", "causal"
+            ),
         }
         missing = sorted(
             key for key, value in build_kwargs.items() if value is None

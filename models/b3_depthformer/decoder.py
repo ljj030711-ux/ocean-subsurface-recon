@@ -102,12 +102,31 @@ class CausalDepthDecoderLayer(nn.Module):
 
 
 class CausalDepthDecoder(nn.Module):
-    """Stack causal depth decoder layers with a final normalization."""
+    """Stack depth decoder layers with a final normalization.
 
-    def __init__(self, embed_dim, num_heads, num_layers, dim_feedforward, dropout):
+    ``causal`` is the original B3 path. ``independent`` keeps exactly the
+    same modules and parameters, but restricts depth self-attention to the
+    diagonal so tokens cannot exchange information across depth positions.
+    """
+
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        num_layers,
+        dim_feedforward,
+        dropout,
+        depth_attention="causal",
+    ):
         super().__init__()
         if int(num_layers) <= 0:
             raise ValueError("decoder num_layers 必须大于0")
+        if depth_attention not in {"causal", "independent"}:
+            raise ValueError(
+                "depth_attention 必须是 causal 或 independent，"
+                f"实际为 {depth_attention!r}"
+            )
+        self.depth_attention_mode = depth_attention
         layer = CausalDepthDecoderLayer(
             embed_dim,
             num_heads,
@@ -126,8 +145,16 @@ class CausalDepthDecoder(nn.Module):
             diagonal=1,
         )
 
+    @staticmethod
+    def independent_mask(length, device):
+        """Block every off-diagonal depth pair while retaining self attention."""
+        return ~torch.eye(length, device=device, dtype=torch.bool)
+
     def forward(self, query, memory):
-        mask = self.causal_mask(query.shape[1], query.device)
+        if self.depth_attention_mode == "causal":
+            mask = self.causal_mask(query.shape[1], query.device)
+        else:
+            mask = self.independent_mask(query.shape[1], query.device)
         for layer in self.layers:
             query = layer(query, memory, mask)
         return self.norm(query)

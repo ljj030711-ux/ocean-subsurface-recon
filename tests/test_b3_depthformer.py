@@ -18,7 +18,7 @@ from config import (
     joint_du_unet_depth_tag,
 )
 from models.b3_depthformer import B3DepthFormer
-from test import _load_joint_du_unet_model
+from test import _load_joint_du_unet_model, _safe_weights_only_load
 from train import teacher_forcing_ratio_for_epoch
 from utils.losses import masked_depth_mean_rmse_loss
 from utils.reproducibility import (
@@ -85,6 +85,26 @@ class B3DepthFormerSmokeTest(unittest.TestCase):
         self.assertEqual(report["seed"], 2026)
         self.assertEqual(report["device"]["type"], "cpu")
         self.assertTrue(report["deterministic_algorithms"])
+        self.assertFalse(report["strict_determinism"])
+        self.assertEqual(report["determinism_policy"], "warn_only")
+        self.assertIsInstance(report["software"]["torch"], str)
+
+    def test_safe_weights_only_load_accepts_torch_version_metadata(self):
+        if not hasattr(torch.serialization, "safe_globals"):
+            self.skipTest("当前PyTorch版本不提供safe_globals白名单接口")
+        with tempfile.TemporaryDirectory() as temporary_root:
+            checkpoint_path = os.path.join(temporary_root, "versioned.pt")
+            torch.save(
+                {
+                    "state_dict": {"weight": torch.ones(1)},
+                    "torch_version": torch.__version__,
+                },
+                checkpoint_path,
+            )
+            loaded = _safe_weights_only_load(
+                checkpoint_path, map_location=torch.device("cpu")
+            )
+        torch.testing.assert_close(loaded["state_dict"]["weight"], torch.ones(1))
 
     def test_scheduled_sampling_is_repeatable(self):
         batch = synthetic_batch()

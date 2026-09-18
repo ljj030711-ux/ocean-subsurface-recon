@@ -17,8 +17,10 @@ data/*
 !data/download_global_phy_reanalysis.py
 
 # 其他临时文件和目录
+docs/
 reports/
 scripts/*
 !scripts/upload_nc_to_autodl_fs.sh
 !scripts/deploy_upload.sh
 !scripts/smoke_b3.py
+!scripts/run_depth_fusion_ablation.py

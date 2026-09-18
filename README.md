@@ -43,6 +43,10 @@ Du_Unet、Joint_Du_Unet、Joint_DUViT、B3_DepthFormer和HVCARefiner的train/tes
 
 配置快照会记录命令行、时间、数据范围、batch size、学习率、深度、模型结构、模型参数量、checkpoint/cache/output 路径等信息。HVCARefiner 配置快照跟随本次运行的 `--save-dir` 保存，便于区分多组 refiner 实验。测试配置统一使用 `test` 命名；Du_Unet 单日测试会在 JSON 中记录 `single: true`，时间段测试记录 `single: false`。
 
+统一训练入口会在每个 epoch 日志末尾输出 `Time: ...s`，训练结束后输出总耗时、平均每轮耗时和实际轮数。对应的原有 `training_history_*.npz` 还会保存 `epoch_times_seconds` 与 `total_training_seconds`，无需新增计时文件；总耗时包含训练循环、验证、最佳权重保存和早停判断。
+
+联合深度模型使用 `--spatial-panels --panel-days ... --target-levels ...` 时，除三联PNG外，还会在同一水平图目录自动保存一个压缩的 `case_fields_*.npz`。其中包含指定日期和深度的预测、真值、训练月气候态、距平场、误差场、有效掩膜、经纬度及MAE/RMSE/R²/Corr/SSIM/ACC，便于多个实验统一重绘和案例对比。
+
 ### 安装
 
 ```bash
@@ -61,7 +65,7 @@ Du_Unet 和 HVCARefiner 使用 `DEPTH_LEVELS_25M`，从 5m 开始：
 
 ## B3：DepthFormer 深度自回归模型
 
-B3 将 SST、SSH、SSS 编码为共享海表记忆，以可学习 BOS token 启动，按真实深度从浅到深生成目标温度层。模型结构、指定六层实验、CPU smoke test、训练/评估指令和完整超参数见 [B3 实现说明](docs/B3_DEPTHFORMER.md)。
+B3 将 SST、SSH、SSS 编码为共享海表记忆，以可学习 BOS token 启动，按真实深度从浅到深生成目标温度层。模型结构、指定六层实验、CPU smoke test、训练/评估指令和完整超参数见 [B3 实现说明](docs/B3_DEPTHFORMER.md)；官方源码参考位置和逐模块差异见 [GL-Geoformer 代码对应报告](docs/B3_GLGeoFormer_CODE_MAPPING.md)。因果深度注意力消融入口为 `scripts/run_depth_fusion_ablation.py`，比较原始 `causal` 与等参数量 `independent`，并固定复用上次 B3 的 seed、数据日期和二维图日期。
 
 ## Du_Unet
 

@@ -259,6 +259,7 @@ def build_model(method, **kwargs):
             base_grid_size=kwargs.get(
                 "base_grid_size", B3_DEPTHFORMER_BASE_GRID_SIZE
             ),
+            depth_attention=kwargs.get("depth_attention", "causal"),
         )
     if name == "ocean_transformer":
         return OceanTransformer(
@@ -792,6 +793,15 @@ def parse_args():
         type=int,
         default=B3_DEPTHFORMER_TEACHER_FORCING_DECAY_EPOCHS,
     )
+    b3.add_argument(
+        "--b3-depth-attention",
+        choices=["causal", "independent"],
+        default="causal",
+        help=(
+            "causal 使用原始B3因果深度注意力；independent仅允许每个深度"
+            "关注自身，模型参数量保持不变"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1165,6 +1175,7 @@ def main():
                 args.b3_base_grid_height,
                 args.b3_base_grid_width,
             ),
+            "depth_attention": args.b3_depth_attention,
         }
         model = build_model(method, **model_kwargs).to(device)
         architecture_config = model.model_config()
@@ -1322,6 +1333,7 @@ def main():
                     "teacher_forcing_decay_epochs": (
                         args.b3_teacher_forcing_decay_epochs
                     ),
+                    "depth_attention": args.b3_depth_attention,
                 },
                 "training_strategy": training_strategy,
                 "model_config": architecture_config,

@@ -32,7 +32,10 @@ def configure_reproducibility(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    torch.use_deterministic_algorithms(True, warn_only=False)
+    # CUDA bicubic interpolation backward has no deterministic implementation
+    # in the training environment. Keep deterministic algorithms enabled for
+    # supported operations, but warn instead of aborting for that kernel.
+    torch.use_deterministic_algorithms(True, warn_only=True)
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
@@ -96,7 +99,11 @@ def build_reproducibility_report(seed, device):
 
     return {
         "seed": int(seed),
-        "strict_determinism": True,
+        "strict_determinism": False,
+        "determinism_policy": "warn_only",
+        "known_nondeterministic_operation": (
+            "upsample_bicubic2d_backward_out_cuda"
+        ),
         "deterministic_algorithms": bool(
             torch.are_deterministic_algorithms_enabled()
         ),
@@ -126,7 +133,10 @@ def build_reproducibility_report(seed, device):
         "software": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),
-            "torch": torch.__version__,
+            # PyTorch 2.6 may expose this as a TorchVersion (a str subclass).
+            # Store a plain string so weights_only checkpoint loading needs no
+            # custom allowlist for checkpoints created after this fix.
+            "torch": str(torch.__version__),
             "numpy": np.__version__,
             "cuda": torch.version.cuda,
             "cudnn": cudnn_version,
@@ -140,8 +150,9 @@ def print_reproducibility_report(report):
     software = report["software"]
     print(f"随机种子:   {report['seed']}")
     print(
-        "确定性模式: 严格开启 "
-        "(无确定性实现的算子将报错，cuDNN benchmark 已关闭)"
+        "确定性模式: warn-only "
+        "(已固定随机种子并关闭cuDNN benchmark；"
+        "bicubic CUDA backward可能产生非逐位一致结果)"
     )
     print(
         f"运行设备:   {device['torch_device']} | {device['name']} | "

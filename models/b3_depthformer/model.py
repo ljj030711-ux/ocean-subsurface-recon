@@ -34,6 +34,7 @@ class B3DepthFormer(nn.Module):
         output_patch_size=8,
         refinement_channels=32,
         base_grid_size=(16, 16),
+        depth_attention="causal",
     ):
         super().__init__()
         self.d_model = int(d_model)
@@ -47,6 +48,7 @@ class B3DepthFormer(nn.Module):
         self.output_patch_size = int(output_patch_size)
         self.refinement_channels = int(refinement_channels)
         self.base_grid_size = tuple(int(value) for value in base_grid_size)
+        self.depth_attention = str(depth_attention)
         positive_values = (
             self.d_model,
             self.nhead,
@@ -115,6 +117,7 @@ class B3DepthFormer(nn.Module):
             num_layers=self.decoder_layers,
             dim_feedforward=self.dim_feedforward,
             dropout=self.dropout,
+            depth_attention=self.depth_attention,
         )
         self.reconstruction_head = PatchFoldReconstructionHead(
             self.d_model,
@@ -365,6 +368,11 @@ class B3DepthFormer(nn.Module):
             "depth_embedding": "learned_mlp_log1p_real_depth",
             "surface_position_embedding": "learnable_2d_interpolated",
             "decoder_start": "learned_BOS",
-            "decoder_attention": "causal_depth_then_surface_cross_attention",
+            "depth_attention": self.depth_attention,
+            "decoder_attention": (
+                "causal_depth_then_surface_cross_attention"
+                if self.depth_attention == "causal"
+                else "independent_depth_then_surface_cross_attention"
+            ),
             "reconstruction": "linear_patch_projection_and_fold_with_local_refinement",
         }

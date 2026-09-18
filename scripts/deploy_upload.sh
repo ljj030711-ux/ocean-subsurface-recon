@@ -4,6 +4,12 @@ set -euo pipefail
 # 禁止 macOS 在压缩包中写入 ._* AppleDouble 元数据文件。
 export COPYFILE_DISABLE=1
 
+# PROJECT_NAME="ocean-subsurface-recon-b3"
+# SERVER_USER="${SERVER_USER:-root}"
+# SERVER_HOST="${SERVER_HOST:-connect.bjb2.seetacloud.com}"
+# SERVER_PORT="${SERVER_PORT:-23910}"
+# REMOTE_PARENT_DIR="${REMOTE_PARENT_DIR:-/root}"
+
 PROJECT_NAME="ocean-subsurface-recon-b3"
 SERVER_USER="${SERVER_USER:-root}"
 SERVER_HOST="${SERVER_HOST:-connect.bjb1.seetacloud.com}"
@@ -84,6 +90,7 @@ tar \
   --exclude='runs' \
   --exclude='wandb' \
   --exclude='logs' \
+  --exclude='docs' \
   --exclude='reports' \
   --exclude='._*' \
   -czf "${ARCHIVE_PATH}" .
