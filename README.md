@@ -1,12 +1,12 @@
 # Ocean Subsurface Recon
 
-本项目用海表场重建水下多深度温度或盐度结构，当前包含 `Du_Unet`、`Joint_Du_Unet`、`Joint_DUViT`、`B3_DepthFormer`、`HVCARefiner`、`ocean_transformer`、`2dvar` 和 `modas`。
+本项目用海表场重建水下多深度温度或盐度结构，当前包含 `Du_Unet`、`Joint_Du_Unet`、`Joint_DUViT`、`B3_DepthFormer`、`B4_CPlus`、`HVCARefiner`、`ocean_transformer`、`2dvar` 和 `modas`。
 
 ## 总览
 
 ### 建模范式
 
-- `2dto2d`：`Du_Unet`为逐深度B0，`Joint_Du_Unet`为联合输出B1，`Joint_DUViT`为在两个瓶颈加入空间ViT的B2，`B3_DepthFormer`为BOS启动的深度自回归Transformer，`HVCARefiner`为B0旁支的二阶段修正模型。
+- `2dto2d`：`Du_Unet`为逐深度B0，`Joint_Du_Unet`为联合输出B1，`Joint_DUViT`为在两个瓶颈加入空间ViT的B2，`B3_DepthFormer`为BOS启动的深度自回归Transformer，`B4_CPlus`在B3垂向建模前后加入原生网格CNN和多尺度U-Net跳连，`HVCARefiner`为B0旁支的二阶段修正模型。
 - `2dto3d`：单次输出多个深度。当前包括 `ocean_transformer`、`2dvar`、`modas`。
 
 ### 目录规则
@@ -21,6 +21,8 @@
 - Joint_DUViT 权重：`checkpoints/2dto2d/Joint_DUViT/{temperature|salinity}/`
 - B3_DepthFormer 输出：`outputs/2dto2d/B3_DepthFormer/{temperature|salinity}/`
 - B3_DepthFormer 权重：`checkpoints/2dto2d/B3_DepthFormer/{temperature|salinity}/`
+- B4_CPlus 输出：`outputs/2dto2d/B4_CPlus/{temperature|salinity}/`
+- B4_CPlus 权重：`checkpoints/2dto2d/B4_CPlus/{temperature|salinity}/`
 - HVCARefiner 输出与权重：`outputs/2dto2d/HVCARefiner/`
 - OceanTransformer 输出：`outputs/2dto3d/ocean_transformer/`
 - 2DVar 输出：`outputs/2dto3d/2dvar/`
@@ -28,7 +30,7 @@
 
 ### 运行日志和配置快照
 
-Du_Unet、Joint_Du_Unet、Joint_DUViT、B3_DepthFormer和HVCARefiner的train/test入口会在运行前打印最终超参数，并保存JSON配置快照：
+Du_Unet、Joint_Du_Unet、Joint_DUViT、B3_DepthFormer、B4_CPlus和HVCARefiner的train/test入口会在运行前打印最终超参数，并保存JSON配置快照：
 
 - `outputs/2dto2d/Du_Unet/Du_Unet_train_config.json`
 - `outputs/2dto2d/Du_Unet/Du_Unet_test_config.json`
@@ -38,6 +40,8 @@ Du_Unet、Joint_Du_Unet、Joint_DUViT、B3_DepthFormer和HVCARefiner的train/tes
 - `outputs/2dto2d/Joint_DUViT/{target_var}/Joint_DUViT_test_config_{depth_tag}.json`
 - `outputs/2dto2d/B3_DepthFormer/{target_var}/B3_DepthFormer_train_config_{depth_tag}.json`
 - `outputs/2dto2d/B3_DepthFormer/{target_var}/B3_DepthFormer_test_config_{depth_tag}.json`
+- `outputs/2dto2d/B4_CPlus/{target_var}/B4_CPlus_train_config_{depth_tag}.json`
+- `outputs/2dto2d/B4_CPlus/{target_var}/B4_CPlus_test_config_{depth_tag}.json`
 - HVCARefiner 训练配置：`<train --save-dir>/HVCARefiner_train_config.json`
 - HVCARefiner 测试配置：`<test --save-dir>/HVCARefiner_test_config.json`
 
@@ -66,6 +70,12 @@ Du_Unet 和 HVCARefiner 使用 `DEPTH_LEVELS_25M`，从 5m 开始：
 ## B3：DepthFormer 深度自回归模型
 
 B3 将 SST、SSH、SSS 编码为共享海表记忆，以可学习 BOS token 启动，按真实深度从浅到深生成目标温度层。模型结构、指定六层实验、CPU smoke test、训练/评估指令和完整超参数见 [B3 实现说明](docs/B3_DEPTHFORMER.md)；官方源码参考位置和逐模块差异见 [GL-Geoformer 代码对应报告](docs/B3_GLGeoFormer_CODE_MAPPING.md)。因果深度注意力消融入口为 `scripts/run_depth_fusion_ablation.py`，比较原始 `causal` 与等参数量 `independent`，并固定复用上次 B3 的 seed、数据日期和二维图日期。
+
+## B4：C+ 原生网格多尺度 DepthFormer
+
+B4 不覆盖 B3：代码位于独立的 `B4` 分支和 `ocean-subsurface-recon-b4` 工作目录。C+ 先在 SST 480×320 与 SSH/SSS 192×128 的原生网格上卷积提取特征，再依据真实经纬度一次性重网格到 145×97；之后使用共享 U-Net 金字塔、与 B3 一致的 37×25 Surface/Depth Transformer 空间网格、保留 memory cross-attention 的因果深度 Decoder，以及三尺度 U-Net 解码器生成 28×289×193 温度场。
+
+默认28层模型共有 **3,325,350** 个可训练参数，比原始B3的1,889,441个增加 **1,435,909（+76.00%）**。完整尺寸流、逐模块参数量、训练与测试命令见 [B4 C+ 实现说明](docs/B4_CPLUS.md)。
 
 ## Du_Unet
 

@@ -14,6 +14,27 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import (
+    B4_CPLUS_BASE_GRID_SIZE,
+    B4_CPLUS_BATCH_SIZE,
+    B4_CPLUS_CKPT_NAME_TEMPLATE,
+    B4_CPLUS_DECODER_LAYERS,
+    B4_CPLUS_DIM_FF,
+    B4_CPLUS_D_MODEL,
+    B4_CPLUS_DROPOUT,
+    B4_CPLUS_ENCODER_LAYERS,
+    B4_CPLUS_EPOCHS,
+    B4_CPLUS_FUSION_CHANNELS,
+    B4_CPLUS_HISTORY_NAME_TEMPLATE,
+    B4_CPLUS_LOSS_CURVE_TEMPLATE,
+    B4_CPLUS_LR,
+    B4_CPLUS_NATIVE_BASE_CHANNELS,
+    B4_CPLUS_NHEAD,
+    B4_CPLUS_OUTPUT_PATCH_SIZE,
+    B4_CPLUS_PATIENCE,
+    B4_CPLUS_TEACHER_FORCING_DECAY_EPOCHS,
+    B4_CPLUS_TEACHER_FORCING_END,
+    B4_CPLUS_TEACHER_FORCING_START,
+    B4_CPLUS_WEIGHT_DECAY,
     B3_DEPTHFORMER_BASE_GRID_SIZE,
     B3_DEPTHFORMER_BATCH_SIZE,
     B3_DEPTHFORMER_CKPT_NAME_TEMPLATE,
@@ -93,13 +114,14 @@ from config import (
     SEED,
     dataset_profile_names,
     get_2dto2d_depth_levels,
+    get_2dto2d_lon_lat_range,
     get_checkpoint_dir,
     get_output_dir,
     joint_du_unet_depth_tag,
 )
 from datasets.dataset_2dto2d import Dataset2Dto2D
 from datasets.dataset_2dto3d import DummyTwoDto3DDataset
-from models.b3_depthformer import B3DepthFormer
+from models.b4_cplus import B4CPlusDepthFormer
 from models.du_unet import Du_Unet
 from models.joint_du_unet import JointDuUnet
 from models.joint_duvit import JointDUViT
@@ -121,6 +143,7 @@ from utils.reproducibility import (
 )
 
 TRAINABLE_METHODS = {
+    "b4_cplus",
     "b3_depthformer",
     "du_unet",
     "joint_du_unet",
@@ -227,6 +250,8 @@ def build_model(method, **kwargs):
             dropout=kwargs.get("dropout", JOINT_DUVIT_DROPOUT),
         )
     if name in {"b3_depthformer", "b3-depthformer", "b3"}:
+        from models.b3_depthformer import B3DepthFormer
+
         depth_values = kwargs.get("depth_values")
         if depth_values is None:
             raise ValueError("B3_DepthFormer 构建时必须提供 depth_values")
@@ -260,6 +285,39 @@ def build_model(method, **kwargs):
                 "base_grid_size", B3_DEPTHFORMER_BASE_GRID_SIZE
             ),
             depth_attention=kwargs.get("depth_attention", "causal"),
+        )
+    if name in {"b4_cplus", "b4-cplus", "b4"}:
+        depth_values = kwargs.get("depth_values")
+        if depth_values is None:
+            raise ValueError("B4_CPlus 构建时必须提供 depth_values")
+        return B4CPlusDepthFormer(
+            depth_values=depth_values,
+            d_model=kwargs.get("d_model", B4_CPLUS_D_MODEL),
+            nhead=kwargs.get("nhead", B4_CPLUS_NHEAD),
+            encoder_layers=kwargs.get(
+                "encoder_layers", B4_CPLUS_ENCODER_LAYERS
+            ),
+            decoder_layers=kwargs.get(
+                "decoder_layers", B4_CPLUS_DECODER_LAYERS
+            ),
+            dim_feedforward=kwargs.get("dim_feedforward", B4_CPLUS_DIM_FF),
+            dropout=kwargs.get("dropout", B4_CPLUS_DROPOUT),
+            native_base_channels=kwargs.get(
+                "native_base_channels", B4_CPLUS_NATIVE_BASE_CHANNELS
+            ),
+            fusion_channels=kwargs.get(
+                "fusion_channels", B4_CPLUS_FUSION_CHANNELS
+            ),
+            output_patch_size=kwargs.get(
+                "output_patch_size", B4_CPLUS_OUTPUT_PATCH_SIZE
+            ),
+            base_grid_size=kwargs.get(
+                "base_grid_size", B4_CPLUS_BASE_GRID_SIZE
+            ),
+            depth_attention=kwargs.get("depth_attention", "causal"),
+            lat_range=kwargs.get("lat_range", (0.0, 24.0)),
+            lon_range=kwargs.get("lon_range", (105.0, 121.0)),
+            source_lat_descending=kwargs.get("source_lat_descending", False),
         )
     if name == "ocean_transformer":
         return OceanTransformer(
@@ -530,9 +588,9 @@ def train_one_model(
         if method == "ocean_transformer":
             t_loss = train_2dto3d_epoch(model, train_loader, optimizer, device, criterion)
             v_loss = validate_2dto3d(model, val_loader, device, criterion)
-        elif method == "b3_depthformer":
+        elif method in {"b3_depthformer", "b4_cplus"}:
             if teacher_forcing_schedule is None:
-                raise ValueError("B3 训练缺少 teacher_forcing_schedule")
+                raise ValueError("深度自回归模型训练缺少 teacher_forcing_schedule")
             teacher_forcing_ratio = teacher_forcing_ratio_for_epoch(
                 epoch, *teacher_forcing_schedule
             )
@@ -802,6 +860,64 @@ def parse_args():
             "关注自身，模型参数量保持不变"
         ),
     )
+    b4 = parser.add_argument_group("B4 C+ 模型参数")
+    b4.add_argument("--b4-d-model", type=int, default=B4_CPLUS_D_MODEL)
+    b4.add_argument("--b4-nhead", type=int, default=B4_CPLUS_NHEAD)
+    b4.add_argument(
+        "--b4-encoder-layers", type=int, default=B4_CPLUS_ENCODER_LAYERS
+    )
+    b4.add_argument(
+        "--b4-decoder-layers", type=int, default=B4_CPLUS_DECODER_LAYERS
+    )
+    b4.add_argument(
+        "--b4-dim-feedforward", type=int, default=B4_CPLUS_DIM_FF
+    )
+    b4.add_argument("--b4-dropout", type=float, default=B4_CPLUS_DROPOUT)
+    b4.add_argument(
+        "--b4-native-base-channels",
+        type=int,
+        default=B4_CPLUS_NATIVE_BASE_CHANNELS,
+    )
+    b4.add_argument(
+        "--b4-fusion-channels",
+        type=int,
+        default=B4_CPLUS_FUSION_CHANNELS,
+    )
+    b4.add_argument(
+        "--b4-base-grid-height",
+        type=int,
+        default=B4_CPLUS_BASE_GRID_SIZE[0],
+    )
+    b4.add_argument(
+        "--b4-base-grid-width",
+        type=int,
+        default=B4_CPLUS_BASE_GRID_SIZE[1],
+    )
+    b4.add_argument(
+        "--b4-source-lat-descending",
+        action="store_true",
+        help="源卫星数组纬度索引从北向南排列时启用",
+    )
+    b4.add_argument(
+        "--b4-teacher-forcing-start",
+        type=float,
+        default=B4_CPLUS_TEACHER_FORCING_START,
+    )
+    b4.add_argument(
+        "--b4-teacher-forcing-end",
+        type=float,
+        default=B4_CPLUS_TEACHER_FORCING_END,
+    )
+    b4.add_argument(
+        "--b4-teacher-forcing-decay-epochs",
+        type=int,
+        default=B4_CPLUS_TEACHER_FORCING_DECAY_EPOCHS,
+    )
+    b4.add_argument(
+        "--b4-depth-attention",
+        choices=["causal", "independent"],
+        default="causal",
+    )
     return parser.parse_args()
 
 
@@ -822,6 +938,8 @@ def main():
         method = "joint_duvit"
     if method in {"b3-depthformer", "b3"}:
         method = "b3_depthformer"
+    if method in {"b4-cplus", "b4"}:
+        method = "b4_cplus"
     if method not in TRAINABLE_METHODS:
         raise ValueError(f"未识别的方法: {args.method}")
     paradigm = paradigm_of_method(method)
@@ -830,6 +948,7 @@ def main():
         "joint_du_unet": "Joint_Du_Unet",
         "joint_duvit": "Joint_DUViT",
         "b3_depthformer": "B3_DepthFormer",
+        "b4_cplus": "B4_CPlus",
     }.get(method, method)
 
     configure_reproducibility(args.seed)
@@ -841,6 +960,7 @@ def main():
         "joint_du_unet",
         "joint_duvit",
         "b3_depthformer",
+        "b4_cplus",
     }:
         out_dir = get_output_dir(
             paradigm, method_dir, base_dir=args.output_dir, target_var=args.target_var
@@ -1144,43 +1264,87 @@ def main():
             print(f"深度 {depth_m}m 训练完成，best val={best_val:.6f}")
         return
 
-    if method == "b3_depthformer":
-        epochs = args.epochs or B3_DEPTHFORMER_EPOCHS
-        batch_size = args.batch_size or B3_DEPTHFORMER_BATCH_SIZE
-        lr = args.lr or B3_DEPTHFORMER_LR
-        patience = args.patience or B3_DEPTHFORMER_PATIENCE
+    if method in {"b3_depthformer", "b4_cplus"}:
+        is_b4 = method == "b4_cplus"
+        model_label = "B4_CPlus" if is_b4 else "B3_DepthFormer"
+        experiment_name = (
+            "B4_CPlus_native_single_regrid_depthformer"
+            if is_b4
+            else "B3_BOS_depth_autoregressive"
+        )
+        epochs = args.epochs or (
+            B4_CPLUS_EPOCHS if is_b4 else B3_DEPTHFORMER_EPOCHS
+        )
+        batch_size = args.batch_size or (
+            B4_CPLUS_BATCH_SIZE if is_b4 else B3_DEPTHFORMER_BATCH_SIZE
+        )
+        lr = args.lr or (B4_CPLUS_LR if is_b4 else B3_DEPTHFORMER_LR)
+        patience = args.patience or (
+            B4_CPLUS_PATIENCE if is_b4 else B3_DEPTHFORMER_PATIENCE
+        )
+        weight_decay = (
+            B4_CPLUS_WEIGHT_DECAY if is_b4 else B3_DEPTHFORMER_WEIGHT_DECAY
+        )
         depth_indices = parse_depth_indices(args.depth_indices, depth_levels)
         if depth_indices != sorted(depth_indices):
             raise ValueError(
-                "B3 --depth-indices 必须按从浅到深递增，例如 0,4,9,17,24,27"
+                f"{model_label} --depth-indices 必须按从浅到深递增，"
+                "例如 0,4,9,17,24,27"
             )
         selected_depth_levels = [depth_levels[idx] for idx in depth_indices]
         num_outputs = len(depth_indices)
         depth_tag = joint_du_unet_depth_tag(
             depth_indices, total_num_depths=dataset.num_depths
         )
-        model_kwargs = {
-            "depth_values": selected_depth_levels,
-            "d_model": args.b3_d_model,
-            "nhead": args.b3_nhead,
-            "encoder_layers": args.b3_encoder_layers,
-            "decoder_layers": args.b3_decoder_layers,
-            "dim_feedforward": args.b3_dim_feedforward,
-            "dropout": args.b3_dropout,
-            "sst_patch_size": args.b3_sst_patch_size,
-            "surface_patch_size": args.b3_surface_patch_size,
-            "output_patch_size": args.b3_output_patch_size,
-            "refinement_channels": args.b3_refinement_channels,
-            "base_grid_size": (
-                args.b3_base_grid_height,
-                args.b3_base_grid_width,
-            ),
-            "depth_attention": args.b3_depth_attention,
-        }
+        if is_b4:
+            lon_range, lat_range = get_2dto2d_lon_lat_range(
+                args.dataset_profile
+            )
+            model_kwargs = {
+                "depth_values": selected_depth_levels,
+                "d_model": args.b4_d_model,
+                "nhead": args.b4_nhead,
+                "encoder_layers": args.b4_encoder_layers,
+                "decoder_layers": args.b4_decoder_layers,
+                "dim_feedforward": args.b4_dim_feedforward,
+                "dropout": args.b4_dropout,
+                "native_base_channels": args.b4_native_base_channels,
+                "fusion_channels": args.b4_fusion_channels,
+                "output_patch_size": B4_CPLUS_OUTPUT_PATCH_SIZE,
+                "base_grid_size": (
+                    args.b4_base_grid_height,
+                    args.b4_base_grid_width,
+                ),
+                "depth_attention": args.b4_depth_attention,
+                "lat_range": lat_range,
+                "lon_range": lon_range,
+                "source_lat_descending": args.b4_source_lat_descending,
+            }
+        else:
+            model_kwargs = {
+                "depth_values": selected_depth_levels,
+                "d_model": args.b3_d_model,
+                "nhead": args.b3_nhead,
+                "encoder_layers": args.b3_encoder_layers,
+                "decoder_layers": args.b3_decoder_layers,
+                "dim_feedforward": args.b3_dim_feedforward,
+                "dropout": args.b3_dropout,
+                "sst_patch_size": args.b3_sst_patch_size,
+                "surface_patch_size": args.b3_surface_patch_size,
+                "output_patch_size": args.b3_output_patch_size,
+                "refinement_channels": args.b3_refinement_channels,
+                "base_grid_size": (
+                    args.b3_base_grid_height,
+                    args.b3_base_grid_width,
+                ),
+                "depth_attention": args.b3_depth_attention,
+            }
         model = build_model(method, **model_kwargs).to(device)
         architecture_config = model.model_config()
         architecture_config["source_depth_indices"] = list(depth_indices)
         param_stats = count_model_parameters(model)
+        if is_b4:
+            param_stats["by_component"] = model.parameter_count_by_component()
         b3_dataset = DepthIndicesTargetDataset(dataset, depth_indices)
         train_loader_kwargs = dataloader_kwargs(args, device, seed_offset=0)
         val_loader_kwargs = dataloader_kwargs(args, device, seed_offset=1)
@@ -1199,7 +1363,7 @@ def main():
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=lr,
-            weight_decay=B3_DEPTHFORMER_WEIGHT_DECAY,
+            weight_decay=weight_decay,
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
@@ -1207,22 +1371,45 @@ def main():
             eta_min=lr * 0.05,
         )
         teacher_forcing_schedule = (
-            args.b3_teacher_forcing_start,
-            args.b3_teacher_forcing_end,
-            args.b3_teacher_forcing_decay_epochs,
+            (
+                args.b4_teacher_forcing_start,
+                args.b4_teacher_forcing_end,
+                args.b4_teacher_forcing_decay_epochs,
+            )
+            if is_b4
+            else (
+                args.b3_teacher_forcing_start,
+                args.b3_teacher_forcing_end,
+                args.b3_teacher_forcing_decay_epochs,
+            )
         )
         # Validate the complete schedule before creating any artifacts.
         teacher_forcing_ratio_for_epoch(0, *teacher_forcing_schedule)
 
-        ckpt_name = B3_DEPTHFORMER_CKPT_NAME_TEMPLATE.format(
+        ckpt_template = (
+            B4_CPLUS_CKPT_NAME_TEMPLATE
+            if is_b4
+            else B3_DEPTHFORMER_CKPT_NAME_TEMPLATE
+        )
+        history_template = (
+            B4_CPLUS_HISTORY_NAME_TEMPLATE
+            if is_b4
+            else B3_DEPTHFORMER_HISTORY_NAME_TEMPLATE
+        )
+        curve_template = (
+            B4_CPLUS_LOSS_CURVE_TEMPLATE
+            if is_b4
+            else B3_DEPTHFORMER_LOSS_CURVE_TEMPLATE
+        )
+        ckpt_name = ckpt_template.format(
             target_var=args.target_var,
             depth_tag=depth_tag,
         )
-        history_name = B3_DEPTHFORMER_HISTORY_NAME_TEMPLATE.format(
+        history_name = history_template.format(
             target_var=args.target_var,
             depth_tag=depth_tag,
         )
-        curve_name = B3_DEPTHFORMER_LOSS_CURVE_TEMPLATE.format(
+        curve_name = curve_template.format(
             target_var=args.target_var,
             depth_tag=depth_tag,
         )
@@ -1230,7 +1417,7 @@ def main():
         history_path = os.path.join(out_dir, history_name)
         curve_path = os.path.join(out_dir, curve_name)
         training_strategy = {
-            "experiment": "B3_BOS_depth_autoregressive",
+            "experiment": experiment_name,
             "epoch": {"planned": epochs, "indexing": "1_based"},
             "early_stopping": {
                 "enabled": True,
@@ -1241,7 +1428,7 @@ def main():
             "optimizer": {
                 "name": "AdamW",
                 "lr": lr,
-                "weight_decay": B3_DEPTHFORMER_WEIGHT_DECAY,
+                "weight_decay": weight_decay,
             },
             "scheduler": {
                 "name": "CosineAnnealingLR",
@@ -1250,22 +1437,22 @@ def main():
                 "step_on": "epoch",
             },
             "teacher_forcing": {
-                "start_ratio": args.b3_teacher_forcing_start,
-                "end_ratio": args.b3_teacher_forcing_end,
-                "linear_decay_epochs": args.b3_teacher_forcing_decay_epochs,
+                "start_ratio": teacher_forcing_schedule[0],
+                "end_ratio": teacher_forcing_schedule[1],
+                "linear_decay_epochs": teacher_forcing_schedule[2],
                 "selection": "per_sample_Bernoulli",
                 "validation_ratio": 0.0,
             },
         }
         config_path = model_config_path(
             args.output_dir,
-            "B3_DepthFormer",
+            model_label,
             "train",
             target_var=args.target_var,
             run_tag=depth_tag,
         )
         checkpoint_metadata = {
-            "checkpoint_type": "B3_DepthFormer",
+            "checkpoint_type": model_label,
             "target_var": args.target_var,
             "dataset_profile": args.dataset_profile,
             "dataset_num_depths": dataset.num_depths,
@@ -1279,11 +1466,11 @@ def main():
             "reproducibility": reproducibility,
         }
         print_and_save_run_config(
-            "B3 B3_DepthFormer 训练超参数",
+            f"{model_label} 训练超参数",
             {
                 "stage": "train",
-                "experiment": "B3_BOS_depth_autoregressive",
-                "model": "B3_DepthFormer",
+                "experiment": experiment_name,
+                "model": model_label,
                 "method": method,
                 "paradigm": paradigm,
                 "target_var": args.target_var,
@@ -1324,16 +1511,14 @@ def main():
                     "batch_size": batch_size,
                     "lr": lr,
                     "learning_rate": lr,
-                    "weight_decay": B3_DEPTHFORMER_WEIGHT_DECAY,
+                    "weight_decay": weight_decay,
                     "patience": patience,
                     "depth_indices": depth_indices,
                     "depth_m": selected_depth_levels,
-                    "teacher_forcing_start": args.b3_teacher_forcing_start,
-                    "teacher_forcing_end": args.b3_teacher_forcing_end,
-                    "teacher_forcing_decay_epochs": (
-                        args.b3_teacher_forcing_decay_epochs
-                    ),
-                    "depth_attention": args.b3_depth_attention,
+                    "teacher_forcing_start": teacher_forcing_schedule[0],
+                    "teacher_forcing_end": teacher_forcing_schedule[1],
+                    "teacher_forcing_decay_epochs": teacher_forcing_schedule[2],
+                    "depth_attention": model_kwargs["depth_attention"],
                 },
                 "training_strategy": training_strategy,
                 "model_config": architecture_config,
@@ -1397,7 +1582,7 @@ def main():
         )
         save_loss_curve(train_losses, val_losses, curve_path)
         print(
-            "\nB3 深度自回归训练完成。"
+            f"\n{model_label} 深度自回归训练完成。"
             f"最佳自回归验证损失: {best_val:.6f}"
         )
         print(f"最佳权重: {ckpt_path}")

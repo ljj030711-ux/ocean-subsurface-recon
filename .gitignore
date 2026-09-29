@@ -17,7 +17,8 @@ data/*
 !data/download_global_phy_reanalysis.py
 
 # 其他临时文件和目录
-docs/
+docs/*
+!docs/B4_CPLUS.md
 reports/
 scripts/*
 !scripts/upload_nc_to_autodl_fs.sh

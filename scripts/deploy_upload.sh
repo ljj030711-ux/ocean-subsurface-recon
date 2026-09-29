@@ -4,13 +4,13 @@ set -euo pipefail
 # 禁止 macOS 在压缩包中写入 ._* AppleDouble 元数据文件。
 export COPYFILE_DISABLE=1
 
-# PROJECT_NAME="ocean-subsurface-recon-b3"
+# PROJECT_NAME="ocean-subsurface-recon-b4"
 # SERVER_USER="${SERVER_USER:-root}"
 # SERVER_HOST="${SERVER_HOST:-connect.bjb2.seetacloud.com}"
 # SERVER_PORT="${SERVER_PORT:-23910}"
 # REMOTE_PARENT_DIR="${REMOTE_PARENT_DIR:-/root}"
 
-PROJECT_NAME="ocean-subsurface-recon-b3"
+PROJECT_NAME="ocean-subsurface-recon-b4"
 SERVER_USER="${SERVER_USER:-root}"
 SERVER_HOST="${SERVER_HOST:-connect.bjb1.seetacloud.com}"
 SERVER_PORT="${SERVER_PORT:-50490}"
@@ -40,7 +40,9 @@ done
 
 if [ ! -f "${PROJECT_DIR}/train.py" ] || \
    [ ! -f "${PROJECT_DIR}/test.py" ] || \
-   [ ! -f "${PROJECT_DIR}/models/b3_depthformer/model.py" ]; then
+   [ ! -f "${PROJECT_DIR}/models/b4_cplus/model.py" ] || \
+   [ ! -f "${PROJECT_DIR}/models/b4_cplus/decoder.py" ] || \
+   [ ! -f "${PROJECT_DIR}/models/b4_cplus/embeddings.py" ]; then
   echo "Project root is invalid: ${PROJECT_DIR}" >&2
   exit 1
 fi
@@ -143,7 +145,9 @@ tar -xzf "${archive_path}" -C "${staging_dir}"
 
 if [ ! -f "${staging_dir}/train.py" ] || \
    [ ! -f "${staging_dir}/test.py" ] || \
-   [ ! -f "${staging_dir}/models/b3_depthformer/model.py" ]; then
+   [ ! -f "${staging_dir}/models/b4_cplus/model.py" ] || \
+   [ ! -f "${staging_dir}/models/b4_cplus/decoder.py" ] || \
+   [ ! -f "${staging_dir}/models/b4_cplus/embeddings.py" ]; then
   echo "Extracted project validation failed; current deployment was not changed" >&2
   exit 1
 fi
@@ -164,7 +168,7 @@ echo "Uploaded archive retained at: ${archive_path}"
 REMOTE_DEPLOY
 
 echo
-echo "B3 deployment completed successfully."
+echo "B4 deployment completed successfully."
 echo "Server project: ${REMOTE_PROJECT_DIR}"
 echo "Server backup:  ${REMOTE_BACKUP_DIR} (when a previous version existed)"
 echo "Server archive: ${REMOTE_ARCHIVE_PATH}"

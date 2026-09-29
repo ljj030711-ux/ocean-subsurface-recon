@@ -45,6 +45,7 @@ PARADIGM_2DTO2D_METHODS = {
     "joint_du_unet",
     "joint_duvit",
     "b3_depthformer",
+    "b4_cplus",
 }
 PARADIGM_2DTO3D_METHODS = {"2dvar", "modas", "ocean_transformer"}
 
@@ -240,6 +241,32 @@ B3_DEPTHFORMER_PATIENCE = 10
 B3_DEPTHFORMER_TEACHER_FORCING_START = 1.0
 B3_DEPTHFORMER_TEACHER_FORCING_END = 0.5
 B3_DEPTHFORMER_TEACHER_FORCING_DECAY_EPOCHS = 30
+
+# B4：C+ 原生网格浅层编码、单次坐标重网格、/8共享金字塔，
+# 保留 B3 Surface/Depth Transformer 与 memory cross-attention。
+B4_CPLUS_CKPT_NAME_TEMPLATE = "B4_CPlus_{target_var}_{depth_tag}_best.pth"
+B4_CPLUS_HISTORY_NAME_TEMPLATE = (
+    "training_history_B4_CPlus_{target_var}_{depth_tag}.npz"
+)
+B4_CPLUS_LOSS_CURVE_TEMPLATE = "loss_B4_CPlus_{target_var}_{depth_tag}.png"
+B4_CPLUS_D_MODEL = 128
+B4_CPLUS_NHEAD = 8
+B4_CPLUS_ENCODER_LAYERS = 4
+B4_CPLUS_DECODER_LAYERS = 3
+B4_CPLUS_DIM_FF = 512
+B4_CPLUS_DROPOUT = 0.1
+B4_CPLUS_NATIVE_BASE_CHANNELS = 32
+B4_CPLUS_FUSION_CHANNELS = 64
+B4_CPLUS_OUTPUT_PATCH_SIZE = 8
+B4_CPLUS_BASE_GRID_SIZE = (16, 16)
+B4_CPLUS_EPOCHS = 50
+B4_CPLUS_BATCH_SIZE = 16
+B4_CPLUS_LR = 1e-4
+B4_CPLUS_WEIGHT_DECAY = 1e-4
+B4_CPLUS_PATIENCE = 10
+B4_CPLUS_TEACHER_FORCING_START = 1.0
+B4_CPLUS_TEACHER_FORCING_END = 0.5
+B4_CPLUS_TEACHER_FORCING_DECAY_EPOCHS = 30
 
 
 def joint_du_unet_depth_tag(depth_indices, total_num_depths):

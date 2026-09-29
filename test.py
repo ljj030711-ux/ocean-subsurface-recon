@@ -17,6 +17,7 @@ from models.inversion_modas import inversion_modas
 
 from config import (
     B3_DEPTHFORMER_CKPT_NAME_TEMPLATE,
+    B4_CPLUS_CKPT_NAME_TEMPLATE,
     CHECKPOINTS_ROOT,
     DATA_DIR,
     DATA_END_DATE,
@@ -87,7 +88,12 @@ NON_DL_METHODS = {"2dvar", "modas"}
 DL_2DTO2D_METHODS = set(PARADIGM_2DTO2D_METHODS)
 DL_2DTO3D_METHODS = set(PARADIGM_2DTO3D_METHODS) - NON_DL_METHODS
 ALL_METHODS = sorted(DL_2DTO2D_METHODS | DL_2DTO3D_METHODS | NON_DL_METHODS)
-JOINT_METHOD_NAMES = {"Joint_Du_Unet", "Joint_DUViT", "B3_DepthFormer"}
+JOINT_METHOD_NAMES = {
+    "Joint_Du_Unet",
+    "Joint_DUViT",
+    "B3_DepthFormer",
+    "B4_CPlus",
+}
 
 
 def _safe_weights_only_load(path, map_location):
@@ -112,6 +118,14 @@ def _is_joint_method(args):
 
 
 def _joint_method_spec(args):
+    if getattr(args, "method", None) == "B4_CPlus":
+        return {
+            "method_key": "b4_cplus",
+            "model_name": "B4_CPlus",
+            "checkpoint_type": "B4_CPlus",
+            "checkpoint_template": B4_CPLUS_CKPT_NAME_TEMPLATE,
+            "experiment": "B4_CPlus_native_single_regrid_depthformer",
+        }
     if getattr(args, "method", None) == "B3_DepthFormer":
         return {
             "method_key": "b3_depthformer",
@@ -590,7 +604,11 @@ def predict_2dto2d(args):
 
     if is_joint:
         param_stats = count_model_parameters(joint_model)
-        parameter_payload = param_stats
+        parameter_payload = dict(param_stats)
+        if joint_spec["method_key"] == "b4_cplus":
+            parameter_payload["by_component"] = (
+                joint_model.parameter_count_by_component()
+            )
         checkpoint_candidates = _joint_du_unet_checkpoint_candidates(
             args,
             dataset.num_depths,
@@ -752,6 +770,7 @@ def _target_var_for_outputs(args, is_2dto3d):
         "Joint_Du_Unet",
         "Joint_DUViT",
         "B3_DepthFormer",
+        "B4_CPlus",
     }:
         return getattr(args, "target_var", None)
     return None
@@ -851,11 +870,12 @@ def _joint_du_unet_checkpoint_candidates(args, dataset_num_depths):
 
 
 def _joint_output_channels_from_state_dict(state_dict, method_key):
-    if method_key == "b3_depthformer":
+    if method_key in {"b3_depthformer", "b4_cplus"}:
         depth_values = state_dict.get("depth_embedding.depth_values")
         if depth_values is None or not hasattr(depth_values, "numel"):
             raise ValueError(
-                "无法从 B3 checkpoint 推断深度数；缺少 depth_embedding.depth_values"
+                "无法从深度自回归 checkpoint 推断深度数；"
+                "缺少 depth_embedding.depth_values"
             )
         return int(depth_values.numel())
     candidates = [
@@ -872,7 +892,7 @@ def _joint_output_channels_from_state_dict(state_dict, method_key):
 
 
 def _load_joint_du_unet_model(args, device, dataset):
-    """Load one B1/B2/B3 joint checkpoint and recover its depth mapping."""
+    """Load one joint-depth checkpoint and recover its depth mapping."""
     from train import build_model
 
     spec = _joint_method_spec(args)
@@ -1036,9 +1056,9 @@ def _load_joint_du_unet_model(args, device, dataset):
                 "checkpoint 与测试数据使用的归一化统计量指纹不一致"
             )
 
-    if spec["method_key"] == "b3_depthformer":
+    if spec["method_key"] in {"b3_depthformer", "b4_cplus"}:
         if not structured_checkpoint:
-            raise ValueError("B3 仅支持包含结构元数据的新版 checkpoint")
+            raise ValueError("深度自回归模型仅支持包含结构元数据的 checkpoint")
         build_kwargs = {
             "depth_values": metadata_model_config.get(
                 "depth_values", metadata.get("depth_m")
@@ -1049,26 +1069,49 @@ def _load_joint_du_unet_model(args, device, dataset):
             "decoder_layers": metadata_model_config.get("decoder_layers"),
             "dim_feedforward": metadata_model_config.get("dim_feedforward"),
             "dropout": metadata_model_config.get("dropout"),
-            "sst_patch_size": metadata_model_config.get("sst_patch_size"),
-            "surface_patch_size": metadata_model_config.get(
-                "surface_patch_size"
-            ),
             "output_patch_size": metadata_model_config.get("output_patch_size"),
-            "refinement_channels": metadata_model_config.get(
-                "refinement_channels"
-            ),
             "base_grid_size": metadata_model_config.get("base_grid_size"),
-            # Old B3 checkpoints predate this field and are the causal model.
             "depth_attention": metadata_model_config.get(
                 "depth_attention", "causal"
             ),
         }
+        if spec["method_key"] == "b4_cplus":
+            build_kwargs.update(
+                {
+                    "native_base_channels": metadata_model_config.get(
+                        "native_base_channels"
+                    ),
+                    "fusion_channels": metadata_model_config.get(
+                        "fusion_channels"
+                    ),
+                    "lat_range": metadata_model_config.get("lat_range"),
+                    "lon_range": metadata_model_config.get("lon_range"),
+                    "source_lat_descending": metadata_model_config.get(
+                        "source_lat_descending", False
+                    ),
+                }
+            )
+        else:
+            build_kwargs.update(
+                {
+                    "sst_patch_size": metadata_model_config.get(
+                        "sst_patch_size"
+                    ),
+                    "surface_patch_size": metadata_model_config.get(
+                        "surface_patch_size"
+                    ),
+                    "refinement_channels": metadata_model_config.get(
+                        "refinement_channels"
+                    ),
+                }
+            )
         missing = sorted(
             key for key, value in build_kwargs.items() if value is None
         )
         if missing:
             raise ValueError(
-                "B3 checkpoint model_config 缺少模型参数: " + ", ".join(missing)
+                f"{spec['model_name']} checkpoint model_config 缺少模型参数: "
+                + ", ".join(missing)
             )
     else:
         build_kwargs = {"num_depths": num_outputs}
@@ -1730,6 +1773,10 @@ def evaluate_2dto2d_period(args, out_dir):
             args, all_depth_levels, checkpoint_depth_indices
         )
         parameter_payload = count_model_parameters(joint_model)
+        if joint_spec["method_key"] == "b4_cplus":
+            parameter_payload["by_component"] = (
+                joint_model.parameter_count_by_component()
+            )
         checkpoint_candidates = _joint_du_unet_checkpoint_candidates(
             args,
             dataset.num_depths,
@@ -2671,6 +2718,8 @@ def main():
         method = "joint_duvit"
     if method in {"b3-depthformer", "b3"}:
         method = "b3_depthformer"
+    if method in {"b4-cplus", "b4"}:
+        method = "b4_cplus"
     if method not in ALL_METHODS:
         raise ValueError(f"未知方法: {args.method}")
     args.method = {
@@ -2678,6 +2727,7 @@ def main():
         "joint_du_unet": "Joint_Du_Unet",
         "joint_duvit": "Joint_DUViT",
         "b3_depthformer": "B3_DepthFormer",
+        "b4_cplus": "B4_CPlus",
     }.get(method, method)
     if method in PARADIGM_2DTO2D_METHODS:
         paradigm = PARADIGM_2DTO2D
@@ -2688,6 +2738,7 @@ def main():
         "joint_du_unet",
         "joint_duvit",
         "b3_depthformer",
+        "b4_cplus",
     }:
         out_dir = get_output_dir(
             paradigm, args.method, base_dir=args.output_dir, target_var=args.target_var
@@ -2702,6 +2753,7 @@ def main():
             "joint_du_unet",
             "joint_duvit",
             "b3_depthformer",
+            "b4_cplus",
         }:
             raise ValueError(
                 "时间段整体评估目前仅支持Du_Unet和联合深度模型"
