@@ -1,4 +1,4 @@
-"""B4 C+: native-grid CNNs, one regrid, B3 depth Transformer and U-Net."""
+"""B4 C+: native-grid CNNs, full U-Net pyramid and B3 depth Transformer."""
 
 import torch
 import torch.nn as nn
@@ -283,7 +283,7 @@ class B4CPlusDepthFormer(nn.Module):
     def model_config(self):
         return {
             "architecture": "B4_CPlus_DepthFormer",
-            "architecture_version": 2,
+            "architecture_version": 5,
             "depth_values": [
                 float(value) for value in self.depth_embedding.depth_values.tolist()
             ],
@@ -303,16 +303,16 @@ class B4CPlusDepthFormer(nn.Module):
             "lon_range": list(self.lon_range),
             "source_lat_descending": self.source_lat_descending,
             "native_branches": {
-                "sst": "480x320 -> learned 240x160",
+                "sst": "480x320 native feature extraction",
                 "ssh_sss": "192x128 native feature extraction",
             },
-            "single_regrid_target": "ceil(output/2), actual 145x97",
-            "shared_pyramid": ["145x97", "73x49", "37x25"],
-            "skip_connections": ["145x97", "73x49"],
-            "full_resolution_skip": False,
+            "single_regrid_target": "output_size, actual 289x193",
+            "shared_pyramid": ["289x193", "145x97", "73x49", "37x25"],
+            "skip_connections": ["289x193", "145x97", "73x49"],
+            "full_resolution_skip": True,
             "surface_memory": "4-layer spatial Transformer encoder",
             "depth_decoder": "causal self-attention plus memory cross-attention",
-            "reconstruction": "three-scale learned-softmax C+ U-Net decoder",
+            "reconstruction": "single 289x193 head after three full-pyramid skip fusions",
             "regrid": self.spatial_encoder.sst_regrid.config_dict(),
         }
 
@@ -323,7 +323,7 @@ class B4CPlusDepthFormer(nn.Module):
             "previous_field_embedding": self.previous_field_embedding,
             "depth_embedding": self.depth_embedding,
             "depth_transformer": self.depth_decoder,
-            "cplus_multiscale_decoder": self.spatial_decoder,
+            "cplus_single_head_decoder": self.spatial_decoder,
         }
         counts = {
             name: sum(parameter.numel() for parameter in module.parameters())

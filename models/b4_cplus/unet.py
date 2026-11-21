@@ -1,7 +1,5 @@
 """C+ native-grid encoders and shared multi-scale U-Net decoder."""
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -69,7 +67,7 @@ class DownBlock(nn.Module):
 
 
 class CPlusSurfaceEncoder(nn.Module):
-    """Encode native grids, regrid once at 1/2 target scale, then fuse."""
+    """Extract native-grid features and build a full-resolution skip pyramid."""
 
     def __init__(
         self,
@@ -92,15 +90,11 @@ class CPlusSurfaceEncoder(nn.Module):
         self.native_base_channels = native_base_channels
         self.fusion_channels = fusion_channels
 
-        # A 4x4/stride-2 convolution centres the 240x160 features at the
-        # midpoint of each adjacent pair of 0.05-degree source cells. Their
-        # coordinates therefore match a regular 0.1-degree cell-centred grid.
+        # Keep both branches at native resolution before coordinate regridding.
         self.sst_native = nn.Sequential(
-            DownBlock(1, native_base_channels, kernel_size=4),
+            ResidualConvBlock(1, native_base_channels),
             ResidualConvBlock(native_base_channels, fusion_channels),
         )
-        # SSH/SSS are already closer to the 1/2 target grid and retain their
-        # 0.125-degree native resolution before the single coordinate regrid.
         self.surface_native = nn.Sequential(
             ResidualConvBlock(2, native_base_channels),
             ResidualConvBlock(native_base_channels, fusion_channels),
@@ -130,21 +124,18 @@ class CPlusSurfaceEncoder(nn.Module):
         )
         self.shared_down = nn.ModuleList(
             [
+                DownBlock(fusion_channels, fusion_channels),
                 DownBlock(fusion_channels, embed_dim),
                 DownBlock(embed_dim, embed_dim),
             ]
         )
-        self.skip_channels = (fusion_channels, embed_dim)
-
-    @staticmethod
-    def fusion_size(output_size):
-        return tuple(math.ceil(int(value) / 2) for value in output_size)
+        self.skip_channels = (fusion_channels, fusion_channels, embed_dim)
 
     def forward(self, sst, ssh_sss, output_size):
-        fusion_size = self.fusion_size(output_size)
-        sst_feature = self.sst_regrid(self.sst_native(sst), fusion_size)
+        output_size = tuple(int(value) for value in output_size)
+        sst_feature = self.sst_regrid(self.sst_native(sst), output_size)
         surface_feature = self.surface_regrid(
-            self.surface_native(ssh_sss), fusion_size
+            self.surface_native(ssh_sss), output_size
         )
         feature = self.fusion(torch.cat([sst_feature, surface_feature], dim=1))
         skips = [feature]
@@ -156,7 +147,7 @@ class CPlusSurfaceEncoder(nn.Module):
 
 
 class CPlusUNetDecoder(nn.Module):
-    """Two skip-connected stages plus one skip-free full-resolution stage."""
+    """Fuse three pyramid skips before one full-resolution temperature head."""
 
     def __init__(self, embed_dim, skip_channels, output_channels):
         super().__init__()
@@ -164,7 +155,6 @@ class CPlusUNetDecoder(nn.Module):
         self.skip_channels = tuple(int(v) for v in skip_channels)
         self.up_projections = nn.ModuleList()
         self.decode_blocks = nn.ModuleList()
-        self.scale_heads = nn.ModuleList()
         current_channels = int(embed_dim)
         for skip_channels_at_level in reversed_skips:
             self.up_projections.append(
@@ -180,11 +170,10 @@ class CPlusUNetDecoder(nn.Module):
                     skip_channels_at_level * 2, skip_channels_at_level
                 )
             )
-            self.scale_heads.append(
-                nn.Conv2d(skip_channels_at_level, 1, kernel_size=1)
-            )
             current_channels = skip_channels_at_level
 
+        if len(reversed_skips) != 3:
+            raise ValueError("C+ 全分辨率解码器需要三条 skip")
         self.final_projection = nn.Conv2d(
             current_channels, int(output_channels), kernel_size=1, bias=False
         )
@@ -192,7 +181,6 @@ class CPlusUNetDecoder(nn.Module):
             int(output_channels), int(output_channels)
         )
         self.final_head = nn.Conv2d(int(output_channels), 1, kernel_size=1)
-        self.scale_logits = nn.Parameter(torch.zeros(len(skip_channels) + 1))
 
     @staticmethod
     def _repeat_for_depth(feature, num_depths):
@@ -215,12 +203,8 @@ class CPlusUNetDecoder(nn.Module):
             )
         batch, num_depths, channels, height, width = bottleneck.shape
         feature = bottleneck.reshape(batch * num_depths, channels, height, width)
-        predictions = []
-        for projection, block, head, skip in zip(
-            self.up_projections,
-            self.decode_blocks,
-            self.scale_heads,
-            reversed(skips),
+        for projection, block, skip in zip(
+            self.up_projections, self.decode_blocks, reversed(skips)
         ):
             feature = F.interpolate(
                 feature,
@@ -234,26 +218,9 @@ class CPlusUNetDecoder(nn.Module):
                     [feature, self._repeat_for_depth(skip, num_depths)], dim=1
                 )
             )
-            predictions.append(head(feature))
-
-        feature = F.interpolate(
-            feature,
-            size=tuple(output_size),
-            mode="bilinear",
-            align_corners=False,
-        )
+        if tuple(feature.shape[-2:]) != tuple(output_size):
+            raise ValueError("最终 skip 尺寸与 output_size 不一致")
         feature = self.final_block(self.final_projection(feature))
-        predictions.append(self.final_head(feature))
-
-        weights = torch.softmax(self.scale_logits, dim=0)
-        fused = 0.0
-        for weight, prediction in zip(weights, predictions):
-            if prediction.shape[-2:] != tuple(output_size):
-                prediction = F.interpolate(
-                    prediction,
-                    size=tuple(output_size),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            fused = fused + weight * prediction
-        return fused.reshape(batch, num_depths, *tuple(output_size))
+        return self.final_head(feature).reshape(
+            batch, num_depths, *tuple(output_size)
+        )

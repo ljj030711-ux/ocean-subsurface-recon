@@ -96,8 +96,16 @@ class B4CPlusTest(unittest.TestCase):
         self.assertEqual(memory.shape, (1, 925, 16))
         self.assertEqual(
             [tuple(skip.shape[-2:]) for skip in skips],
-            [(145, 97), (73, 49)],
+            [(289, 193), (145, 97), (73, 49)],
         )
+        self.assertEqual([skip.shape[1] for skip in skips], [8, 8, 16])
+        with torch.no_grad():
+            prediction = model.spatial_decoder(
+                torch.randn(1, len(DEPTH_VALUES), 16, 37, 25),
+                skips,
+                (289, 193),
+            )
+        self.assertEqual(prediction.shape, (1, len(DEPTH_VALUES), 289, 193))
 
     def test_forward_backward_and_component_parameter_sum(self):
         batch = synthetic_batch(batch_size=2)
@@ -127,6 +135,50 @@ class B4CPlusTest(unittest.TestCase):
             counts["total"],
             sum(parameter.numel() for parameter in model.parameters()),
         )
+
+    def test_single_head_and_three_feature_skips(self):
+        model = tiny_model()
+        decoder = model.spatial_decoder
+        self.assertEqual(model.model_config()["architecture_version"], 5)
+        self.assertFalse(hasattr(decoder, "scale_heads"))
+        self.assertFalse(hasattr(decoder, "scale_logits"))
+        self.assertEqual(
+            sum(
+                isinstance(module, torch.nn.Conv2d) and module.out_channels == 1
+                for module in decoder.modules()
+            ),
+            1,
+        )
+
+        bottleneck = torch.randn(1, 2, 16, 3, 3, requires_grad=True)
+        skips = [
+            torch.randn(1, 8, 17, 19, requires_grad=True),
+            torch.randn(1, 8, 9, 10, requires_grad=True),
+            torch.randn(1, 16, 5, 5, requires_grad=True),
+        ]
+        prediction = decoder(bottleneck, skips, (17, 19))
+        self.assertEqual(prediction.shape, (1, 2, 17, 19))
+        prediction.square().sum().backward()
+        for skip in skips:
+            self.assertIsNotNone(skip.grad)
+            self.assertGreater(skip.grad.abs().sum().item(), 0.0)
+        self.assertIsNotNone(decoder.final_head.weight.grad)
+        self.assertGreater(decoder.final_head.weight.grad.abs().sum().item(), 0.0)
+
+        legacy_state = dict(model.state_dict())
+        legacy_state["spatial_decoder.scale_logits"] = torch.zeros(3)
+        with self.assertRaises(RuntimeError):
+            model.load_state_dict(legacy_state)
+
+    def test_single_head_autoregressive_generation(self):
+        batch = synthetic_batch()
+        model = tiny_model().eval()
+        with torch.no_grad():
+            prediction = model.generate(
+                batch["sst"], batch["ssh_sss"], output_size=(17, 19)
+            )
+        self.assertEqual(prediction.shape, batch["target"].shape)
+        self.assertTrue(torch.isfinite(prediction).all())
 
     def test_first_depth_cannot_see_future_teacher_forcing_fields(self):
         batch = synthetic_batch()
