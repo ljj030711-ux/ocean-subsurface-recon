@@ -1,14 +1,48 @@
-"""2dto2d 模型的垂向剖面可视化。"""
+"""本地垂向对比图：真值 / 模型A / 模型B / 两个绝对误差，共享掩膜与色标。
+
+在 B4 仓库根目录运行；本地仅需 numpy 和 matplotlib，无需 Torch 或 checkpoint。
+服务器导出两个模型的相同日期、全部希望画剖面的目标层：
+    python test.py --method B3_DepthFormer --target-var temperature \
+      --dataset-profile glorys12v1_all_size --data-dir ./data/raw \
+      --checkpoint /server/B3/best.pth --output-dir ./B3 \
+      --eval-start 2023-01-01 --eval-end 2023-12-31 --eval-batch-size 1 \
+      --depth-indices 0,4,9,17,24,27 --target-levels 0,1,2,3,4,5 --panel-days 2023-05-26
+B2 将 --method 改为 Joint_DUViT，并设置对应 --checkpoint 与 --output-dir ./B2。
+下载 B2、B3 后，固定中间纬度画 depth-longitude：
+    python -m utils.viz_layer_profile --run-a /local/results/B2 --run-b /local/results/B3 \
+      --dates 2023-05-26 --depth-indices 0,4,9,17,24,27 \
+      --section-axis lat --section-index middle --section-width 1
+两个方向的多个位置（每个日期、每个剖面单独输出一张对比图）：
+    python -m utils.viz_layer_profile --dates 2023-05-26 --depth-indices 0,4,9,17,24,27 \
+      --multi-section-panels --section-percentiles 10,25,50,75,90 --section-width 1
+默认输入当前工作目录的 ./B2、./B3，输出 ./comparison_figures；可直接传案例NPZ。
+--section-axis lon 固定经度画 depth-latitude；宽度 >1 时先应用共同掩膜再带平均。
+本地 --depth-indices 是数据集原始层号，与服务端 --target-levels 的局部位置不同。
+只使用 NPZ 中已保存的实际深度（至少两层），不补出其他层；缺少日期或层必须重新推理。
+旧 NPZ 如无法确定版本，可加 --metadata-a /local/B2/test.log --metadata-b /local/B3/test.log。
+水平图的完整 B2/B3 导出与绘图示例见 viz_layer_2d.py 文件头。
+"""
+
+from pathlib import Path
+import sys
+import warnings
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
 from utils.viz_layer_2d import (
+    create_comparison_figure,
+    draw_comparison_row,
     field_cmap_and_label,
     finite_symmetric_limit,
     finite_vmin_vmax,
 )
+
+from utils.case_fields import comparison_parser, comparison_from_args
 
 plt.rcParams["font.sans-serif"] = ["Arial Unicode MS", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -107,97 +141,80 @@ def build_section_specs(
     ]
 
 
-def plot_joint_du_unet_section_panel(
-    prediction_3d,
-    truth_3d,
-    target_var,
-    section_axis,
-    section_index,
-    section_width,
-    day,
-    output_path,
-    depth_values,
-    lon_range=(110, 118),
-    lat_range=(10, 18),
-    title_prefix="Joint_Du_Unet",
-):
-    """绘制 Joint_Du_Unet 的预测、真值和绝对误差垂向剖面。"""
-    prediction_3d = np.asarray(prediction_3d, dtype=np.float32)
-    truth_3d = np.asarray(truth_3d, dtype=np.float32)
-    if prediction_3d.shape != truth_3d.shape or prediction_3d.ndim != 3:
-        raise ValueError(
-            "prediction/truth 需要同形状 (D,H,W)，实际: "
-            f"{prediction_3d.shape}, {truth_3d.shape}"
-        )
-
-    depth = np.asarray(depth_values, dtype=np.float32)
-    d, h, w = prediction_3d.shape
-    if depth.shape != (d,) or not np.all(np.diff(depth) > 0):
-        raise ValueError(
-            f"depth_values 需要长度D且严格递增，实际: {depth.tolist()}"
-        )
-
-    prediction_section, start, end = _extract_section(
-        prediction_3d, section_axis, section_index, section_width
-    )
-    truth_section, _, _ = _extract_section(
-        truth_3d, section_axis, section_index, section_width
-    )
-    error_section = np.abs(prediction_section - truth_section)
-    x_coords, x_label = _axis_coords(
-        section_axis, lat_range, lon_range, h, w
-    )
-    section_center = (start + end - 1) / 2
-    if section_axis == "lat":
-        section_coord = np.interp(
-            section_center,
-            np.arange(h),
-            np.linspace(lat_range[0], lat_range[1], h),
-        )
-        section_label = f"lat idx {start}:{end} (~{section_coord:.2f}°N)"
+def plot_section_comparison(comparison, day, axis, index, width, output_path):
+    """Apply the common mask before extracting/averaging physical depth sections."""
+    if len(comparison.depth_m) < 2:
+        raise ValueError("垂向图至少需要两个已保存的深度；缺少目标层时需要重新推理")
+    if width <= 0:
+        raise ValueError("section-width 必须大于0")
+    size = len(comparison.latitude) if axis == "lat" else len(comparison.longitude)
+    index = resolve_section_index(index, size)
+    t, order = comparison.dates.index(day), np.argsort(comparison.depth_m)
+    sections = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for fields in (comparison.truth, comparison.prediction_a, comparison.prediction_b):
+            section, start, end = _extract_section(fields[t, order], axis, index, width)
+            sections.append(section)
+    if axis == "lat":
+        x, x_label = comparison.longitude, "Longitude / °E"
+        coordinate = float(np.mean(comparison.latitude[start:end]))
+        section_label = f"Latitude {coordinate:.3f}°N"
     else:
-        section_coord = np.interp(
-            section_center,
-            np.arange(w),
-            np.linspace(lon_range[0], lon_range[1], w),
+        x, x_label = comparison.latitude, "Latitude / °N"
+        coordinate = float(np.mean(comparison.longitude[start:end]))
+        section_label = f"Longitude {coordinate:.3f}°E"
+    fig, rows = create_comparison_figure(
+        1, f"Section study: {day}, {section_label}, width {end - start}, shared ocean mask and color scale"
+    )
+    try:
+        axes, color_axes = rows[0]
+        draw_comparison_row(
+            fig, axes, color_axes, *sections, x, comparison.depth_m[order],
+            comparison.target_var, comparison.truth_label, comparison.label_a, comparison.label_b,
+            x_label, "Depth / m", invert_depth=True,
         )
-        section_label = f"lon idx {start}:{end} (~{section_coord:.2f}°E)"
+        output_path = Path(output_path).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"垂向对比图: {output_path}")
+    finally:
+        plt.close(fig)
+    return fig
 
-    cmap, value_label, error_label = field_cmap_and_label(target_var)
-    value_vmin, value_vmax = finite_vmin_vmax(
-        prediction_section, truth_section
-    )
-    error_vmin, error_vmax = finite_vmin_vmax(
-        error_section, default=(0.0, 1.0)
-    )
-    error_vmin = max(error_vmin, 0.0)
-    panels = [
-        ("Prediction", prediction_section, cmap, value_label, value_vmin, value_vmax),
-        ("Truth", truth_section, cmap, value_label, value_vmin, value_vmax),
-        ("Absolute error", error_section, "magma", error_label, error_vmin, error_vmax),
-    ]
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), dpi=150)
-    for ax, (title, data, panel_cmap, label, vmin, vmax) in zip(axes, panels):
-        image = ax.pcolormesh(
-            x_coords,
-            depth,
-            data,
-            cmap=panel_cmap,
-            shading="auto",
-            vmin=vmin,
-            vmax=vmax,
+
+def main(argv=None):
+    parser = comparison_parser("读取两组案例 NPZ，绘制共享色标的垂向剖面对比图")
+    parser.add_argument("--section-axis", choices=["lat", "lon"], default="lat")
+    parser.add_argument("--section-index", default="middle")
+    parser.add_argument("--section-width", type=int, default=1)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--section-panels", action="store_true", help="单剖面，默认模式")
+    mode.add_argument("--multi-section-panels", action="store_true")
+    parser.add_argument("--section-percentiles", default="10,25,50,75,90")
+    args = parser.parse_args(argv)
+    try:
+        if args.section_width <= 0:
+            raise ValueError("section-width 必须大于0")
+        comparison = comparison_from_args(args)
+        if len(comparison.depth_m) < 2:
+            raise ValueError("垂向图至少需要两个已保存的深度，需要重新推理保存所需目标层")
+        specs = build_section_specs(
+            len(comparison.latitude), len(comparison.longitude), multi=args.multi_section_panels,
+            axis=args.section_axis, index=args.section_index,
+            percentiles=[float(value) for value in args.section_percentiles.split(",")],
         )
-        ax.set_title(title)
-        ax.set_xlabel(x_label)
-        ax.set_ylabel("Depth / m")
-        ax.invert_yaxis()
-        colorbar = fig.colorbar(image, ax=ax)
-        colorbar.set_label(label)
-    fig.suptitle(f"{title_prefix} {target_var} section {day} | {section_label}")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Joint_Du_Unet 垂向剖面图已保存至：{output_path}")
+        depths_tag = "-".join(map(str, comparison.depth_indices))
+        for day in comparison.dates:
+            for spec in specs:
+                filename = (f"comparison_section_{comparison.target_var}_{day.replace('-', '')}_"
+                            f"{spec['axis']}_idx{spec['index']}_width{args.section_width}_gidx{depths_tag}.png")
+                plot_section_comparison(
+                    comparison, day, spec["axis"], spec["index"], args.section_width,
+                    Path(args.output_dir) / filename,
+                )
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
 
 
 def plot_hvca_refiner_section_panel(
@@ -297,3 +314,7 @@ def plot_hvca_refiner_section_panel(
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"HVCA 垂向剖面解释图已保存至：{output_path}")
+
+
+if __name__ == "__main__":
+    main()
