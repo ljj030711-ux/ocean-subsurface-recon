@@ -94,6 +94,8 @@ tar \
   --exclude='logs' \
   --exclude='docs' \
   --exclude='reports' \
+  --exclude='analysis' \
+  --exclude='comparison_figures' \
   --exclude='._*' \
   -czf "${ARCHIVE_PATH}" .
 
